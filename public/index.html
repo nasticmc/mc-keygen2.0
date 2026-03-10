@@ -25,7 +25,7 @@
   <section id="tab-upload" class="tab-content active">
     <div class="panel">
       <h2>Upload Raw Packet</h2>
-      <p class="hint">Paste raw packet data below. It will be checked against known keys before queuing.</p>
+      <p class="hint">Paste raw packet hex data. The first byte is extracted as the channel prefix to crack against.</p>
       <textarea id="raw-packet" rows="10" placeholder="Paste raw packet hex data here..."></textarea>
       <button id="btn-upload" class="btn-primary">Upload & Queue</button>
       <div id="upload-result" class="result-box hidden"></div>
@@ -71,14 +71,32 @@
         <thead>
           <tr>
             <th>ID</th>
-            <th>Hash</th>
+            <th>Prefix</th>
             <th>Status</th>
+            <th>Channel</th>
             <th>Key</th>
             <th>Created</th>
             <th>Actions</th>
           </tr>
         </thead>
         <tbody id="packets-table"></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h3>Candidate Keys (prefix matches)</h3>
+      <p class="hint">Channel names whose derived prefix matches the target. Use meshcore-decoder to verify.</p>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Packet</th>
+            <th>Channel Name</th>
+            <th>Key (hex)</th>
+            <th>Prefix</th>
+            <th>Found At</th>
+          </tr>
+        </thead>
+        <tbody id="candidates-table"></tbody>
       </table>
     </div>
 
@@ -92,11 +110,11 @@
   <section id="tab-channels" class="tab-content">
     <div class="panel">
       <h2>Known Channels</h2>
+      <p class="hint">Add channel names to auto-derive their key and prefix. Key = SHA256("#name")[0:16], Prefix = SHA256(key)[0].</p>
       <div class="add-channel-form">
-        <input type="text" id="channel-name" placeholder="Channel name">
-        <input type="text" id="channel-hash" placeholder="Hash (auto-generated if empty)">
-        <input type="text" id="channel-key" placeholder="Key (auto-generated if empty)">
-        <input type="text" id="channel-prefix" placeholder="Prefix (auto-generated if empty)">
+        <input type="text" id="channel-name" placeholder="Channel name (e.g. mychannel)">
+        <input type="text" id="channel-key" placeholder="Key (auto-derived)" readonly>
+        <input type="text" id="channel-prefix" placeholder="Prefix (auto-derived)" readonly>
         <button id="btn-add-channel" class="btn-primary">Add Channel</button>
       </div>
 
@@ -104,8 +122,7 @@
         <thead>
           <tr>
             <th>Channel Name</th>
-            <th>Hash</th>
-            <th>Key</th>
+            <th>Key (hex)</th>
             <th>Prefix</th>
             <th>Actions</th>
           </tr>

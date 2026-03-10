@@ -122,7 +122,7 @@ textarea:focus, input[type="text"]:focus {
 
 .add-channel-form {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr 1fr auto;
+  grid-template-columns: 2fr 2fr 1fr auto;
   gap: 8px;
   margin-bottom: 16px;
 }

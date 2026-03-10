@@ -3,6 +3,7 @@
 let ws = null;
 let cracker = null;
 let cracking = false;
+let currentCharset = 'abcdefghijklmnopqrstuvwxyz0123456789';
 
 // ── Tab Navigation ──────────────────────────────────────────────────────────
 document.querySelectorAll('.tab').forEach(tab => {
@@ -45,8 +46,14 @@ function connectWebSocket() {
       case 'channels':
         renderChannels(msg.channels);
         break;
+      case 'candidate_found':
+        showNotification(`Prefix match: ${msg.channelName} (key: ${msg.key.substring(0, 16)}...)`);
+        break;
+      case 'candidates':
+        renderCandidates(msg.candidates);
+        break;
       case 'key_found':
-        showNotification(`Key found for packet #${msg.packetId}: ${msg.key}`);
+        showNotification(`Confirmed key for packet #${msg.packetId}: ${msg.channelName}`);
         break;
       case 'worker_update':
         updateWorkerDisplay(msg.workerId, msg.hashRate);
@@ -111,11 +118,13 @@ function renderPackets(packets) {
   for (const p of packets) {
     const tr = document.createElement('tr');
     const badgeClass = p.status === 'cracked' ? 'badge-cracked' : p.status === 'cracking' ? 'badge-cracking' : 'badge-pending';
+    const prefixHex = p.prefix.toString(16).padStart(2, '0');
     tr.innerHTML = `
       <td>${p.id}</td>
-      <td title="${p.hash}">${p.hash.substring(0, 16)}...</td>
+      <td>0x${prefixHex}</td>
       <td><span class="badge ${badgeClass}">${p.status}</span></td>
-      <td>${p.cracked_key || '-'}</td>
+      <td>${p.channel_name || '-'}</td>
+      <td title="${p.cracked_key || ''}">${p.cracked_key ? p.cracked_key.substring(0, 16) + '...' : '-'}</td>
       <td>${new Date(p.created_at).toLocaleString()}</td>
       <td><button class="btn-sm" onclick="deletePacket(${p.id})">Delete</button></td>
     `;
@@ -127,6 +136,24 @@ async function deletePacket(id) {
   await fetch(`/api/packets/${id}`, { method: 'DELETE' });
 }
 
+// ── Candidates Table ────────────────────────────────────────────────────────
+function renderCandidates(candidates) {
+  const tbody = document.getElementById('candidates-table');
+  tbody.innerHTML = '';
+
+  for (const c of candidates) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>#${c.packet_id}</td>
+      <td>${c.channel_name}</td>
+      <td title="${c.key}">${c.key.substring(0, 20)}...</td>
+      <td>0x${c.prefix}</td>
+      <td>${new Date(c.created_at).toLocaleString()}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
 // ── Channels Table ──────────────────────────────────────────────────────────
 function renderChannels(channels) {
   const tbody = document.getElementById('channels-table');
@@ -136,9 +163,8 @@ function renderChannels(channels) {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${c.channel_name}</td>
-      <td title="${c.hash}">${c.hash.substring(0, 16)}...</td>
-      <td title="${c.key}">${c.key.substring(0, 16)}...</td>
-      <td>${c.prefix}</td>
+      <td title="${c.key}">${c.key.substring(0, 20)}...</td>
+      <td>0x${c.prefix}</td>
       <td><button class="btn-sm" onclick="deleteChannel(${c.id})">Delete</button></td>
     `;
     tbody.appendChild(tr);
@@ -165,12 +191,15 @@ document.getElementById('btn-upload').addEventListener('click', async () => {
     });
     const data = await res.json();
 
-    if (data.alreadyKnown) {
+    if (data.error) {
+      resultBox.classList.add('error');
+      resultBox.textContent = data.error;
+    } else if (data.alreadyKnown) {
       resultBox.classList.add('success');
-      resultBox.textContent = `Already cracked! Channel: ${data.knownChannel.channel_name}, Key: ${data.knownChannel.key}`;
+      resultBox.textContent = `Already known! Channel: ${data.knownChannel.channel_name}, Key: ${data.knownChannel.key}`;
     } else {
       resultBox.classList.add('info');
-      resultBox.textContent = `Packet queued (ID: ${data.packet.id}). Hash: ${data.packet.hash}. Work chunks created.`;
+      resultBox.textContent = `Packet queued (ID: ${data.packet.id}). Target prefix: 0x${data.prefixByte}. Work chunks created.`;
     }
     resultBox.classList.remove('hidden');
     document.getElementById('raw-packet').value = '';
@@ -181,34 +210,43 @@ document.getElementById('btn-upload').addEventListener('click', async () => {
   }
 });
 
-// ── Add Channel ─────────────────────────────────────────────────────────────
+// ── Add Channel (auto-derive key & prefix) ──────────────────────────────────
+let deriveTimeout = null;
 document.getElementById('channel-name').addEventListener('input', (e) => {
   const name = e.target.value.trim();
-  if (name) {
-    // Auto-populate hash, key, prefix when channel name is typed
-    // These are placeholders - server will generate actual values
-    document.getElementById('channel-hash').placeholder = 'Auto: md5(name)';
-    document.getElementById('channel-key').placeholder = 'Auto: sha256(name)';
-    document.getElementById('channel-prefix').placeholder = 'Auto: md5(name)[0:8]';
+  clearTimeout(deriveTimeout);
+  if (!name) {
+    document.getElementById('channel-key').value = '';
+    document.getElementById('channel-prefix').value = '';
+    return;
   }
+  deriveTimeout = setTimeout(async () => {
+    try {
+      const res = await fetch('/api/derive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channelName: name })
+      });
+      const data = await res.json();
+      document.getElementById('channel-key').value = data.key;
+      document.getElementById('channel-prefix').value = '0x' + data.prefix;
+    } catch (err) {
+      console.error('Derive failed:', err);
+    }
+  }, 300);
 });
 
 document.getElementById('btn-add-channel').addEventListener('click', async () => {
   const channelName = document.getElementById('channel-name').value.trim();
   if (!channelName) return;
 
-  const hash = document.getElementById('channel-hash').value.trim();
-  const key = document.getElementById('channel-key').value.trim();
-  const prefix = document.getElementById('channel-prefix').value.trim();
-
   try {
     await fetch('/api/channels', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channelName, hash: hash || undefined, key: key || undefined, prefix: prefix || undefined })
+      body: JSON.stringify({ channelName })
     });
     document.getElementById('channel-name').value = '';
-    document.getElementById('channel-hash').value = '';
     document.getElementById('channel-key').value = '';
     document.getElementById('channel-prefix').value = '';
   } catch (err) {
@@ -253,46 +291,35 @@ document.getElementById('btn-stop-cracking').addEventListener('click', () => {
 
 async function runCrackingLoop() {
   while (cracking && ws && ws.readyState === WebSocket.OPEN) {
-    // Request work from server
     ws.send(JSON.stringify({ type: 'request_work', count: 4 }));
 
-    // Wait for work response
-    const chunks = await new Promise((resolve) => {
+    const response = await new Promise((resolve) => {
       const handler = (event) => {
         const msg = JSON.parse(event.data);
         if (msg.type === 'work') {
           ws.removeEventListener('message', handler);
-          resolve(msg.chunks);
+          resolve(msg);
         }
       };
       ws.addEventListener('message', handler);
-      // Timeout after 5s if no work available
       setTimeout(() => {
         ws.removeEventListener('message', handler);
-        resolve([]);
+        resolve({ chunks: [] });
       }, 5000);
     });
 
+    const chunks = response.chunks;
+    if (response.charset) currentCharset = response.charset;
+
     if (chunks.length === 0) {
-      // No work available, wait and retry
       await new Promise(r => setTimeout(r, 2000));
       continue;
     }
 
-    const result = await cracker.processChunks(chunks, ws, (hashRate) => {
+    await cracker.processChunks(chunks, ws, (hashRate) => {
       document.getElementById('stat-hashrate').textContent = formatHashRate(hashRate);
       ws.send(JSON.stringify({ type: 'hashrate_update', hashRate }));
-    });
-
-    if (result.found) {
-      ws.send(JSON.stringify({
-        type: 'key_found',
-        packetId: result.packetId,
-        key: String(result.key),
-        chunkId: result.chunkId
-      }));
-      showNotification(`Key found: ${result.key}`);
-    }
+    }, currentCharset);
   }
 }
 
@@ -307,18 +334,21 @@ function showNotification(message) {
 // ── Initial Load ────────────────────────────────────────────────────────────
 async function loadData() {
   try {
-    const [packetsRes, channelsRes, statsRes] = await Promise.all([
+    const [packetsRes, channelsRes, statsRes, candidatesRes] = await Promise.all([
       fetch('/api/packets'),
       fetch('/api/channels'),
-      fetch('/api/stats')
+      fetch('/api/stats'),
+      fetch('/api/candidates'),
     ]);
     const packets = await packetsRes.json();
     const channels = await channelsRes.json();
     const stats = await statsRes.json();
+    const candidates = await candidatesRes.json();
 
     renderPackets(packets);
     renderChannels(channels);
     updateStats(stats);
+    renderCandidates(candidates);
     document.getElementById('worker-count').textContent = `Workers: ${stats.workerCount}`;
   } catch (err) {
     console.error('Failed to load initial data:', err);

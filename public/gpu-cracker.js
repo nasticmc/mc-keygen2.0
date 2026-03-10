@@ -1,149 +1,188 @@
-// ── WebGPU MD5 Hash Cracker ─────────────────────────────────────────────────
-// Runs MD5 brute-force on the GPU using compute shaders.
+// ── WebGPU SHA-256 Channel Key Cracker ──────────────────────────────────────
+// MeshCore key derivation:
+//   key    = SHA256("#" + channelName)[0:16]   (first 16 bytes)
+//   prefix = SHA256(key)[0]                    (first byte)
+//
+// We brute-force channel names, derive the prefix, and check against target.
+// Matches are sent back to the server as candidate keys.
 
-const MD5_WGSL = `
-// MD5 constants
-const S = array<u32, 64>(
-  7u, 12u, 17u, 22u, 7u, 12u, 17u, 22u, 7u, 12u, 17u, 22u, 7u, 12u, 17u, 22u,
-  5u,  9u, 14u, 20u, 5u,  9u, 14u, 20u, 5u,  9u, 14u, 20u, 5u,  9u, 14u, 20u,
-  4u, 11u, 16u, 23u, 4u, 11u, 16u, 23u, 4u, 11u, 16u, 23u, 4u, 11u, 16u, 23u,
-  6u, 10u, 15u, 21u, 6u, 10u, 15u, 21u, 6u, 10u, 15u, 21u, 6u, 10u, 15u, 21u
-);
-
+const SHA256_WGSL = `
+// SHA-256 constants
 const K = array<u32, 64>(
-  0xd76aa478u, 0xe8c7b756u, 0x242070dbu, 0xc1bdceeeu,
-  0xf57c0fafu, 0x4787c62au, 0xa8304613u, 0xfd469501u,
-  0x698098d8u, 0x8b44f7afu, 0xffff5bb1u, 0x895cd7beu,
-  0x6b901122u, 0xfd987193u, 0xa679438eu, 0x49b40821u,
-  0xf61e2562u, 0xc040b340u, 0x265e5a51u, 0xe9b6c7aau,
-  0xd62f105du, 0x02441453u, 0xd8a1e681u, 0xe7d3fbc8u,
-  0x21e1cde6u, 0xc33707d6u, 0xf4d50d87u, 0x455a14edu,
-  0xa9e3e905u, 0xfcefa3f8u, 0x676f02d9u, 0x8d2a4c8au,
-  0xfffa3942u, 0x8771f681u, 0x6d9d6122u, 0xfde5380cu,
-  0xa4beea44u, 0x4bdecfa9u, 0xf6bb4b60u, 0xbebfbc70u,
-  0x289b7ec6u, 0xeaa127fau, 0xd4ef3085u, 0x04881d05u,
-  0xd9d4d039u, 0xe6db99e5u, 0x1fa27cf8u, 0xc4ac5665u,
-  0xf4292244u, 0x432aff97u, 0xab9423a7u, 0xfc93a039u,
-  0x655b59c3u, 0x8f0ccc92u, 0xffeff47du, 0x85845dd1u,
-  0x6fa87e4fu, 0xfe2ce6e0u, 0xa3014314u, 0x4e0811a1u,
-  0xf7537e82u, 0xbd3af235u, 0x2ad7d2bbu, 0xeb86d391u
+  0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+  0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+  0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+  0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+  0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+  0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+  0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+  0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+  0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+  0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+  0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+  0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+  0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+  0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+  0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+  0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
 );
 
-fn left_rotate(x: u32, c: u32) -> u32 {
-  return (x << c) | (x >> (32u - c));
+fn right_rotate(x: u32, n: u32) -> u32 {
+  return (x >> n) | (x << (32u - n));
 }
 
-// Compute MD5 of a short message (up to 55 bytes, single block)
-fn md5_hash(msg: array<u32, 16>) -> vec4<u32> {
-  var a0: u32 = 0x67452301u;
-  var b0: u32 = 0xefcdab89u;
-  var c0: u32 = 0x98badcfeu;
-  var d0: u32 = 0x10325476u;
-
-  var A = a0;
-  var B = b0;
-  var C = c0;
-  var D = d0;
-
-  for (var i: u32 = 0u; i < 64u; i++) {
-    var F: u32;
-    var g: u32;
-    if (i < 16u) {
-      F = (B & C) | ((~B) & D);
-      g = i;
-    } else if (i < 32u) {
-      F = (D & B) | ((~D) & C);
-      g = (5u * i + 1u) % 16u;
-    } else if (i < 48u) {
-      F = B ^ C ^ D;
-      g = (3u * i + 5u) % 16u;
-    } else {
-      F = C ^ (B | (~D));
-      g = (7u * i) % 16u;
-    }
-    F = F + A + K[i] + msg[g];
-    A = D;
-    D = C;
-    C = B;
-    B = B + left_rotate(F, S[i]);
+// SHA-256 of a single block (64 bytes / 16 u32 words, big-endian)
+fn sha256_block(block: array<u32, 16>) -> array<u32, 8> {
+  // Prepare message schedule
+  var w: array<u32, 64>;
+  for (var i: u32 = 0u; i < 16u; i++) {
+    w[i] = block[i];
+  }
+  for (var i: u32 = 16u; i < 64u; i++) {
+    let s0 = right_rotate(w[i - 15u], 7u) ^ right_rotate(w[i - 15u], 18u) ^ (w[i - 15u] >> 3u);
+    let s1 = right_rotate(w[i - 2u], 17u) ^ right_rotate(w[i - 2u], 19u) ^ (w[i - 2u] >> 10u);
+    w[i] = w[i - 16u] + s0 + w[i - 7u] + s1;
   }
 
-  return vec4<u32>(a0 + A, b0 + B, c0 + C, d0 + D);
+  // Initialize working variables
+  var h: array<u32, 8>;
+  h[0] = 0x6a09e667u; h[1] = 0xbb67ae85u;
+  h[2] = 0x3c6ef372u; h[3] = 0xa54ff53au;
+  h[4] = 0x510e527fu; h[5] = 0x9b05688cu;
+  h[6] = 0x1f83d9abu; h[7] = 0x5be0cd19u;
+
+  var a = h[0]; var b = h[1]; var c = h[2]; var d = h[3];
+  var e = h[4]; var f = h[5]; var g = h[6]; var hh = h[7];
+
+  // Compression
+  for (var i: u32 = 0u; i < 64u; i++) {
+    let S1 = right_rotate(e, 6u) ^ right_rotate(e, 11u) ^ right_rotate(e, 25u);
+    let ch = (e & f) ^ ((~e) & g);
+    let temp1 = hh + S1 + ch + K[i] + w[i];
+    let S0 = right_rotate(a, 2u) ^ right_rotate(a, 13u) ^ right_rotate(a, 22u);
+    let maj = (a & b) ^ (a & c) ^ (b & c);
+    let temp2 = S0 + maj;
+
+    hh = g; g = f; f = e; e = d + temp1;
+    d = c; c = b; b = a; a = temp1 + temp2;
+  }
+
+  h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+  h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+
+  return h;
 }
 
 struct Params {
-  target_a: u32,
-  target_b: u32,
-  target_c: u32,
-  target_d: u32,
+  target_prefix: u32,   // target prefix byte (only lowest 8 bits used)
   range_start: u32,
   range_size: u32,
+  charset_len: u32,     // length of charset (36 for alnum)
 }
 
-struct Result {
-  found: atomic<u32>,
-  key_value: u32,
+struct MatchEntry {
+  index: u32,           // the candidate index that matched
+}
+
+struct Results {
+  match_count: atomic<u32>,
+  matches: array<MatchEntry, 256>,  // store up to 256 matches per dispatch
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read_write> result: Result;
+@group(0) @binding(1) var<storage, read_write> results: Results;
+@group(0) @binding(2) var<storage, read> charset: array<u32, 64>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let idx = gid.x;
   if (idx >= params.range_size) { return; }
 
-  // Check if already found
-  if (atomicLoad(&result.found) != 0u) { return; }
+  let candidate_idx = params.range_start + idx;
 
-  let candidate = params.range_start + idx;
+  // Convert index to channel name string using charset
+  // Index maps to variable-length strings:
+  // 0..35 = 1-char, 36..1331 = 2-char, etc.
+  let base = params.charset_len;
+  var name_bytes: array<u32, 32>;  // max channel name length
+  var name_len: u32 = 0u;
 
-  // Build the candidate key as bytes in MD5 message format
-  // We encode the u32 candidate as a decimal string for hashing
-  var msg: array<u32, 16>;
-  for (var i = 0u; i < 16u; i++) { msg[i] = 0u; }
+  // First byte is always '#' (0x23)
+  name_bytes[0] = 0x23u;
+  name_len = 1u;
 
-  // Convert candidate to decimal string bytes
-  var num = candidate;
-  var digits: array<u32, 10>;
-  var digit_count: u32 = 0u;
+  // Determine which length tier this index falls into
+  var remaining = candidate_idx;
+  var tier_start: u32 = 0u;
+  var tier_len: u32 = 1u;
+  var tier_size: u32 = base;
 
-  if (num == 0u) {
-    digits[0] = 48u; // '0'
-    digit_count = 1u;
-  } else {
-    var temp = num;
-    while (temp > 0u) {
-      digits[digit_count] = (temp % 10u) + 48u;
-      temp = temp / 10u;
-      digit_count++;
+  loop {
+    if (remaining < tier_size) { break; }
+    remaining -= tier_size;
+    tier_start += tier_size;
+    tier_len++;
+    tier_size *= base;
+    if (tier_len > 8u) { return; } // safety limit
+  }
+
+  // Convert remaining to base-N digits for the name
+  var temp = remaining;
+  for (var i: u32 = 0u; i < tier_len; i++) {
+    let digit = temp % base;
+    name_bytes[name_len + tier_len - 1u - i] = charset[digit];
+    temp /= base;
+  }
+  name_len += tier_len;
+
+  // ── SHA-256("#channelName") ──
+  // Build padded message block (big-endian, single block for names <= 55 bytes)
+  var block: array<u32, 16>;
+  for (var i: u32 = 0u; i < 16u; i++) { block[i] = 0u; }
+
+  // Pack name bytes into big-endian u32 words
+  for (var i: u32 = 0u; i < name_len; i++) {
+    let word_idx = i / 4u;
+    let byte_idx = 3u - (i % 4u);  // big-endian
+    block[word_idx] |= name_bytes[i] << (byte_idx * 8u);
+  }
+
+  // SHA-256 padding
+  let pad_word = name_len / 4u;
+  let pad_byte = 3u - (name_len % 4u);
+  block[pad_word] |= 0x80u << (pad_byte * 8u);
+  // Length in bits at the end of the block
+  block[15] = name_len * 8u;
+
+  let hash1 = sha256_block(block);
+
+  // key = first 16 bytes of hash1 (hash1[0], hash1[1], hash1[2], hash1[3])
+
+  // ── SHA-256(key) to get prefix ──
+  // key is 16 bytes, so build another padded block
+  var block2: array<u32, 16>;
+  for (var i: u32 = 0u; i < 16u; i++) { block2[i] = 0u; }
+
+  // Copy first 4 words (16 bytes) of hash1 as the message
+  block2[0] = hash1[0];
+  block2[1] = hash1[1];
+  block2[2] = hash1[2];
+  block2[3] = hash1[3];
+  // Padding byte after 16 bytes
+  block2[4] = 0x80000000u;
+  // Length: 16 bytes = 128 bits
+  block2[15] = 128u;
+
+  let hash2 = sha256_block(block2);
+
+  // prefix = first byte of hash2 (top 8 bits of hash2[0], big-endian)
+  let prefix_byte = (hash2[0] >> 24u) & 0xFFu;
+
+  if (prefix_byte == params.target_prefix) {
+    let slot = atomicAdd(&results.match_count, 1u);
+    if (slot < 256u) {
+      results.matches[slot].index = candidate_idx;
     }
-  }
-
-  // Reverse digits and pack into msg (little-endian)
-  var byte_pos: u32 = 0u;
-  for (var i: u32 = 0u; i < digit_count; i++) {
-    let d = digits[digit_count - 1u - i];
-    let word_idx = byte_pos / 4u;
-    let byte_idx = byte_pos % 4u;
-    msg[word_idx] = msg[word_idx] | (d << (byte_idx * 8u));
-    byte_pos++;
-  }
-
-  // MD5 padding: append 0x80
-  let pad_word = byte_pos / 4u;
-  let pad_byte = byte_pos % 4u;
-  msg[pad_word] = msg[pad_word] | (0x80u << (pad_byte * 8u));
-
-  // Append length in bits at position 14 (56 bytes)
-  msg[14] = byte_pos * 8u;
-
-  let hash = md5_hash(msg);
-
-  if (hash.x == params.target_a && hash.y == params.target_b &&
-      hash.z == params.target_c && hash.w == params.target_d) {
-    atomicStore(&result.found, 1u);
-    result.key_value = candidate;
   }
 }
 `;
@@ -181,7 +220,7 @@ class GPUCracker {
         }
       });
 
-      const shaderModule = this.device.createShaderModule({ code: MD5_WGSL });
+      const shaderModule = this.device.createShaderModule({ code: SHA256_WGSL });
       this.pipeline = this.device.createComputePipeline({
         layout: 'auto',
         compute: { module: shaderModule, entryPoint: 'main' }
@@ -196,39 +235,37 @@ class GPUCracker {
     }
   }
 
-  // Parse a hex MD5 hash string into 4 u32 values (little-endian)
-  parseHash(hexStr) {
-    const clean = hexStr.replace(/\s/g, '').toLowerCase();
-    if (clean.length !== 32) throw new Error('Hash must be 32 hex chars');
+  // Convert index back to channel name (must match GPU logic exactly)
+  indexToChannelName(index, charset) {
+    const base = charset.length;
+    let remaining = index;
+    let tierLen = 1;
+    let tierSize = base;
 
-    const bytes = [];
-    for (let i = 0; i < 32; i += 2) {
-      bytes.push(parseInt(clean.substring(i, i + 2), 16));
+    while (remaining >= tierSize) {
+      remaining -= tierSize;
+      tierLen++;
+      tierSize *= base;
+      if (tierLen > 8) return null;
     }
 
-    const view = new DataView(new ArrayBuffer(16));
-    for (let i = 0; i < 16; i++) view.setUint8(i, bytes[i]);
+    let name = '';
+    let temp = remaining;
+    for (let i = 0; i < tierLen; i++) {
+      name = charset[temp % base] + name;
+      temp = Math.floor(temp / base);
+    }
 
-    return {
-      a: view.getUint32(0, true),
-      b: view.getUint32(4, true),
-      c: view.getUint32(8, true),
-      d: view.getUint32(12, true),
-    };
+    return '#' + name;
   }
 
-  async crackChunk(hash, rangeStart, rangeSize) {
+  async crackChunk(targetPrefix, rangeStart, rangeSize, charset) {
     if (!this.supported || !this.device) {
       throw new Error('WebGPU not initialized');
     }
 
-    const target = this.parseHash(hash);
-
-    // Params buffer: 6 x u32
-    const paramsData = new Uint32Array([
-      target.a, target.b, target.c, target.d,
-      rangeStart, rangeSize
-    ]);
+    // Params: target_prefix, range_start, range_size, charset_len
+    const paramsData = new Uint32Array([targetPrefix, rangeStart, rangeSize, charset.length]);
 
     const paramsBuffer = this.device.createBuffer({
       size: paramsData.byteLength,
@@ -236,22 +273,35 @@ class GPUCracker {
     });
     this.device.queue.writeBuffer(paramsBuffer, 0, paramsData);
 
-    // Result buffer: found (u32) + key_value (u32)
+    // Results buffer: match_count (u32) + 256 match entries (u32 each)
+    const resultSize = 4 + 256 * 4; // 1028 bytes
     const resultBuffer = this.device.createBuffer({
-      size: 8,
+      size: resultSize,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     });
 
     const readBuffer = this.device.createBuffer({
-      size: 8,
+      size: resultSize,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
+
+    // Charset buffer (up to 64 chars)
+    const charsetData = new Uint32Array(64);
+    for (let i = 0; i < charset.length; i++) {
+      charsetData[i] = charset.charCodeAt(i);
+    }
+    const charsetBuffer = this.device.createBuffer({
+      size: charsetData.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(charsetBuffer, 0, charsetData);
 
     const bindGroup = this.device.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: paramsBuffer } },
         { binding: 1, resource: { buffer: resultBuffer } },
+        { binding: 2, resource: { buffer: charsetBuffer } },
       ],
     });
 
@@ -265,25 +315,27 @@ class GPUCracker {
     pass.dispatchWorkgroups(numWorkgroups);
     pass.end();
 
-    encoder.copyBufferToBuffer(resultBuffer, 0, readBuffer, 0, 8);
+    encoder.copyBufferToBuffer(resultBuffer, 0, readBuffer, 0, resultSize);
     this.device.queue.submit([encoder.finish()]);
 
     await readBuffer.mapAsync(GPUMapMode.READ);
     const resultData = new Uint32Array(readBuffer.getMappedRange());
-    const found = resultData[0];
-    const keyValue = resultData[1];
+    const matchCount = resultData[0];
+    const matches = [];
+    for (let i = 0; i < Math.min(matchCount, 256); i++) {
+      matches.push(resultData[1 + i]);
+    }
     readBuffer.unmap();
 
-    // Cleanup
     paramsBuffer.destroy();
     resultBuffer.destroy();
     readBuffer.destroy();
+    charsetBuffer.destroy();
 
-    return { found: found !== 0, key: found ? keyValue : null };
+    return matches;
   }
 
-  // Process a batch of chunks, running them on the GPU
-  async processChunks(chunks, ws, onProgress) {
+  async processChunks(chunks, ws, onProgress, charset) {
     this.running = true;
     this._lastTime = performance.now();
     this._lastCount = 0;
@@ -292,14 +344,14 @@ class GPUCracker {
       if (!this.running) break;
 
       const rangeSize = chunk.range_end - chunk.range_start;
-      const batchSize = 65536; // Process in sub-batches for responsiveness
+      const batchSize = 65536;
 
       for (let offset = 0; offset < rangeSize && this.running; offset += batchSize) {
         const size = Math.min(batchSize, rangeSize - offset);
         const start = chunk.range_start + offset;
 
         try {
-          const result = await this.crackChunk(chunk.hash, start, size);
+          const matches = await this.crackChunk(chunk.target_prefix, start, size, charset);
 
           this._lastCount += size;
           const elapsed = (performance.now() - this._lastTime) / 1000;
@@ -310,15 +362,27 @@ class GPUCracker {
             if (onProgress) onProgress(this.hashRate);
           }
 
-          if (result.found) {
-            return { found: true, key: result.key, chunkId: chunk.id, packetId: chunk.packet_id };
+          // Report each match back to server
+          for (const matchIdx of matches) {
+            const channelName = this.indexToChannelName(matchIdx, charset);
+            if (channelName) {
+              // Derive key on CPU for reporting
+              const key = await deriveKeyJS(channelName);
+              const prefix = await derivePrefixJS(key);
+              ws.send(JSON.stringify({
+                type: 'prefix_match',
+                packetId: chunk.packet_id,
+                channelName,
+                key: bufToHex(key),
+                prefix: prefix.toString(16).padStart(2, '0'),
+              }));
+            }
           }
         } catch (err) {
           console.error('GPU batch error:', err);
         }
       }
 
-      // Report chunk complete
       ws.send(JSON.stringify({
         type: 'chunk_complete',
         chunkId: chunk.id,
@@ -334,7 +398,26 @@ class GPUCracker {
   }
 }
 
-// Fallback CPU cracker for browsers without WebGPU
+// ── JS SHA-256 helpers (for deriving key/prefix on CPU after GPU match) ─────
+
+async function deriveKeyJS(channelName) {
+  const name = channelName.startsWith('#') ? channelName : '#' + channelName;
+  const data = new TextEncoder().encode(name);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return new Uint8Array(hash).subarray(0, 16);
+}
+
+async function derivePrefixJS(keyBytes) {
+  const hash = await crypto.subtle.digest('SHA-256', keyBytes);
+  return new Uint8Array(hash)[0];
+}
+
+function bufToHex(buf) {
+  return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// ── CPU Fallback Cracker ────────────────────────────────────────────────────
+
 class CPUCracker {
   constructor() {
     this.supported = true;
@@ -344,101 +427,30 @@ class CPUCracker {
 
   async init() { return true; }
 
-  // Simple MD5 in JS (for CPU fallback)
-  md5(str) {
-    // Using SubtleCrypto is not available for MD5, so we use a minimal implementation
-    function md5cycle(x, k) {
-      let a = x[0], b = x[1], c = x[2], d = x[3];
-      a = ff(a, b, c, d, k[0], 7, -680876936);   d = ff(d, a, b, c, k[1], 12, -389564586);
-      c = ff(c, d, a, b, k[2], 17, 606105819);    b = ff(b, c, d, a, k[3], 22, -1044525330);
-      a = ff(a, b, c, d, k[4], 7, -176418897);    d = ff(d, a, b, c, k[5], 12, 1200080426);
-      c = ff(c, d, a, b, k[6], 17, -1473231341);  b = ff(b, c, d, a, k[7], 22, -45705983);
-      a = ff(a, b, c, d, k[8], 7, 1770035416);    d = ff(d, a, b, c, k[9], 12, -1958414417);
-      c = ff(c, d, a, b, k[10], 17, -42063);       b = ff(b, c, d, a, k[11], 22, -1990404162);
-      a = ff(a, b, c, d, k[12], 7, 1804603682);   d = ff(d, a, b, c, k[13], 12, -40341101);
-      c = ff(c, d, a, b, k[14], 17, -1502002290); b = ff(b, c, d, a, k[15], 22, 1236535329);
-      a = gg(a, b, c, d, k[1], 5, -165796510);    d = gg(d, a, b, c, k[6], 9, -1069501632);
-      c = gg(c, d, a, b, k[11], 14, 643717713);    b = gg(b, c, d, a, k[0], 20, -373897302);
-      a = gg(a, b, c, d, k[5], 5, -701558691);    d = gg(d, a, b, c, k[10], 9, 38016083);
-      c = gg(c, d, a, b, k[15], 14, -660478335);   b = gg(b, c, d, a, k[4], 20, -405537848);
-      a = gg(a, b, c, d, k[9], 5, 568446438);     d = gg(d, a, b, c, k[14], 9, -1019803690);
-      c = gg(c, d, a, b, k[3], 14, -187363961);    b = gg(b, c, d, a, k[8], 20, 1163531501);
-      a = gg(a, b, c, d, k[13], 5, -1444681467);  d = gg(d, a, b, c, k[2], 9, -51403784);
-      c = gg(c, d, a, b, k[7], 14, 1735328473);    b = gg(b, c, d, a, k[12], 20, -1926607734);
-      a = hh(a, b, c, d, k[5], 4, -378558);       d = hh(d, a, b, c, k[8], 11, -2022574463);
-      c = hh(c, d, a, b, k[11], 16, 1839030562);   b = hh(b, c, d, a, k[14], 23, -35309556);
-      a = hh(a, b, c, d, k[1], 4, -1530992060);   d = hh(d, a, b, c, k[4], 11, 1272893353);
-      c = hh(c, d, a, b, k[7], 16, -155497632);    b = hh(b, c, d, a, k[10], 23, -1094730640);
-      a = hh(a, b, c, d, k[13], 4, 681279174);    d = hh(d, a, b, c, k[0], 11, -358537222);
-      c = hh(c, d, a, b, k[3], 16, -722521979);    b = hh(b, c, d, a, k[6], 23, 76029189);
-      a = hh(a, b, c, d, k[9], 4, -640364487);    d = hh(d, a, b, c, k[12], 11, -421815835);
-      c = hh(c, d, a, b, k[15], 16, 530742520);    b = hh(b, c, d, a, k[2], 23, -995338651);
-      a = ii(a, b, c, d, k[0], 6, -198630844);    d = ii(d, a, b, c, k[7], 10, 1126891415);
-      c = ii(c, d, a, b, k[14], 15, -1416354905);  b = ii(b, c, d, a, k[5], 21, -57434055);
-      a = ii(a, b, c, d, k[12], 6, 1700485571);   d = ii(d, a, b, c, k[3], 10, -1894986606);
-      c = ii(c, d, a, b, k[10], 15, -1051523);      b = ii(b, c, d, a, k[1], 21, -2054922799);
-      a = ii(a, b, c, d, k[8], 6, 1873313359);    d = ii(d, a, b, c, k[15], 10, -30611744);
-      c = ii(c, d, a, b, k[6], 15, -1560198380);   b = ii(b, c, d, a, k[13], 21, 1309151649);
-      a = ii(a, b, c, d, k[4], 6, -145523070);    d = ii(d, a, b, c, k[11], 10, -1120210379);
-      c = ii(c, d, a, b, k[2], 15, 718787259);     b = ii(b, c, d, a, k[9], 21, -343485551);
-      x[0] = add32(a, x[0]); x[1] = add32(b, x[1]); x[2] = add32(c, x[2]); x[3] = add32(d, x[3]);
+  indexToChannelName(index, charset) {
+    const base = charset.length;
+    let remaining = index;
+    let tierLen = 1;
+    let tierSize = base;
+
+    while (remaining >= tierSize) {
+      remaining -= tierSize;
+      tierLen++;
+      tierSize *= base;
+      if (tierLen > 8) return null;
     }
 
-    function cmn(q, a, b, x, s, t) {
-      a = add32(add32(a, q), add32(x, t));
-      return add32((a << s) | (a >>> (32 - s)), b);
-    }
-    function ff(a, b, c, d, x, s, t) { return cmn((b & c) | ((~b) & d), a, b, x, s, t); }
-    function gg(a, b, c, d, x, s, t) { return cmn((b & d) | (c & (~d)), a, b, x, s, t); }
-    function hh(a, b, c, d, x, s, t) { return cmn(b ^ c ^ d, a, b, x, s, t); }
-    function ii(a, b, c, d, x, s, t) { return cmn(c ^ (b | (~d)), a, b, x, s, t); }
-
-    function md5blk(s) {
-      const md5blks = [];
-      for (let i = 0; i < 64; i += 4) {
-        md5blks[i >> 2] = s.charCodeAt(i) + (s.charCodeAt(i + 1) << 8) +
-          (s.charCodeAt(i + 2) << 16) + (s.charCodeAt(i + 3) << 24);
-      }
-      return md5blks;
+    let name = '';
+    let temp = remaining;
+    for (let i = 0; i < tierLen; i++) {
+      name = charset[temp % base] + name;
+      temp = Math.floor(temp / base);
     }
 
-    function add32(a, b) { return (a + b) & 0xFFFFFFFF; }
-
-    function rhex(n) {
-      const hc = '0123456789abcdef';
-      let s = '';
-      for (let j = 0; j < 4; j++)
-        s += hc.charAt((n >> (j * 8 + 4)) & 0x0F) + hc.charAt((n >> (j * 8)) & 0x0F);
-      return s;
-    }
-
-    function md5str(s) {
-      let n = s.length;
-      let state = [1732584193, -271733879, -1732584194, 271733878];
-      let tail = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-      let i;
-      for (i = 64; i <= n; i += 64) {
-        md5cycle(state, md5blk(s.substring(i - 64, i)));
-      }
-      s = s.substring(i - 64);
-      let lo = s.length;
-      for (i = 0; i < lo; i++) {
-        tail[i >> 2] |= s.charCodeAt(i) << ((i % 4) << 3);
-      }
-      tail[i >> 2] |= 0x80 << ((i % 4) << 3);
-      if (i > 55) {
-        md5cycle(state, tail);
-        for (i = 0; i < 16; i++) tail[i] = 0;
-      }
-      tail[14] = n * 8;
-      md5cycle(state, tail);
-      return rhex(state[0]) + rhex(state[1]) + rhex(state[2]) + rhex(state[3]);
-    }
-
-    return md5str(str);
+    return '#' + name;
   }
 
-  async processChunks(chunks, ws, onProgress) {
+  async processChunks(chunks, ws, onProgress, charset) {
     this.running = true;
     let totalHashed = 0;
     let lastTime = performance.now();
@@ -447,20 +459,28 @@ class CPUCracker {
       if (!this.running) break;
 
       for (let i = chunk.range_start; i < chunk.range_end && this.running; i++) {
-        const candidate = String(i);
-        const hash = this.md5(candidate);
+        const channelName = this.indexToChannelName(i, charset);
+        if (!channelName) continue;
 
-        if (hash === chunk.hash) {
-          return { found: true, key: i, chunkId: chunk.id, packetId: chunk.packet_id };
+        const key = await deriveKeyJS(channelName);
+        const prefix = await derivePrefixJS(key);
+
+        if (prefix === chunk.target_prefix) {
+          ws.send(JSON.stringify({
+            type: 'prefix_match',
+            packetId: chunk.packet_id,
+            channelName,
+            key: bufToHex(key),
+            prefix: prefix.toString(16).padStart(2, '0'),
+          }));
         }
 
         totalHashed++;
-        if (totalHashed % 10000 === 0) {
+        if (totalHashed % 5000 === 0) {
           const now = performance.now();
           const elapsed = (now - lastTime) / 1000;
           this.hashRate = Math.round(totalHashed / elapsed);
           if (onProgress) onProgress(this.hashRate);
-          // Yield to event loop
           await new Promise(r => setTimeout(r, 0));
         }
       }
@@ -483,6 +503,5 @@ class CPUCracker {
   }
 }
 
-// Export the appropriate cracker
 window.GPUCracker = GPUCracker;
 window.CPUCracker = CPUCracker;
