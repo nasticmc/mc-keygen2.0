@@ -47,13 +47,13 @@ function connectWebSocket() {
         renderChannels(msg.channels);
         break;
       case 'candidate_found':
-        showNotification(`Prefix match: ${msg.channelName} (key: ${msg.key.substring(0, 16)}...)`);
+        showNotification(`Prefix match: ${msg.channelName} — trying decryption...`);
         break;
       case 'candidates':
         renderCandidates(msg.candidates);
         break;
       case 'key_found':
-        showNotification(`Confirmed key for packet #${msg.packetId}: ${msg.channelName}`);
+        showNotification(`Decrypted! Packet #${msg.packetId}: channel ${msg.channelName}`);
         break;
       case 'worker_update':
         updateWorkerDisplay(msg.workerId, msg.hashRate);
@@ -119,14 +119,18 @@ function renderPackets(packets) {
     const tr = document.createElement('tr');
     const badgeClass = p.status === 'cracked' ? 'badge-cracked' : p.status === 'cracking' ? 'badge-cracking' : 'badge-pending';
     const prefixHex = p.prefix.toString(16).padStart(2, '0');
+    const channelHash = p.channel_hash || prefixHex;
     tr.innerHTML = `
       <td>${p.id}</td>
-      <td>0x${prefixHex}</td>
+      <td>0x${channelHash}</td>
       <td><span class="badge ${badgeClass}">${p.status}</span></td>
       <td>${p.channel_name || '-'}</td>
       <td title="${p.cracked_key || ''}">${p.cracked_key ? p.cracked_key.substring(0, 16) + '...' : '-'}</td>
       <td>${new Date(p.created_at).toLocaleString()}</td>
-      <td><button class="btn-sm" onclick="deletePacket(${p.id})">Delete</button></td>
+      <td>
+        <button class="btn-sm" onclick="deletePacket(${p.id})">Delete</button>
+        ${p.status !== 'cracked' ? `<button class="btn-sm" onclick="autoDecrypt(${p.id})">Try Decrypt</button>` : ''}
+      </td>
     `;
     tbody.appendChild(tr);
   }
@@ -136,6 +140,20 @@ async function deletePacket(id) {
   await fetch(`/api/packets/${id}`, { method: 'DELETE' });
 }
 
+async function autoDecrypt(id) {
+  try {
+    const res = await fetch(`/api/packets/${id}/auto-decrypt`, { method: 'POST' });
+    const data = await res.json();
+    if (data.success) {
+      showNotification(`Decrypted packet #${id}!`);
+    } else {
+      showNotification(`No candidates decrypted packet #${id} yet.`);
+    }
+  } catch (err) {
+    console.error('Auto-decrypt failed:', err);
+  }
+}
+
 // ── Candidates Table ────────────────────────────────────────────────────────
 function renderCandidates(candidates) {
   const tbody = document.getElementById('candidates-table');
@@ -143,11 +161,19 @@ function renderCandidates(candidates) {
 
   for (const c of candidates) {
     const tr = document.createElement('tr');
+    const verifiedBadge = c.verified
+      ? (c.decode_success ? '<span class="badge badge-cracked">Yes</span>' : '<span class="badge badge-pending">No</span>')
+      : '<span class="badge">Pending</span>';
+    const decryptBadge = c.decode_success
+      ? '<span class="badge badge-cracked">Success</span>'
+      : (c.verified ? '<span class="badge badge-pending">Failed</span>' : '-');
     tr.innerHTML = `
       <td>#${c.packet_id}</td>
       <td>${c.channel_name}</td>
       <td title="${c.key}">${c.key.substring(0, 20)}...</td>
       <td>0x${c.prefix}</td>
+      <td>${verifiedBadge}</td>
+      <td>${decryptBadge}</td>
       <td>${new Date(c.created_at).toLocaleString()}</td>
     `;
     tbody.appendChild(tr);
@@ -196,10 +222,11 @@ document.getElementById('btn-upload').addEventListener('click', async () => {
       resultBox.textContent = data.error;
     } else if (data.alreadyKnown) {
       resultBox.classList.add('success');
-      resultBox.textContent = `Already known! Channel: ${data.knownChannel.channel_name}, Key: ${data.knownChannel.key}`;
+      resultBox.textContent = `Decrypted! Channel: ${data.knownChannel.channel_name}, Key: ${data.knownChannel.key}`;
     } else {
       resultBox.classList.add('info');
-      resultBox.textContent = `Packet queued (ID: ${data.packet.id}). Target prefix: 0x${data.prefixByte}. Work chunks created.`;
+      const hashInfo = data.decoded?.channelHash ? `Channel hash: 0x${data.decoded.channelHash}` : `Prefix: 0x${data.prefixByte}`;
+      resultBox.textContent = `Packet queued (ID: ${data.packet.id}). ${hashInfo}. Work chunks created.`;
     }
     resultBox.classList.remove('hidden');
     document.getElementById('raw-packet').value = '';
@@ -251,6 +278,46 @@ document.getElementById('btn-add-channel').addEventListener('click', async () =>
     document.getElementById('channel-prefix').value = '';
   } catch (err) {
     console.error('Failed to add channel:', err);
+  }
+});
+
+// ── Packet Decoder Tab ──────────────────────────────────────────────────────
+document.getElementById('btn-decode').addEventListener('click', async () => {
+  const hexData = document.getElementById('decode-hex').value.trim();
+  if (!hexData) return;
+
+  const channelKey = document.getElementById('decode-key').value.trim() || undefined;
+  const resultBox = document.getElementById('decode-result');
+  const jsonBox = document.getElementById('decode-json');
+
+  resultBox.classList.remove('hidden', 'success', 'info', 'error');
+  jsonBox.classList.add('hidden');
+
+  try {
+    const res = await fetch('/api/decode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hexData, channelKey })
+    });
+    const data = await res.json();
+
+    if (data.error) {
+      resultBox.classList.add('error');
+      resultBox.textContent = `Decode error: ${data.error}`;
+    } else {
+      resultBox.classList.add('success');
+      const payloadType = data.payloadType !== undefined ? `Type: ${data.payloadType}` : '';
+      const channelHash = data.payload?.decoded?.channelHash;
+      const hashInfo = channelHash !== undefined ? ` | Channel Hash: 0x${typeof channelHash === 'number' ? channelHash.toString(16).padStart(2, '0') : channelHash}` : '';
+      resultBox.textContent = `Decoded successfully. ${payloadType}${hashInfo}`;
+      jsonBox.textContent = JSON.stringify(data, null, 2);
+      jsonBox.classList.remove('hidden');
+    }
+    resultBox.classList.remove('hidden');
+  } catch (err) {
+    resultBox.classList.add('error');
+    resultBox.textContent = `Error: ${err.message}`;
+    resultBox.classList.remove('hidden');
   }
 });
 
@@ -334,22 +401,33 @@ function showNotification(message) {
 // ── Initial Load ────────────────────────────────────────────────────────────
 async function loadData() {
   try {
-    const [packetsRes, channelsRes, statsRes, candidatesRes] = await Promise.all([
+    const [packetsRes, channelsRes, statsRes, candidatesRes, decoderRes] = await Promise.all([
       fetch('/api/packets'),
       fetch('/api/channels'),
       fetch('/api/stats'),
       fetch('/api/candidates'),
+      fetch('/api/decoder-status'),
     ]);
     const packets = await packetsRes.json();
     const channels = await channelsRes.json();
     const stats = await statsRes.json();
     const candidates = await candidatesRes.json();
+    const decoderStatus = await decoderRes.json();
 
     renderPackets(packets);
     renderChannels(channels);
     updateStats(stats);
     renderCandidates(candidates);
     document.getElementById('worker-count').textContent = `Workers: ${stats.workerCount}`;
+
+    const decoderEl = document.getElementById('decoder-status');
+    if (decoderStatus.available) {
+      decoderEl.textContent = 'Decoder: Ready';
+      decoderEl.className = 'connected';
+    } else {
+      decoderEl.textContent = 'Decoder: N/A';
+      decoderEl.className = 'disconnected';
+    }
   } catch (err) {
     console.error('Failed to load initial data:', err);
   }

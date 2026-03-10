@@ -335,3 +335,31 @@ textarea:focus, input[type="text"]:focus {
 .cracking-controls .btn-danger {
   margin-top: 0;
 }
+
+/* ── JSON Output ──────────────────────────────────────────────── */
+.json-output {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px;
+  margin-top: 12px;
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 0.8rem;
+  color: var(--text);
+  overflow-x: auto;
+  max-height: 400px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+#decoder-status::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  background: var(--red);
+}
+#decoder-status.connected::before { background: var(--green); }

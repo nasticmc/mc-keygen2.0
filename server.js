@@ -4,6 +4,7 @@ const { WebSocketServer } = require('ws');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
 const path = require('path');
+const { execFile } = require('child_process');
 
 const app = express();
 const server = http.createServer(app);
@@ -20,12 +21,12 @@ app.use(express.static(path.join(__dirname, 'public')));
 function deriveChannelKey(channelName) {
   const name = channelName.startsWith('#') ? channelName : '#' + channelName;
   const hash = crypto.createHash('sha256').update(name).digest();
-  return hash.subarray(0, 16); // first 16 bytes
+  return hash.subarray(0, 16);
 }
 
 function derivePrefix(keyBuffer) {
   const hash = crypto.createHash('sha256').update(keyBuffer).digest();
-  return hash[0]; // first byte
+  return hash[0];
 }
 
 function deriveAll(channelName) {
@@ -38,15 +39,65 @@ function deriveAll(channelName) {
   };
 }
 
-// Extract prefix byte from raw packet data (first byte of the packet)
-function extractPrefixFromPacket(rawData) {
-  const cleaned = rawData.trim();
-  // If it looks like hex data, parse the first byte
-  const hexMatch = cleaned.match(/^([0-9a-fA-F]{2})/);
-  if (hexMatch) return parseInt(hexMatch[1], 16);
-  // If raw binary provided as decimal bytes
-  const byteMatch = cleaned.match(/^(\d{1,3})/);
-  if (byteMatch) return parseInt(byteMatch[1], 10) & 0xFF;
+// ── MeshCore Decoder Bridge (Python) ────────────────────────────────────────
+const DECODER_PY = path.join(__dirname, 'decoder.py');
+
+function runDecoder(args) {
+  return new Promise((resolve, reject) => {
+    execFile('python3', [DECODER_PY, ...args], { timeout: 30000 }, (err, stdout, stderr) => {
+      if (err) {
+        reject(new Error(stderr || err.message));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (parseErr) {
+        reject(new Error(`Invalid JSON from decoder: ${stdout}`));
+      }
+    });
+  });
+}
+
+async function decodePacket(hexData, channelKey) {
+  const args = channelKey ? ['decrypt', hexData, channelKey] : ['decode', hexData];
+  return runDecoder(args);
+}
+
+async function extractChannelHash(hexData) {
+  return runDecoder(['extract-hash', hexData]);
+}
+
+async function tryDecrypt(hexData, channelKey) {
+  return runDecoder(['decrypt', hexData, channelKey]);
+}
+
+// Auto-decrypt: try all candidate keys for a packet
+async function autoDecryptCandidates(packetId) {
+  const packet = stmts.getPacketById.get(packetId);
+  if (!packet || packet.status === 'cracked') return;
+
+  const candidates = stmts.getCandidates.all(packetId);
+  for (const candidate of candidates) {
+    if (candidate.verified) continue;
+
+    try {
+      const result = await tryDecrypt(packet.raw_data, candidate.key);
+      db.prepare('UPDATE candidate_keys SET verified = 1, decode_success = ? WHERE id = ?')
+        .run(result.success ? 1 : 0, candidate.id);
+
+      if (result.success) {
+        stmts.updatePacketStatus.run('cracked', candidate.key, candidate.channel_name, packetId);
+        db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
+          .run(packetId);
+        broadcast({ type: 'key_found', packetId, key: candidate.key, channelName: candidate.channel_name });
+        broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+        broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+        return result;
+      }
+    } catch (err) {
+      console.error(`Decrypt failed for candidate ${candidate.id}:`, err.message);
+    }
+  }
   return null;
 }
 
@@ -59,6 +110,8 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     raw_data TEXT NOT NULL,
     prefix INTEGER NOT NULL,
+    channel_hash TEXT,
+    decoded_json TEXT,
     status TEXT DEFAULT 'pending',
     cracked_key TEXT,
     channel_name TEXT,
@@ -103,7 +156,7 @@ db.exec(`
 
 // ── Prepared Statements ─────────────────────────────────────────────────────
 const stmts = {
-  insertPacket: db.prepare('INSERT INTO packets (raw_data, prefix) VALUES (?, ?)'),
+  insertPacket: db.prepare('INSERT INTO packets (raw_data, prefix, channel_hash, decoded_json) VALUES (?, ?, ?, ?)'),
   getPackets: db.prepare('SELECT * FROM packets ORDER BY created_at DESC'),
   getPacketById: db.prepare('SELECT * FROM packets WHERE id = ?'),
   updatePacketStatus: db.prepare('UPDATE packets SET status = ?, cracked_key = ?, channel_name = ?, cracked_at = CURRENT_TIMESTAMP WHERE id = ?'),
@@ -133,32 +186,16 @@ const stmts = {
 };
 
 // ── Work Chunk Generation ───────────────────────────────────────────────────
-// We brute-force channel names. The charset is alphanumeric + common chars.
-// Chunks represent ranges of a numeric index that maps to candidate strings.
 const CHUNK_SIZE = 500_000;
 
-// Character sets for name generation
 const CHARSETS = {
-  // a-z, 0-9 (lowercase only, most common for channel names)
   alnum: 'abcdefghijklmnopqrstuvwxyz0123456789',
-  // Include uppercase and common special chars
   full: 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.',
 };
 
-// Generate candidate strings by length tier
-// 1 char: 36 candidates (alnum)
-// 2 char: 36^2 = 1,296
-// 3 char: 36^3 = 46,656
-// 4 char: 36^4 = 1,679,616
-// 5 char: 36^5 = 60,466,176
-// 6 char: 36^6 = 2,176,782,336
-// Total through 5 chars: ~62M candidates
-// Total through 6 chars: ~2.2B candidates
-
 function createWorkChunks(packetId, targetPrefix) {
-  // Start with names up to 6 chars long using alnum charset
   const charset = CHARSETS.alnum;
-  const base = charset.length; // 36
+  const base = charset.length;
   let totalCandidates = 0;
   for (let len = 1; len <= 6; len++) {
     totalCandidates += Math.pow(base, len);
@@ -222,8 +259,6 @@ wss.on('connection', (ws) => {
       }
 
       case 'prefix_match': {
-        // Worker found a channel name whose derived prefix matches the target
-        // Store it as a candidate key for verification with meshcore-decoder
         const { packetId, channelName, key, prefix } = msg;
         stmts.insertCandidate.run(packetId, channelName, key, prefix);
         broadcast({
@@ -234,11 +269,35 @@ wss.on('connection', (ws) => {
           prefix,
         });
         broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
+
+        // Auto-try decryption with this candidate
+        const packet = stmts.getPacketById.get(packetId);
+        if (packet && packet.status !== 'cracked') {
+          tryDecrypt(packet.raw_data, key).then(result => {
+            const candidateRow = db.prepare('SELECT id FROM candidate_keys WHERE packet_id = ? AND key = ? ORDER BY id DESC LIMIT 1')
+              .get(packetId, key);
+            if (candidateRow) {
+              db.prepare('UPDATE candidate_keys SET verified = 1, decode_success = ? WHERE id = ?')
+                .run(result.success ? 1 : 0, candidateRow.id);
+            }
+
+            if (result.success) {
+              stmts.updatePacketStatus.run('cracked', key, channelName, packetId);
+              db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
+                .run(packetId);
+              broadcast({ type: 'key_found', packetId, key, channelName, decoded: result.decoded });
+              broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+              broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+            }
+            broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
+          }).catch(err => {
+            console.error('Auto-decrypt error:', err.message);
+          });
+        }
         break;
       }
 
       case 'key_found': {
-        // Confirmed working key (verified via meshcore-decoder)
         stmts.updatePacketStatus.run('cracked', msg.key, msg.channelName || null, msg.packetId);
         db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
           .run(msg.packetId);
@@ -269,35 +328,70 @@ app.get('/api/packets', (req, res) => {
   res.json(stmts.getPackets.all());
 });
 
-app.post('/api/packets', (req, res) => {
+// Upload a packet — decode it with meshcoredecoder to extract channelHash
+app.post('/api/packets', async (req, res) => {
   const { rawData } = req.body;
   if (!rawData) return res.status(400).json({ error: 'rawData required' });
 
-  const prefix = extractPrefixFromPacket(rawData);
-  if (prefix === null) return res.status(400).json({ error: 'Could not extract prefix byte from packet' });
+  const hexData = rawData.trim().replace(/\s+/g, '');
+
+  // Decode the packet to extract channelHash
+  let decoded = null;
+  let channelHash = null;
+  let prefix = null;
+
+  try {
+    decoded = await extractChannelHash(hexData);
+    channelHash = decoded.channelHash;
+    if (channelHash !== null && channelHash !== undefined) {
+      prefix = parseInt(channelHash, 16);
+    }
+  } catch (err) {
+    console.error('Decoder error:', err.message);
+  }
+
+  // If decoder couldn't extract channelHash, fall back to raw first byte
+  if (prefix === null) {
+    const hexMatch = hexData.match(/^([0-9a-fA-F]{2})/);
+    if (hexMatch) {
+      prefix = parseInt(hexMatch[1], 16);
+    }
+  }
+
+  if (prefix === null) {
+    return res.status(400).json({ error: 'Could not extract channel hash from packet' });
+  }
 
   const prefixHex = prefix.toString(16).padStart(2, '0');
 
   // Check against known channels with matching prefix
   const known = stmts.findByPrefix.all(prefixHex);
   if (known.length > 0) {
-    // Try each known key — for now just report the first match
-    const match = known[0];
-    const result = stmts.insertPacket.run(rawData, prefix);
-    stmts.updatePacketStatus.run('cracked', match.key, match.channel_name, result.lastInsertRowid);
-    const packet = stmts.getPacketById.get(result.lastInsertRowid);
-    broadcast({ type: 'packets', packets: stmts.getPackets.all() });
-    return res.json({ packet, alreadyKnown: true, knownChannel: match });
+    // Try to actually decrypt with each known key
+    for (const match of known) {
+      try {
+        const decryptResult = await tryDecrypt(hexData, match.key);
+        if (decryptResult.success) {
+          const result = stmts.insertPacket.run(hexData, prefix, channelHash, JSON.stringify(decoded));
+          stmts.updatePacketStatus.run('cracked', match.key, match.channel_name, result.lastInsertRowid);
+          const packet = stmts.getPacketById.get(result.lastInsertRowid);
+          broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+          return res.json({ packet, alreadyKnown: true, knownChannel: match, decoded: decryptResult.decoded });
+        }
+      } catch (err) {
+        console.error('Known key decrypt failed:', err.message);
+      }
+    }
   }
 
-  const result = stmts.insertPacket.run(rawData, prefix);
+  const result = stmts.insertPacket.run(hexData, prefix, channelHash, decoded ? JSON.stringify(decoded) : null);
   createWorkChunks(result.lastInsertRowid, prefix);
   const packet = stmts.getPacketById.get(result.lastInsertRowid);
 
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
   broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
 
-  res.json({ packet, alreadyKnown: false, prefixByte: prefixHex });
+  res.json({ packet, alreadyKnown: false, prefixByte: prefixHex, decoded });
 });
 
 app.delete('/api/packets/:id', (req, res) => {
@@ -309,6 +403,42 @@ app.delete('/api/packets/:id', (req, res) => {
   res.json({ ok: true });
 });
 
+// Decode a packet (without saving)
+app.post('/api/decode', async (req, res) => {
+  const { hexData, channelKey } = req.body;
+  if (!hexData) return res.status(400).json({ error: 'hexData required' });
+
+  try {
+    const result = await decodePacket(hexData.trim().replace(/\s+/g, ''), channelKey);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Try to decrypt a packet with a specific key
+app.post('/api/decrypt', async (req, res) => {
+  const { hexData, channelKey } = req.body;
+  if (!hexData || !channelKey) return res.status(400).json({ error: 'hexData and channelKey required' });
+
+  try {
+    const result = await tryDecrypt(hexData.trim().replace(/\s+/g, ''), channelKey);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Auto-decrypt all candidates for a packet
+app.post('/api/packets/:id/auto-decrypt', async (req, res) => {
+  try {
+    const result = await autoDecryptCandidates(parseInt(req.params.id));
+    res.json({ success: !!result, result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/channels', (req, res) => {
   res.json(stmts.getKnownChannels.all());
 });
@@ -317,9 +447,7 @@ app.post('/api/channels', (req, res) => {
   let { channelName } = req.body;
   if (!channelName) return res.status(400).json({ error: 'channelName required' });
 
-  // Derive key and prefix from channel name using MeshCore algorithm
   const derived = deriveAll(channelName);
-
   stmts.insertKnownChannel.run(derived.channelName, derived.key, derived.prefix);
   broadcast({ type: 'channels', channels: stmts.getKnownChannels.all() });
   res.json({ ok: true, ...derived });
@@ -349,15 +477,30 @@ app.get('/api/stats', (req, res) => {
   res.json({ ...stats, workers: workerList, workerCount: workers.size });
 });
 
-// ── Derive endpoint (for frontend auto-populate) ────────────────────────────
 app.post('/api/derive', (req, res) => {
   const { channelName } = req.body;
   if (!channelName) return res.status(400).json({ error: 'channelName required' });
   res.json(deriveAll(channelName));
 });
 
+// Decoder health check
+app.get('/api/decoder-status', async (req, res) => {
+  try {
+    const result = await runDecoder(['check', 'x']);
+    res.json(result);
+  } catch (err) {
+    res.json({ available: false, error: err.message });
+  }
+});
+
 // ── Start ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`MC-Keygen 2.0 running on http://localhost:${PORT}`);
+  // Check decoder on startup
+  runDecoder(['check', 'x']).then(r => {
+    console.log(`meshcoredecoder: ${r.available ? 'available' : 'NOT available'}`);
+  }).catch(() => {
+    console.log('meshcoredecoder: NOT available (decoder.py failed)');
+  });
 });

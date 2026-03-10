@@ -11,6 +11,7 @@
     <h1>MC-Keygen 2.0</h1>
     <div class="status-bar">
       <span id="worker-count">Workers: 0</span>
+      <span id="decoder-status" class="disconnected">Decoder: Checking...</span>
       <span id="connection-status" class="disconnected">Disconnected</span>
     </div>
   </header>
@@ -19,13 +20,14 @@
     <button class="tab active" data-tab="upload">Upload Packets</button>
     <button class="tab" data-tab="cracking">Cracking Queue</button>
     <button class="tab" data-tab="channels">Known Channels</button>
+    <button class="tab" data-tab="decoder">Packet Decoder</button>
   </nav>
 
   <!-- ── Upload Tab ──────────────────────────────────────────────────── -->
   <section id="tab-upload" class="tab-content active">
     <div class="panel">
       <h2>Upload Raw Packet</h2>
-      <p class="hint">Paste raw packet hex data. The first byte is extracted as the channel prefix to crack against.</p>
+      <p class="hint">Paste raw packet hex data. It will be decoded with meshcoredecoder to extract the channelHash for cracking.</p>
       <textarea id="raw-packet" rows="10" placeholder="Paste raw packet hex data here..."></textarea>
       <button id="btn-upload" class="btn-primary">Upload & Queue</button>
       <div id="upload-result" class="result-box hidden"></div>
@@ -71,7 +73,7 @@
         <thead>
           <tr>
             <th>ID</th>
-            <th>Prefix</th>
+            <th>Channel Hash</th>
             <th>Status</th>
             <th>Channel</th>
             <th>Key</th>
@@ -85,7 +87,7 @@
 
     <div class="panel">
       <h3>Candidate Keys (prefix matches)</h3>
-      <p class="hint">Channel names whose derived prefix matches the target. Use meshcore-decoder to verify.</p>
+      <p class="hint">Channel names whose derived prefix matches the target. Server auto-tries decryption via meshcoredecoder.</p>
       <table class="data-table">
         <thead>
           <tr>
@@ -93,6 +95,8 @@
             <th>Channel Name</th>
             <th>Key (hex)</th>
             <th>Prefix</th>
+            <th>Verified</th>
+            <th>Decrypted</th>
             <th>Found At</th>
           </tr>
         </thead>
@@ -129,6 +133,19 @@
         </thead>
         <tbody id="channels-table"></tbody>
       </table>
+    </div>
+  </section>
+
+  <!-- ── Packet Decoder Tab ──────────────────────────────────────────── -->
+  <section id="tab-decoder" class="tab-content">
+    <div class="panel">
+      <h2>Packet Decoder</h2>
+      <p class="hint">Decode a MeshCore packet. Optionally provide a channel key for decryption.</p>
+      <textarea id="decode-hex" rows="6" placeholder="Paste packet hex data..."></textarea>
+      <input type="text" id="decode-key" placeholder="Channel key (hex, optional — for decryption)">
+      <button id="btn-decode" class="btn-primary">Decode</button>
+      <div id="decode-result" class="result-box hidden"></div>
+      <pre id="decode-json" class="json-output hidden"></pre>
     </div>
   </section>
 
