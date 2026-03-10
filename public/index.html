@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MC-Keygen 2.0</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>MC-Keygen 2.0</h1>
+    <div class="status-bar">
+      <span id="worker-count">Workers: 0</span>
+      <span id="connection-status" class="disconnected">Disconnected</span>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="upload">Upload Packets</button>
+    <button class="tab" data-tab="cracking">Cracking Queue</button>
+    <button class="tab" data-tab="channels">Known Channels</button>
+  </nav>
+
+  <!-- ── Upload Tab ──────────────────────────────────────────────────── -->
+  <section id="tab-upload" class="tab-content active">
+    <div class="panel">
+      <h2>Upload Raw Packet</h2>
+      <p class="hint">Paste raw packet data below. It will be checked against known keys before queuing.</p>
+      <textarea id="raw-packet" rows="10" placeholder="Paste raw packet hex data here..."></textarea>
+      <button id="btn-upload" class="btn-primary">Upload & Queue</button>
+      <div id="upload-result" class="result-box hidden"></div>
+    </div>
+  </section>
+
+  <!-- ── Cracking Tab ────────────────────────────────────────────────── -->
+  <section id="tab-cracking" class="tab-content">
+    <div class="panel">
+      <h2>Cracking Queue</h2>
+      <div class="cracking-controls">
+        <button id="btn-start-cracking" class="btn-primary">Start Cracking</button>
+        <button id="btn-stop-cracking" class="btn-danger hidden">Stop Cracking</button>
+        <span id="gpu-status" class="gpu-badge">WebGPU: Checking...</span>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-value" id="stat-pending">0</div>
+          <div class="stat-label">Pending Chunks</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="stat-assigned">0</div>
+          <div class="stat-label">In Progress</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="stat-completed">0</div>
+          <div class="stat-label">Completed</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="stat-hashrate">0</div>
+          <div class="stat-label">Hashes/sec</div>
+        </div>
+      </div>
+
+      <div class="progress-bar-container">
+        <div class="progress-bar" id="progress-bar"></div>
+        <span class="progress-text" id="progress-text">0%</span>
+      </div>
+
+      <h3>Packet Queue</h3>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Hash</th>
+            <th>Status</th>
+            <th>Key</th>
+            <th>Created</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="packets-table"></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h3>Connected Workers</h3>
+      <div id="workers-list" class="workers-grid"></div>
+    </div>
+  </section>
+
+  <!-- ── Known Channels Tab ──────────────────────────────────────────── -->
+  <section id="tab-channels" class="tab-content">
+    <div class="panel">
+      <h2>Known Channels</h2>
+      <div class="add-channel-form">
+        <input type="text" id="channel-name" placeholder="Channel name">
+        <input type="text" id="channel-hash" placeholder="Hash (auto-generated if empty)">
+        <input type="text" id="channel-key" placeholder="Key (auto-generated if empty)">
+        <input type="text" id="channel-prefix" placeholder="Prefix (auto-generated if empty)">
+        <button id="btn-add-channel" class="btn-primary">Add Channel</button>
+      </div>
+
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Channel Name</th>
+            <th>Hash</th>
+            <th>Key</th>
+            <th>Prefix</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="channels-table"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <script src="gpu-cracker.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

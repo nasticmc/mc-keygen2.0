@@ -1,0 +1,4 @@
+node_modules/
+keygen.db
+*.db-wal
+*.db-shm
