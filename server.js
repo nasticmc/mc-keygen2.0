@@ -4,7 +4,7 @@ const { WebSocketServer } = require('ws');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
 const path = require('path');
-const { execFile } = require('child_process');
+const { MeshCorePacketDecoder } = require('@michaelhart/meshcore-decoder');
 
 const app = express();
 const server = http.createServer(app);
@@ -39,40 +39,55 @@ function deriveAll(channelName) {
   };
 }
 
-// ── MeshCore Decoder Bridge (Python) ────────────────────────────────────────
-const DECODER_PY = path.join(__dirname, 'decoder.py');
+// ── MeshCore Decoder (Node.js) ───────────────────────────────────────────────
 
-function runDecoder(args) {
-  return new Promise((resolve, reject) => {
-    execFile('python3', [DECODER_PY, ...args], { timeout: 30000 }, (err, stdout, stderr) => {
-      if (err) {
-        reject(new Error(stderr || err.message));
-        return;
-      }
-      try {
-        resolve(JSON.parse(stdout));
-      } catch (parseErr) {
-        reject(new Error(`Invalid JSON from decoder: ${stdout}`));
-      }
-    });
-  });
+function decodePacket(hexData, channelKey) {
+  let options;
+  if (channelKey) {
+    const keyStore = MeshCorePacketDecoder.createKeyStore({ channelSecrets: [channelKey.trim()] });
+    options = { keyStore, attemptDecryption: true };
+  }
+  try {
+    return MeshCorePacketDecoder.decode(hexData, options);
+  } catch (err) {
+    return { error: err.message };
+  }
 }
 
-async function decodePacket(hexData, channelKey) {
-  const args = channelKey ? ['decrypt', hexData, channelKey] : ['decode', hexData];
-  return runDecoder(args);
+function extractChannelHash(hexData) {
+  try {
+    const decoded = MeshCorePacketDecoder.decode(hexData);
+    const channelHash = decoded.payload?.decoded?.channelHash ?? null;
+    return {
+      channelHash,
+      payloadType: decoded.payloadType,
+      isValid: decoded.isValid,
+      decoded,
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
 }
 
-async function extractChannelHash(hexData) {
-  return runDecoder(['extract-hash', hexData]);
-}
-
-async function tryDecrypt(hexData, channelKey) {
-  return runDecoder(['decrypt', hexData, channelKey]);
+function tryDecrypt(hexData, channelKey) {
+  const keyStore = MeshCorePacketDecoder.createKeyStore({ channelSecrets: [channelKey.trim()] });
+  const options = { keyStore, attemptDecryption: true };
+  try {
+    const decoded = MeshCorePacketDecoder.decode(hexData, options);
+    const payloadDecoded = decoded.payload?.decoded;
+    const decrypted = payloadDecoded?.decrypted ?? payloadDecoded?.message ?? null;
+    return {
+      success: decrypted !== null,
+      decoded,
+      channelKey,
+    };
+  } catch (err) {
+    return { error: err.message, success: false };
+  }
 }
 
 // Auto-decrypt: try all candidate keys for a packet
-async function autoDecryptCandidates(packetId) {
+function autoDecryptCandidates(packetId) {
   const packet = stmts.getPacketById.get(packetId);
   if (!packet || packet.status === 'cracked') return;
 
@@ -81,7 +96,7 @@ async function autoDecryptCandidates(packetId) {
     if (candidate.verified) continue;
 
     try {
-      const result = await tryDecrypt(packet.raw_data, candidate.key);
+      const result = tryDecrypt(packet.raw_data, candidate.key);
       db.prepare('UPDATE candidate_keys SET verified = 1, decode_success = ? WHERE id = ?')
         .run(result.success ? 1 : 0, candidate.id);
 
@@ -273,7 +288,8 @@ wss.on('connection', (ws) => {
         // Auto-try decryption with this candidate
         const packet = stmts.getPacketById.get(packetId);
         if (packet && packet.status !== 'cracked') {
-          tryDecrypt(packet.raw_data, key).then(result => {
+          try {
+            const result = tryDecrypt(packet.raw_data, key);
             const candidateRow = db.prepare('SELECT id FROM candidate_keys WHERE packet_id = ? AND key = ? ORDER BY id DESC LIMIT 1')
               .get(packetId, key);
             if (candidateRow) {
@@ -290,9 +306,9 @@ wss.on('connection', (ws) => {
               broadcast({ type: 'packets', packets: stmts.getPackets.all() });
             }
             broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
-          }).catch(err => {
+          } catch (err) {
             console.error('Auto-decrypt error:', err.message);
-          });
+          }
         }
         break;
       }
@@ -329,7 +345,7 @@ app.get('/api/packets', (req, res) => {
 });
 
 // Upload a packet — decode it with meshcoredecoder to extract channelHash
-app.post('/api/packets', async (req, res) => {
+app.post('/api/packets', (req, res) => {
   const { rawData } = req.body;
   if (!rawData) return res.status(400).json({ error: 'rawData required' });
 
@@ -341,7 +357,7 @@ app.post('/api/packets', async (req, res) => {
   let prefix = null;
 
   try {
-    decoded = await extractChannelHash(hexData);
+    decoded = extractChannelHash(hexData);
     channelHash = decoded.channelHash;
     if (channelHash !== null && channelHash !== undefined) {
       prefix = parseInt(channelHash, 16);
@@ -370,7 +386,7 @@ app.post('/api/packets', async (req, res) => {
     // Try to actually decrypt with each known key
     for (const match of known) {
       try {
-        const decryptResult = await tryDecrypt(hexData, match.key);
+        const decryptResult = tryDecrypt(hexData, match.key);
         if (decryptResult.success) {
           const result = stmts.insertPacket.run(hexData, prefix, channelHash, JSON.stringify(decoded));
           stmts.updatePacketStatus.run('cracked', match.key, match.channel_name, result.lastInsertRowid);
@@ -404,35 +420,27 @@ app.delete('/api/packets/:id', (req, res) => {
 });
 
 // Decode a packet (without saving)
-app.post('/api/decode', async (req, res) => {
+app.post('/api/decode', (req, res) => {
   const { hexData, channelKey } = req.body;
   if (!hexData) return res.status(400).json({ error: 'hexData required' });
 
-  try {
-    const result = await decodePacket(hexData.trim().replace(/\s+/g, ''), channelKey);
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const result = decodePacket(hexData.trim().replace(/\s+/g, ''), channelKey);
+  res.json(result);
 });
 
 // Try to decrypt a packet with a specific key
-app.post('/api/decrypt', async (req, res) => {
+app.post('/api/decrypt', (req, res) => {
   const { hexData, channelKey } = req.body;
   if (!hexData || !channelKey) return res.status(400).json({ error: 'hexData and channelKey required' });
 
-  try {
-    const result = await tryDecrypt(hexData.trim().replace(/\s+/g, ''), channelKey);
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const result = tryDecrypt(hexData.trim().replace(/\s+/g, ''), channelKey);
+  res.json(result);
 });
 
 // Auto-decrypt all candidates for a packet
-app.post('/api/packets/:id/auto-decrypt', async (req, res) => {
+app.post('/api/packets/:id/auto-decrypt', (req, res) => {
   try {
-    const result = await autoDecryptCandidates(parseInt(req.params.id));
+    const result = autoDecryptCandidates(parseInt(req.params.id));
     res.json({ success: !!result, result });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -484,23 +492,14 @@ app.post('/api/derive', (req, res) => {
 });
 
 // Decoder health check
-app.get('/api/decoder-status', async (req, res) => {
-  try {
-    const result = await runDecoder(['check', 'x']);
-    res.json(result);
-  } catch (err) {
-    res.json({ available: false, error: err.message });
-  }
+app.get('/api/decoder-status', (req, res) => {
+  res.json({ available: true, version: require('@michaelhart/meshcore-decoder/package.json').version });
 });
 
 // ── Start ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`MC-Keygen 2.0 running on http://localhost:${PORT}`);
-  // Check decoder on startup
-  runDecoder(['check', 'x']).then(r => {
-    console.log(`meshcoredecoder: ${r.available ? 'available' : 'NOT available'}`);
-  }).catch(() => {
-    console.log('meshcoredecoder: NOT available (decoder.py failed)');
-  });
+  const decoderVersion = require('@michaelhart/meshcore-decoder/package.json').version;
+  console.log(`meshcoredecoder: available (v${decoderVersion})`);
 });
