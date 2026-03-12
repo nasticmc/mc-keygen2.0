@@ -54,6 +54,7 @@ function connectWebSocket() {
         break;
       case 'key_found':
         showNotification(`Decrypted! Packet #${msg.packetId}: channel ${msg.channelName}`);
+        loadDecodedPackets();
         break;
       case 'worker_update':
         updateWorkerDisplay(msg.workerId, msg.hashRate);
@@ -199,6 +200,122 @@ function renderChannels(channels) {
 
 async function deleteChannel(id) {
   await fetch(`/api/channels/${id}`, { method: 'DELETE' });
+}
+
+// ── Decoded Packets Tab ─────────────────────────────────────────────────────
+async function loadDecodedPackets() {
+  try {
+    const res = await fetch('/api/packets/decoded');
+    const packets = await res.json();
+    renderDecodedPackets(packets);
+  } catch (err) {
+    console.error('Failed to load decoded packets:', err);
+  }
+}
+
+function renderDecodedPackets(packets) {
+  const container = document.getElementById('decoded-packets-list');
+  const empty = document.getElementById('decoded-empty');
+  container.innerHTML = '';
+
+  if (packets.length === 0) {
+    empty.classList.remove('hidden');
+    return;
+  }
+  empty.classList.add('hidden');
+
+  for (const p of packets) {
+    const card = document.createElement('div');
+    card.className = 'decoded-card';
+
+    let decoded = null;
+    try {
+      decoded = p.decrypted_json ? JSON.parse(p.decrypted_json) : null;
+    } catch {}
+
+    const crackedAt = p.cracked_at ? new Date(p.cracked_at).toLocaleString() : 'Unknown';
+    const keyShort = p.cracked_key ? p.cracked_key.substring(0, 16) + '...' : '-';
+
+    let messageHtml = '';
+    if (decoded) {
+      const highlighted = extractMessageFields(decoded);
+      if (highlighted.length > 0) {
+        messageHtml = `<div class="decoded-message-fields">${highlighted.map(({ label, value }) =>
+          `<div class="decoded-field"><span class="decoded-field-label">${label}</span><span class="decoded-field-value">${escapeHtml(String(value))}</span></div>`
+        ).join('')}</div>`;
+      }
+      const jsonId = `json-${p.id}`;
+      messageHtml += `
+        <button class="btn-sm decoded-toggle" onclick="toggleJson('${jsonId}')">View Raw JSON</button>
+        <pre id="${jsonId}" class="json-output hidden">${escapeHtml(JSON.stringify(decoded, null, 2))}</pre>
+      `;
+    } else {
+      messageHtml = `
+        <p class="decoded-no-data">No decoded content stored.</p>
+        <button class="btn-sm btn-decode-now" onclick="decodeNow(${p.id})">Decode Now</button>
+        <div id="decode-now-result-${p.id}"></div>
+      `;
+    }
+
+    card.innerHTML = `
+      <div class="decoded-card-header">
+        <span class="decoded-card-id">Packet #${p.id}</span>
+        ${p.channel_name ? `<span class="badge badge-cracked">${escapeHtml(p.channel_name)}</span>` : ''}
+        <span class="decoded-card-time">${crackedAt}</span>
+      </div>
+      <div class="decoded-card-key">Key: <span title="${p.cracked_key || ''}">${keyShort}</span></div>
+      <div class="decoded-card-body">${messageHtml}</div>
+    `;
+    container.appendChild(card);
+  }
+}
+
+function extractMessageFields(decoded) {
+  const interesting = ['message', 'text', 'msg', 'content', 'sender', 'from', 'source',
+    'type', 'payloadType', 'channelName', 'node', 'snr', 'rssi', 'timestamp'];
+  const fields = [];
+
+  function search(obj, path) {
+    if (typeof obj !== 'object' || obj === null) return;
+    for (const [k, v] of Object.entries(obj)) {
+      const key = k.toLowerCase();
+      if (interesting.some(name => key === name || key.includes(name))) {
+        if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+          fields.push({ label: k, value: v });
+        }
+      }
+      if (typeof v === 'object' && v !== null && fields.length < 12) {
+        search(v, path + '.' + k);
+      }
+    }
+  }
+  search(decoded, '');
+  return fields;
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function toggleJson(id) {
+  const el = document.getElementById(id);
+  if (el) el.classList.toggle('hidden');
+}
+
+async function decodeNow(packetId) {
+  const resultEl = document.getElementById(`decode-now-result-${packetId}`);
+  resultEl.textContent = 'Decoding...';
+  try {
+    const res = await fetch(`/api/packets/${packetId}/decode`, { method: 'POST' });
+    const data = await res.json();
+    if (data.error) {
+      resultEl.textContent = `Error: ${data.error}`;
+    } else {
+      await loadDecodedPackets();
+    }
+  } catch (err) {
+    resultEl.textContent = `Error: ${err.message}`;
+  }
 }
 
 // ── Upload Packet ───────────────────────────────────────────────────────────
@@ -401,23 +518,26 @@ function showNotification(message) {
 // ── Initial Load ────────────────────────────────────────────────────────────
 async function loadData() {
   try {
-    const [packetsRes, channelsRes, statsRes, candidatesRes, decoderRes] = await Promise.all([
+    const [packetsRes, channelsRes, statsRes, candidatesRes, decoderRes, decodedRes] = await Promise.all([
       fetch('/api/packets'),
       fetch('/api/channels'),
       fetch('/api/stats'),
       fetch('/api/candidates'),
       fetch('/api/decoder-status'),
+      fetch('/api/packets/decoded'),
     ]);
     const packets = await packetsRes.json();
     const channels = await channelsRes.json();
     const stats = await statsRes.json();
     const candidates = await candidatesRes.json();
     const decoderStatus = await decoderRes.json();
+    const decodedPackets = await decodedRes.json();
 
     renderPackets(packets);
     renderChannels(channels);
     updateStats(stats);
     renderCandidates(candidates);
+    renderDecodedPackets(decodedPackets);
     document.getElementById('worker-count').textContent = `Workers: ${stats.workerCount}`;
 
     const decoderEl = document.getElementById('decoder-status');

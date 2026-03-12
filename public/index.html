@@ -21,6 +21,7 @@
     <button class="tab" data-tab="cracking">Cracking Queue</button>
     <button class="tab" data-tab="channels">Known Channels</button>
     <button class="tab" data-tab="decoder">Packet Decoder</button>
+    <button class="tab" data-tab="decoded">Decoded Packets</button>
   </nav>
 
   <!-- ── Upload Tab ──────────────────────────────────────────────────── -->
@@ -146,6 +147,16 @@
       <button id="btn-decode" class="btn-primary">Decode</button>
       <div id="decode-result" class="result-box hidden"></div>
       <pre id="decode-json" class="json-output hidden"></pre>
+    </div>
+  </section>
+
+  <!-- ── Decoded Packets Tab ─────────────────────────────────────────── -->
+  <section id="tab-decoded" class="tab-content">
+    <div class="panel">
+      <h2>Decoded Packets</h2>
+      <p class="hint">Packets that have been cracked and decoded using the recovered channel key via meshcoredecoder.</p>
+      <div id="decoded-empty" class="decoded-empty hidden">No decoded packets yet. Cracked packets will appear here automatically.</div>
+      <div id="decoded-packets-list"></div>
     </div>
   </section>
 
