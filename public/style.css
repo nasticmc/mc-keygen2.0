@@ -363,3 +363,101 @@ textarea:focus, input[type="text"]:focus {
   background: var(--red);
 }
 #decoder-status.connected::before { background: var(--green); }
+
+/* ── Decoded Packets ──────────────────────────────────────────────── */
+.decoded-empty {
+  color: var(--text-dim);
+  padding: 32px;
+  text-align: center;
+  font-size: 0.9rem;
+}
+
+.decoded-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-bottom: 12px;
+}
+
+.decoded-card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.decoded-card-id {
+  font-weight: 700;
+  color: var(--accent);
+  font-size: 0.95rem;
+}
+
+.decoded-card-time {
+  margin-left: auto;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+.decoded-card-key {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+}
+
+.decoded-card-key span {
+  color: var(--text);
+}
+
+.decoded-card-body {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.decoded-message-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 6px 16px;
+  margin-bottom: 12px;
+}
+
+.decoded-field {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 0.85rem;
+  overflow: hidden;
+}
+
+.decoded-field-label {
+  color: var(--text-dim);
+  white-space: nowrap;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  min-width: 72px;
+}
+
+.decoded-field-value {
+  color: var(--text);
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.decoded-no-data {
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  margin-bottom: 8px;
+}
+
+.decoded-toggle {
+  margin-bottom: 8px;
+}
+
+.btn-decode-now {
+  border-color: var(--accent);
+  color: var(--accent);
+}

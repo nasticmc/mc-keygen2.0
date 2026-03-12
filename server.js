@@ -102,9 +102,10 @@ function autoDecryptCandidates(packetId) {
 
       if (result.success) {
         stmts.updatePacketStatus.run('cracked', candidate.key, candidate.channel_name, packetId);
+        if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), packetId);
         db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
           .run(packetId);
-        broadcast({ type: 'key_found', packetId, key: candidate.key, channelName: candidate.channel_name });
+        broadcast({ type: 'key_found', packetId, key: candidate.key, channelName: candidate.channel_name, decoded: result.decoded });
         broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
         broadcast({ type: 'packets', packets: stmts.getPackets.all() });
         return result;
@@ -169,6 +170,9 @@ db.exec(`
   );
 `);
 
+// Migration: add decrypted_json column for storing decoded message content
+try { db.exec('ALTER TABLE packets ADD COLUMN decrypted_json TEXT'); } catch {}
+
 // ── Prepared Statements ─────────────────────────────────────────────────────
 const stmts = {
   insertPacket: db.prepare('INSERT INTO packets (raw_data, prefix, channel_hash, decoded_json) VALUES (?, ?, ?, ?)'),
@@ -198,6 +202,8 @@ const stmts = {
   insertCandidate: db.prepare('INSERT INTO candidate_keys (packet_id, channel_name, key, prefix) VALUES (?, ?, ?, ?)'),
   getCandidates: db.prepare('SELECT * FROM candidate_keys WHERE packet_id = ? ORDER BY created_at DESC'),
   getAllCandidates: db.prepare('SELECT * FROM candidate_keys ORDER BY created_at DESC LIMIT 100'),
+  updatePacketDecrypted: db.prepare('UPDATE packets SET decrypted_json = ? WHERE id = ?'),
+  getDecodedPackets: db.prepare("SELECT * FROM packets WHERE status = 'cracked' ORDER BY cracked_at DESC"),
 };
 
 // ── Work Chunk Generation ───────────────────────────────────────────────────
@@ -299,6 +305,7 @@ wss.on('connection', (ws) => {
 
             if (result.success) {
               stmts.updatePacketStatus.run('cracked', key, channelName, packetId);
+              if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), packetId);
               db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
                 .run(packetId);
               broadcast({ type: 'key_found', packetId, key, channelName, decoded: result.decoded });
@@ -342,6 +349,25 @@ wss.on('connection', (ws) => {
 
 app.get('/api/packets', (req, res) => {
   res.json(stmts.getPackets.all());
+});
+
+app.get('/api/packets/decoded', (req, res) => {
+  res.json(stmts.getDecodedPackets.all());
+});
+
+// Re-run decoder on an already-cracked packet and store the result
+app.post('/api/packets/:id/decode', async (req, res) => {
+  const packet = stmts.getPacketById.get(parseInt(req.params.id));
+  if (!packet) return res.status(404).json({ error: 'Packet not found' });
+  if (!packet.cracked_key) return res.status(400).json({ error: 'Packet not yet cracked' });
+
+  try {
+    const result = await tryDecrypt(packet.raw_data, packet.cracked_key);
+    if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), packet.id);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Upload a packet — decode it with meshcoredecoder to extract channelHash
@@ -390,6 +416,7 @@ app.post('/api/packets', (req, res) => {
         if (decryptResult.success) {
           const result = stmts.insertPacket.run(hexData, prefix, channelHash, JSON.stringify(decoded));
           stmts.updatePacketStatus.run('cracked', match.key, match.channel_name, result.lastInsertRowid);
+          if (decryptResult.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(decryptResult.decoded), result.lastInsertRowid);
           const packet = stmts.getPacketById.get(result.lastInsertRowid);
           broadcast({ type: 'packets', packets: stmts.getPackets.all() });
           return res.json({ packet, alreadyKnown: true, knownChannel: match, decoded: decryptResult.decoded });
