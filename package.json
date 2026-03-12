@@ -15,6 +15,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@michaelhart/meshcore-decoder": "^0.2.7",
     "better-sqlite3": "^12.6.2",
     "express": "^5.2.1",
     "ws": "^8.19.0"
