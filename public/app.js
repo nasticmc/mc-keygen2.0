@@ -81,6 +81,14 @@ function formatNumber(n) {
   return String(n);
 }
 
+// Convert SQLite UTC timestamp (YYYY-MM-DD HH:MM:SS) to local time string
+function formatLocalTime(ts) {
+  if (!ts) return 'Unknown';
+  // SQLite stores UTC without 'Z'; append it so Date parses correctly as UTC
+  const normalized = ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z';
+  return new Date(normalized).toLocaleString();
+}
+
 function formatHashRate(n) {
   if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + ' GH/s';
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + ' MH/s';
@@ -127,7 +135,7 @@ function renderPackets(packets) {
       <td><span class="badge ${badgeClass}">${p.status}</span></td>
       <td>${p.channel_name || '-'}</td>
       <td title="${p.cracked_key || ''}">${p.cracked_key ? p.cracked_key.substring(0, 16) + '...' : '-'}</td>
-      <td>${new Date(p.created_at).toLocaleString()}</td>
+      <td>${formatLocalTime(p.created_at)}</td>
       <td>
         <button class="btn-sm" onclick="deletePacket(${p.id})">Delete</button>
         ${p.status !== 'cracked' ? `<button class="btn-sm" onclick="autoDecrypt(${p.id})">Try Decrypt</button>` : ''}
@@ -175,7 +183,7 @@ function renderCandidates(candidates) {
       <td>0x${c.prefix}</td>
       <td>${verifiedBadge}</td>
       <td>${decryptBadge}</td>
-      <td>${new Date(c.created_at).toLocaleString()}</td>
+      <td>${formatLocalTime(c.created_at)}</td>
     `;
     tbody.appendChild(tr);
   }
@@ -233,7 +241,7 @@ function renderDecodedPackets(packets) {
       decoded = p.decrypted_json ? JSON.parse(p.decrypted_json) : null;
     } catch {}
 
-    const crackedAt = p.cracked_at ? new Date(p.cracked_at).toLocaleString() : 'Unknown';
+    const crackedAt = formatLocalTime(p.cracked_at);
     const keyShort = p.cracked_key ? p.cracked_key.substring(0, 16) + '...' : '-';
 
     let messageHtml = '';
