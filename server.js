@@ -179,9 +179,9 @@ db.exec(`
     prefix INTEGER NOT NULL,
     channel_hash TEXT,
     decoded_json TEXT,
-    charset TEXT DEFAULT 'alnum',
+    charset TEXT DEFAULT 'lower',
     min_len INTEGER DEFAULT 1,
-    max_len INTEGER DEFAULT 6,
+    max_len INTEGER DEFAULT 5,
     status TEXT DEFAULT 'pending',
     cracked_key TEXT,
     channel_name TEXT,
@@ -312,9 +312,9 @@ function clampInt(value, min, max, fallback) {
 }
 
 function normalizeCrackConfig(input = {}) {
-  const charsetKey = CHARSETS[input.charset] ? input.charset : 'alnum';
+  const charsetKey = CHARSETS[input.charset] ? input.charset : 'lower';
   const minLen = clampInt(input.minLen, 1, 10, 1);
-  const maxLen = clampInt(input.maxLen, minLen, 10, 6);
+  const maxLen = clampInt(input.maxLen, minLen, 10, 5);
   return {
     charset: charsetKey,
     minLen,

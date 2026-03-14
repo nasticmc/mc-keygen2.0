@@ -48,8 +48,8 @@
       <div class="keyspace-controls">
         <label>Charset
           <select id="keyspace-charset">
-            <option value="alnum" selected>a-z + 0-9</option>
-            <option value="lower">a-z only</option>
+            <option value="alnum">a-z + 0-9</option>
+            <option value="lower" selected>a-z only</option>
             <option value="numeric">0-9 only</option>
             <option value="full">a-z + A-Z + 0-9 + -_.</option>
           </select>
@@ -58,7 +58,7 @@
           <input id="keyspace-min-len" type="number" min="1" max="10" value="1">
         </label>
         <label>Max Length
-          <input id="keyspace-max-len" type="number" min="1" max="10" value="6">
+          <input id="keyspace-max-len" type="number" min="1" max="10" value="5">
         </label>
         <label>Work Request Size
           <input id="work-batch-count" type="number" min="1" max="24" value="8">

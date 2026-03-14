@@ -4,7 +4,7 @@ let ws = null;
 let cracker = null;
 let cracking = false;
 let loopRunning = false;
-let currentCharset = 'abcdefghijklmnopqrstuvwxyz0123456789';
+let currentCharset = 'abcdefghijklmnopqrstuvwxyz';
 let serverChunkSize = 500000;
 const pendingWorkResolvers = [];
 const queuedWorkMessages = [];
@@ -631,9 +631,9 @@ async function runCrackingLoop() {
 }
 
 function getCrackConfigFromUI() {
-  const charsetKey = document.getElementById('keyspace-charset')?.value || 'alnum';
+  const charsetKey = document.getElementById('keyspace-charset')?.value || 'lower';
   let minLen = parseInt(document.getElementById('keyspace-min-len')?.value, 10) || 1;
-  let maxLen = parseInt(document.getElementById('keyspace-max-len')?.value, 10) || 6;
+  let maxLen = parseInt(document.getElementById('keyspace-max-len')?.value, 10) || 5;
   minLen = Math.max(1, Math.min(minLen, 10));
   maxLen = Math.max(minLen, Math.min(maxLen, 10));
 
