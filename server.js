@@ -229,7 +229,9 @@ db.exec(`
 try { db.exec('ALTER TABLE packets ADD COLUMN decrypted_json TEXT'); } catch {}
 try { db.exec("ALTER TABLE packets ADD COLUMN charset TEXT DEFAULT 'alnum'"); } catch {}
 try { db.exec('ALTER TABLE packets ADD COLUMN min_len INTEGER DEFAULT 1'); } catch {}
-try { db.exec('ALTER TABLE packets ADD COLUMN max_len INTEGER DEFAULT 6'); } catch {}
+try { db.exec('ALTER TABLE packets ADD COLUMN max_len INTEGER DEFAULT 5'); } catch {}
+// Fix rows that got the wrong default (6) from the old migration — only if user never explicitly set a higher value
+try { db.exec('UPDATE packets SET max_len = 5 WHERE max_len = 6 AND status = \'pending\''); } catch {}
 try { db.exec('ALTER TABLE candidate_keys ADD COLUMN ignored INTEGER DEFAULT 0'); } catch {}
 
 // ── Prepared Statements ─────────────────────────────────────────────────────
@@ -245,7 +247,7 @@ const stmts = {
   insertChunk: db.prepare('INSERT INTO work_chunks (packet_id, target_prefix, range_start, range_end, charset) VALUES (?, ?, ?, ?, ?)'),
   getPendingChunks: db.prepare("SELECT * FROM work_chunks WHERE status = 'pending' LIMIT ?"),
   assignChunk: db.prepare("UPDATE work_chunks SET status = 'assigned', assigned_to = ?, assigned_at = CURRENT_TIMESTAMP WHERE id = ?"),
-  completeChunk: db.prepare("UPDATE work_chunks SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?"),
+  completeChunk: db.prepare("UPDATE work_chunks SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ? AND assigned_to = ?"),
   getChunksByPacket: db.prepare('SELECT * FROM work_chunks WHERE packet_id = ?'),
   getQueueStats: db.prepare(`
     SELECT
@@ -336,9 +338,16 @@ function createWorkChunks(packetId, targetPrefix, crackConfig = {}) {
   const base = charset.length;
   const { start: totalStart, end: totalEnd } = indexRangeForLengths(base, cfg.minLen, cfg.maxLen);
 
+  // Fetch already-completed ranges for this charset so we don't re-queue finished work
+  const completedRanges = db.prepare(
+    "SELECT range_start, range_end FROM work_chunks WHERE packet_id = ? AND status = 'completed' AND charset = ?"
+  ).all(packetId, cfg.charset);
+
   const insert = db.transaction(() => {
     for (let start = totalStart; start < totalEnd; start += CHUNK_SIZE) {
       const end = Math.min(start + CHUNK_SIZE, totalEnd);
+      // Skip ranges already fully covered by a completed chunk
+      if (completedRanges.some(r => r.range_start <= start && r.range_end >= end)) continue;
       stmts.insertChunk.run(packetId, targetPrefix, start, end, cfg.charset);
     }
   });
@@ -399,18 +408,18 @@ wss.on('connection', (ws) => {
           chunks,
           charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
         }));
-        broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
+        broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get(), totalHashRate: getTotalHashRate() });
         break;
       }
 
       case 'chunk_complete': {
-        stmts.completeChunk.run(msg.chunkId);
+        stmts.completeChunk.run(msg.chunkId, workerId);
         const worker = workers.get(workerId);
         if (worker) {
           worker.chunksCompleted++;
           worker.hashRate = msg.hashRate || 0;
         }
-        broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
+        broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get(), totalHashRate: getTotalHashRate() });
         broadcast({ type: 'worker_update', workerId, hashRate: msg.hashRate || 0 });
         break;
       }
@@ -686,7 +695,8 @@ app.post('/api/packets/:id/retry', (req, res) => {
     .run(packetId);
   db.prepare('UPDATE packets SET charset = ?, min_len = ?, max_len = ? WHERE id = ?')
     .run(cfg.charset, cfg.minLen, cfg.maxLen, packetId);
-  db.prepare('DELETE FROM work_chunks WHERE packet_id = ?')
+  // Only delete unfinished chunks — preserve completed ranges so we don't re-crack them
+  db.prepare("DELETE FROM work_chunks WHERE packet_id = ? AND status != 'completed'")
     .run(packetId);
   createWorkChunks(packetId, packet.prefix, cfg);
 

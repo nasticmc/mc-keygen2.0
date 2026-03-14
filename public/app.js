@@ -138,6 +138,10 @@ function updateStats(stats) {
   const eta = hashRate > 0 && remaining > 0 ? remaining / hashRate : Infinity;
   const etaEl = document.getElementById('stat-eta');
   if (etaEl) etaEl.textContent = formatETA(eta);
+
+  // Update keyspace display to show remaining candidates (decreases as work completes)
+  const ksEl = document.getElementById('stat-keyspace-size');
+  if (ksEl && active.total > 0) ksEl.textContent = formatNumber(remaining);
 }
 
 function formatNumber(n) {
@@ -709,7 +713,7 @@ function calculateKeyspaceSize(charsetLen, minLen, maxLen) {
 function updateKeyspaceEstimate() {
   const charsetKey = document.getElementById('keyspace-charset')?.value || 'alnum';
   const minLen = parseInt(document.getElementById('keyspace-min-len')?.value, 10) || 1;
-  const maxLen = parseInt(document.getElementById('keyspace-max-len')?.value, 10) || 6;
+  const maxLen = parseInt(document.getElementById('keyspace-max-len')?.value, 10) || 5;
   const charsetLen = CHARSET_LENS[charsetKey] || 36;
   const keyspaceSize = calculateKeyspaceSize(charsetLen, minLen, maxLen);
   const el = document.getElementById('stat-keyspace-size');
