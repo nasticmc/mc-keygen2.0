@@ -196,6 +196,12 @@ class GPUCracker {
     this.hashRate = 0;
     this._lastCount = 0;
     this._lastTime = 0;
+    this.paramsBuffer = null;
+    this.resultBuffer = null;
+    this.readBuffer = null;
+    this.charsetBuffer = null;
+    this.bindGroup = null;
+    this.cachedCharset = null;
   }
 
   async init() {
@@ -264,46 +270,23 @@ class GPUCracker {
       throw new Error('WebGPU not initialized');
     }
 
+    this.ensureBuffers();
+
     // Params: target_prefix, range_start, range_size, charset_len
     const paramsData = new Uint32Array([targetPrefix, rangeStart, rangeSize, charset.length]);
+    this.device.queue.writeBuffer(this.paramsBuffer, 0, paramsData);
 
-    const paramsBuffer = this.device.createBuffer({
-      size: paramsData.byteLength,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(paramsBuffer, 0, paramsData);
-
-    // Results buffer: match_count (u32) + 256 match entries (u32 each)
-    const resultSize = 4 + 256 * 4; // 1028 bytes
-    const resultBuffer = this.device.createBuffer({
-      size: resultSize,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-    });
-
-    const readBuffer = this.device.createBuffer({
-      size: resultSize,
-      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-    });
-
-    // Charset buffer (up to 64 chars)
-    const charsetData = new Uint32Array(64);
-    for (let i = 0; i < charset.length; i++) {
-      charsetData[i] = charset.charCodeAt(i);
+    if (this.cachedCharset !== charset) {
+      const charsetData = new Uint32Array(64);
+      for (let i = 0; i < charset.length; i++) {
+        charsetData[i] = charset.charCodeAt(i);
+      }
+      this.device.queue.writeBuffer(this.charsetBuffer, 0, charsetData);
+      this.cachedCharset = charset;
     }
-    const charsetBuffer = this.device.createBuffer({
-      size: charsetData.byteLength,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(charsetBuffer, 0, charsetData);
 
-    const bindGroup = this.device.createBindGroup({
-      layout: this.pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: paramsBuffer } },
-        { binding: 1, resource: { buffer: resultBuffer } },
-        { binding: 2, resource: { buffer: charsetBuffer } },
-      ],
-    });
+    // Reset match count for this dispatch.
+    this.device.queue.writeBuffer(this.resultBuffer, 0, new Uint32Array([0]));
 
     const workgroupSize = 256;
     const numWorkgroups = Math.ceil(rangeSize / workgroupSize);
@@ -311,28 +294,55 @@ class GPUCracker {
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginComputePass();
     pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, bindGroup);
+    pass.setBindGroup(0, this.bindGroup);
     pass.dispatchWorkgroups(numWorkgroups);
     pass.end();
 
-    encoder.copyBufferToBuffer(resultBuffer, 0, readBuffer, 0, resultSize);
+    const resultSize = 4 + 256 * 4;
+    encoder.copyBufferToBuffer(this.resultBuffer, 0, this.readBuffer, 0, resultSize);
     this.device.queue.submit([encoder.finish()]);
 
-    await readBuffer.mapAsync(GPUMapMode.READ);
-    const resultData = new Uint32Array(readBuffer.getMappedRange());
+    await this.readBuffer.mapAsync(GPUMapMode.READ);
+    const resultData = new Uint32Array(this.readBuffer.getMappedRange());
     const matchCount = resultData[0];
     const matches = [];
     for (let i = 0; i < Math.min(matchCount, 256); i++) {
       matches.push(resultData[1 + i]);
     }
-    readBuffer.unmap();
-
-    paramsBuffer.destroy();
-    resultBuffer.destroy();
-    readBuffer.destroy();
-    charsetBuffer.destroy();
+    this.readBuffer.unmap();
 
     return matches;
+  }
+
+  ensureBuffers() {
+    if (this.bindGroup) return;
+
+    const resultSize = 4 + 256 * 4;
+    this.paramsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.resultBuffer = this.device.createBuffer({
+      size: resultSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    this.readBuffer = this.device.createBuffer({
+      size: resultSize,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+    this.charsetBuffer = this.device.createBuffer({
+      size: 64 * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    this.bindGroup = this.device.createBindGroup({
+      layout: this.pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.paramsBuffer } },
+        { binding: 1, resource: { buffer: this.resultBuffer } },
+        { binding: 2, resource: { buffer: this.charsetBuffer } },
+      ],
+    });
   }
 
   async processChunks(chunks, ws, onProgress, charset) {
@@ -344,7 +354,7 @@ class GPUCracker {
       if (!this.running) break;
 
       const rangeSize = chunk.range_end - chunk.range_start;
-      const batchSize = 65536;
+      const batchSize = 262144;
 
       for (let offset = 0; offset < rangeSize && this.running; offset += batchSize) {
         const size = Math.min(batchSize, rangeSize - offset);

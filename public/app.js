@@ -4,6 +4,8 @@ let ws = null;
 let cracker = null;
 let cracking = false;
 let currentCharset = 'abcdefghijklmnopqrstuvwxyz0123456789';
+const pendingWorkResolvers = [];
+const queuedWorkMessages = [];
 
 // ── Tab Navigation ──────────────────────────────────────────────────────────
 document.querySelectorAll('.tab').forEach(tab => {
@@ -59,8 +61,37 @@ function connectWebSocket() {
       case 'worker_update':
         updateWorkerDisplay(msg.workerId, msg.hashRate);
         break;
+      case 'work':
+        if (pendingWorkResolvers.length > 0) {
+          const resolve = pendingWorkResolvers.shift();
+          resolve(msg);
+        } else {
+          queuedWorkMessages.push(msg);
+        }
+        break;
     }
   };
+}
+
+function waitForWork(timeoutMs = 5000) {
+  if (queuedWorkMessages.length > 0) {
+    return Promise.resolve(queuedWorkMessages.shift());
+  }
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      const idx = pendingWorkResolvers.indexOf(resolver);
+      if (idx >= 0) pendingWorkResolvers.splice(idx, 1);
+      resolve({ chunks: [] });
+    }, timeoutMs);
+
+    const resolver = (msg) => {
+      clearTimeout(timeout);
+      resolve(msg);
+    };
+
+    pendingWorkResolvers.push(resolver);
+  });
 }
 
 // ── Stats ───────────────────────────────────────────────────────────────────
@@ -484,21 +515,7 @@ document.getElementById('btn-stop-cracking').addEventListener('click', () => {
 async function runCrackingLoop() {
   while (cracking && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'request_work', count: 4 }));
-
-    const response = await new Promise((resolve) => {
-      const handler = (event) => {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'work') {
-          ws.removeEventListener('message', handler);
-          resolve(msg);
-        }
-      };
-      ws.addEventListener('message', handler);
-      setTimeout(() => {
-        ws.removeEventListener('message', handler);
-        resolve({ chunks: [] });
-      }, 5000);
-    });
+    const response = await waitForWork(5000);
 
     const chunks = response.chunks;
     if (response.charset) currentCharset = response.charset;

@@ -204,7 +204,27 @@ const stmts = {
   getAllCandidates: db.prepare('SELECT * FROM candidate_keys ORDER BY created_at DESC LIMIT 100'),
   updatePacketDecrypted: db.prepare('UPDATE packets SET decrypted_json = ? WHERE id = ?'),
   getDecodedPackets: db.prepare("SELECT * FROM packets WHERE status = 'cracked' ORDER BY cracked_at DESC"),
+  unassignWorkerChunks: db.prepare(`
+    UPDATE work_chunks
+    SET status = 'pending', assigned_to = NULL, assigned_at = NULL
+    WHERE status = 'assigned' AND assigned_to = ?
+  `),
+  tryAssignChunk: db.prepare(`
+    UPDATE work_chunks
+    SET status = 'assigned', assigned_to = ?, assigned_at = CURRENT_TIMESTAMP
+    WHERE id = ? AND status = 'pending'
+  `),
 };
+
+const assignPendingChunks = db.transaction((workerId, count) => {
+  const available = stmts.getPendingChunks.all(count);
+  const assigned = [];
+  for (const chunk of available) {
+    const result = stmts.tryAssignChunk.run(workerId, chunk.id);
+    if (result.changes > 0) assigned.push(chunk);
+  }
+  return assigned;
+});
 
 // ── Work Chunk Generation ───────────────────────────────────────────────────
 const CHUNK_SIZE = 500_000;
@@ -254,10 +274,7 @@ wss.on('connection', (ws) => {
     switch (msg.type) {
       case 'request_work': {
         stmts.expireStaleChunks.run();
-        const chunks = stmts.getPendingChunks.all(msg.count || 1);
-        for (const chunk of chunks) {
-          stmts.assignChunk.run(workerId, chunk.id);
-        }
+        const chunks = assignPendingChunks(workerId, msg.count || 1);
         ws.send(JSON.stringify({
           type: 'work',
           chunks,
@@ -281,7 +298,11 @@ wss.on('connection', (ws) => {
 
       case 'prefix_match': {
         const { packetId, channelName, key, prefix } = msg;
-        stmts.insertCandidate.run(packetId, channelName, key, prefix);
+        const exists = db.prepare('SELECT 1 FROM candidate_keys WHERE packet_id = ? AND key = ? LIMIT 1')
+          .get(packetId, key);
+        if (!exists) {
+          stmts.insertCandidate.run(packetId, channelName, key, prefix);
+        }
         broadcast({
           type: 'candidate_found',
           packetId,
@@ -340,8 +361,10 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    stmts.unassignWorkerChunks.run(workerId);
     workers.delete(workerId);
     broadcast({ type: 'worker_count', count: workers.size });
+    broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
   });
 });
 
