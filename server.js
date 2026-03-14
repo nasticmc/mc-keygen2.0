@@ -348,8 +348,25 @@ function broadcast(data) {
 }
 
 // ── WebSocket Handler ───────────────────────────────────────────────────────
+// ── WebSocket Keepalive ─────────────────────────────────────────────────────
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach(client => {
+    if (client.isAlive === false) { client.terminate(); return; }
+    client.isAlive = false;
+    client.ping();
+  });
+}, 30000);
+wss.on('close', () => clearInterval(heartbeatInterval));
+
+// ── Periodic Stats Broadcast ────────────────────────────────────────────────
+setInterval(() => {
+  if (wss.clients.size > 0) broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+}, 2000);
+
 wss.on('connection', (ws) => {
   const workerId = crypto.randomUUID();
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
   workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0 });
   broadcast({ type: 'worker_count', count: workers.size });
 
@@ -427,6 +444,44 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      case 'prefix_match_batch': {
+        const { packetId: batchPacketId, matches: batchMatches } = msg;
+        const batchPacket = stmts.getPacketById.get(batchPacketId);
+        if (!batchPacket || batchPacket.status === 'cracked') break;
+
+        let foundKey = false;
+        for (const { channelName: cn, keyHex, prefixHex: ph } of batchMatches) {
+          if (foundKey) break;
+          const exists = db.prepare('SELECT 1 FROM candidate_keys WHERE packet_id = ? AND key = ? LIMIT 1')
+            .get(batchPacketId, keyHex);
+          if (!exists) stmts.insertCandidate.run(batchPacketId, cn, keyHex, ph);
+
+          try {
+            const result = tryDecrypt(batchPacket.raw_data, keyHex);
+            const candidateRow = db.prepare('SELECT id FROM candidate_keys WHERE packet_id = ? AND key = ? ORDER BY id DESC LIMIT 1')
+              .get(batchPacketId, keyHex);
+            if (candidateRow) {
+              db.prepare('UPDATE candidate_keys SET verified = 1, decode_success = ? WHERE id = ?')
+                .run(result.success ? 1 : 0, candidateRow.id);
+            }
+            if (result.success) {
+              stmts.updatePacketStatus.run('cracked', keyHex, cn, batchPacketId);
+              if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), batchPacketId);
+              db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
+                .run(batchPacketId);
+              broadcast({ type: 'key_found', packetId: batchPacketId, key: keyHex, channelName: cn, decoded: result.decoded });
+              broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+              broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+              foundKey = true;
+            }
+          } catch (err) {
+            console.error('Batch auto-decrypt error:', err.message);
+          }
+        }
+        broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
+        break;
+      }
+
       case 'key_found': {
         stmts.updatePacketStatus.run('cracked', msg.key, msg.channelName || null, msg.packetId);
         db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
@@ -455,6 +510,13 @@ wss.on('connection', (ws) => {
 });
 
 // ── REST API ────────────────────────────────────────────────────────────────
+
+app.get('/api/config', (req, res) => {
+  res.json({
+    chunkSize: CHUNK_SIZE,
+    charsets: Object.fromEntries(Object.entries(CHARSETS).map(([k, v]) => [k, v.length])),
+  });
+});
 
 app.get('/api/packets', (req, res) => {
   res.json(stmts.getPackets.all());
