@@ -74,7 +74,7 @@ fn sha256_block(block: array<u32, 16>) -> array<u32, 8> {
 }
 
 struct Params {
-  target_prefix: u32,   // target prefix byte (only lowest 8 bits used)
+  target_prefix: u32,   // target prefix byte (lowest 8 bits compared against hash2[0]>>24)
   range_start: u32,
   range_size: u32,
   charset_len: u32,     // length of charset (36 for alnum)
@@ -82,11 +82,15 @@ struct Params {
 
 struct MatchEntry {
   index: u32,           // the candidate index that matched
+  key0: u32,            // hash1[0] — first word of SHA256("#channelName")
+  key1: u32,            // hash1[1]
+  key2: u32,            // hash1[2]
+  key3: u32,            // hash1[3]  (key = first 16 bytes = key0..key3 big-endian)
 }
 
 struct Results {
   match_count: atomic<u32>,
-  matches: array<MatchEntry, 256>,  // store up to 256 matches per dispatch
+  matches: array<MatchEntry, 4096>,  // larger pool for bigger batches
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -180,8 +184,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   if (prefix_byte == params.target_prefix) {
     let slot = atomicAdd(&results.match_count, 1u);
-    if (slot < 256u) {
+    if (slot < 4096u) {
       results.matches[slot].index = candidate_idx;
+      results.matches[slot].key0  = hash1[0];
+      results.matches[slot].key1  = hash1[1];
+      results.matches[slot].key2  = hash1[2];
+      results.matches[slot].key3  = hash1[3];
     }
   }
 }
@@ -298,16 +306,24 @@ class GPUCracker {
     pass.dispatchWorkgroups(numWorkgroups);
     pass.end();
 
-    const resultSize = 4 + 256 * 4;
+    const resultSize = this._resultSize;
     encoder.copyBufferToBuffer(this.resultBuffer, 0, this.readBuffer, 0, resultSize);
     this.device.queue.submit([encoder.finish()]);
 
     await this.readBuffer.mapAsync(GPUMapMode.READ);
     const resultData = new Uint32Array(this.readBuffer.getMappedRange());
     const matchCount = resultData[0];
+    const MATCH_SLOTS = this._matchSlots;
     const matches = [];
-    for (let i = 0; i < Math.min(matchCount, 256); i++) {
-      matches.push(resultData[1 + i]);
+    for (let i = 0; i < Math.min(matchCount, MATCH_SLOTS); i++) {
+      const base = 1 + i * 5;
+      matches.push({
+        index: resultData[base],
+        key0:  resultData[base + 1],
+        key1:  resultData[base + 2],
+        key2:  resultData[base + 3],
+        key3:  resultData[base + 4],
+      });
     }
     this.readBuffer.unmap();
 
@@ -317,7 +333,11 @@ class GPUCracker {
   ensureBuffers() {
     if (this.bindGroup) return;
 
-    const resultSize = 4 + 256 * 4;
+    // 4-byte atomic count + 4096 entries × 5 u32s × 4 bytes = 81,924 bytes
+    const MATCH_SLOTS = 4096;
+    const resultSize = 4 + MATCH_SLOTS * 5 * 4;
+    this._matchSlots = MATCH_SLOTS;
+    this._resultSize = resultSize;
     this.paramsBuffer = this.device.createBuffer({
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -354,7 +374,7 @@ class GPUCracker {
       if (!this.running) break;
 
       const rangeSize = chunk.range_end - chunk.range_start;
-      const batchSize = 262144;
+      const batchSize = 2097152; // 2M — ~20ms GPU compute vs ~5ms mapAsync overhead
 
       for (let offset = 0; offset < rangeSize && this.running; offset += batchSize) {
         const size = Math.min(batchSize, rangeSize - offset);
@@ -372,19 +392,22 @@ class GPUCracker {
             if (onProgress) onProgress(this.hashRate);
           }
 
-          // Report each match back to server
-          for (const matchIdx of matches) {
-            const channelName = this.indexToChannelName(matchIdx, charset);
-            if (channelName) {
-              // Derive key on CPU for reporting
-              const key = await deriveKeyJS(channelName);
-              const prefix = await derivePrefixJS(key);
+          // Build key hex directly from GPU result buffer — no async crypto needed
+          if (matches.length > 0) {
+            const batchMatches = [];
+            for (const m of matches) {
+              const channelName = this.indexToChannelName(m.index, charset);
+              if (!channelName) continue;
+              const keyHex = [m.key0, m.key1, m.key2, m.key3]
+                .map(w => w.toString(16).padStart(8, '0')).join('');
+              const prefixHex = chunk.target_prefix.toString(16).padStart(2, '0');
+              batchMatches.push({ channelName, keyHex, prefixHex });
+            }
+            if (batchMatches.length > 0) {
               ws.send(JSON.stringify({
-                type: 'prefix_match',
+                type: 'prefix_match_batch',
                 packetId: chunk.packet_id,
-                channelName,
-                key: bufToHex(key),
-                prefix: prefix.toString(16).padStart(2, '0'),
+                matches: batchMatches,
               }));
             }
           }

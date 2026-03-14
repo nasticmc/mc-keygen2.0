@@ -3,7 +3,9 @@
 let ws = null;
 let cracker = null;
 let cracking = false;
+let loopRunning = false;
 let currentCharset = 'abcdefghijklmnopqrstuvwxyz0123456789';
+let serverChunkSize = 500000;
 const pendingWorkResolvers = [];
 const queuedWorkMessages = [];
 let lastCrackingStatus = 'Idle.';
@@ -31,8 +33,12 @@ function connectWebSocket() {
   ws = new WebSocket(`${protocol}//${location.host}`);
 
   ws.onopen = () => {
+    // Clear stale work queues from before the disconnect
+    pendingWorkResolvers.length = 0;
+    queuedWorkMessages.length = 0;
     document.getElementById('connection-status').textContent = 'Connected';
     document.getElementById('connection-status').className = 'connected';
+    if (cracking && !loopRunning) runCrackingLoop();
   };
 
   ws.onclose = () => {
@@ -502,7 +508,7 @@ document.getElementById('btn-decode').addEventListener('click', async () => {
       resultBox.classList.add('success');
       const payloadType = data.payloadType !== undefined ? `Type: ${data.payloadType}` : '';
       const channelHash = data.payload?.decoded?.channelHash;
-      const hashInfo = channelHash !== undefined ? ` | Channel Hash: 0x${typeof channelHash === 'number' ? channelHash.toString(16).padStart(2, '0') : channelHash}` : '';
+      const hashInfo = channelHash != null ? ` | Channel Hash: 0x${typeof channelHash === 'number' ? channelHash.toString(16).padStart(2, '0') : channelHash}` : '';
       resultBox.textContent = `Decoded successfully. ${payloadType}${hashInfo}`;
       jsonBox.textContent = JSON.stringify(data, null, 2);
       jsonBox.classList.remove('hidden');
@@ -553,31 +559,37 @@ document.getElementById('btn-stop-cracking').addEventListener('click', () => {
 });
 
 async function runCrackingLoop() {
-  while (cracking && ws && ws.readyState === WebSocket.OPEN) {
-    setCrackingStatus('Requesting work from server...');
-    const count = parseInt(document.getElementById('work-batch-count')?.value, 10) || 8;
-    ws.send(JSON.stringify({ type: 'request_work', count }));
-    const response = await waitForWork(5000);
+  if (loopRunning) return;
+  loopRunning = true;
+  try {
+    while (cracking && ws && ws.readyState === WebSocket.OPEN) {
+      setCrackingStatus('Requesting work from server...');
+      const count = parseInt(document.getElementById('work-batch-count')?.value, 10) || 8;
+      ws.send(JSON.stringify({ type: 'request_work', count }));
+      const response = await waitForWork(5000);
 
-    const chunks = response.chunks;
-    if (response.charset) currentCharset = response.charset;
+      const chunks = response.chunks;
+      if (response.charset) currentCharset = response.charset;
 
-    if (chunks.length === 0) {
-      setCrackingStatus('No work available. Polling again in 2s...');
-      await new Promise(r => setTimeout(r, 2000));
-      continue;
+      if (chunks.length === 0) {
+        setCrackingStatus('No work available. Polling again in 2s...');
+        await new Promise(r => setTimeout(r, 2000));
+        continue;
+      }
+
+      const packetIds = [...new Set(chunks.map(c => c.packet_id))];
+      setCrackingStatus(`Processing ${chunks.length} chunk(s) for packet ${packetIds.join(', ')}...`);
+
+      await cracker.processChunks(chunks, ws, (hashRate) => {
+        document.getElementById('stat-hashrate').textContent = formatHashRate(hashRate);
+        setCrackingStatus(`Crunching ${chunks.length} chunk(s) at ${formatHashRate(hashRate)}.`);
+        ws.send(JSON.stringify({ type: 'hashrate_update', hashRate }));
+      }, currentCharset);
+
+      setCrackingStatus(`Finished ${chunks.length} chunk(s). Requesting more work...`);
     }
-
-    const packetIds = [...new Set(chunks.map(c => c.packet_id))];
-    setCrackingStatus(`Processing ${chunks.length} chunk(s) for packet ${packetIds.join(', ')}...`);
-
-    await cracker.processChunks(chunks, ws, (hashRate) => {
-      document.getElementById('stat-hashrate').textContent = formatHashRate(hashRate);
-      setCrackingStatus(`Crunching ${chunks.length} chunk(s) at ${formatHashRate(hashRate)}.`);
-      ws.send(JSON.stringify({ type: 'hashrate_update', hashRate }));
-    }, currentCharset);
-
-    setCrackingStatus(`Finished ${chunks.length} chunk(s). Requesting more work...`);
+  } finally {
+    loopRunning = false;
   }
 
   if (cracking && (!ws || ws.readyState !== WebSocket.OPEN)) {
@@ -652,9 +664,41 @@ async function loadData() {
   }
 }
 
+// ── Keyspace Estimate ────────────────────────────────────────────────────────
+const CHARSET_LENS = { alnum: 36, lower: 26, numeric: 10, full: 65 };
+
+function calculateKeyspaceSize(charsetLen, minLen, maxLen) {
+  let size = 0;
+  for (let len = minLen; len <= maxLen; len++) size += Math.pow(charsetLen, len);
+  return size;
+}
+
+function updateKeyspaceEstimate() {
+  const charsetKey = document.getElementById('keyspace-charset')?.value || 'alnum';
+  const minLen = parseInt(document.getElementById('keyspace-min-len')?.value, 10) || 1;
+  const maxLen = parseInt(document.getElementById('keyspace-max-len')?.value, 10) || 6;
+  const charsetLen = CHARSET_LENS[charsetKey] || 36;
+  const keyspaceSize = calculateKeyspaceSize(charsetLen, minLen, maxLen);
+  const estimatedChunks = Math.ceil(keyspaceSize / serverChunkSize);
+  const el = document.getElementById('stat-keyspace-chunks');
+  if (el) el.textContent = formatNumber(estimatedChunks);
+}
+
+['keyspace-charset', 'keyspace-min-len', 'keyspace-max-len'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) {
+    el.addEventListener('change', updateKeyspaceEstimate);
+    el.addEventListener('input', updateKeyspaceEstimate);
+  }
+});
+
 // ── Boot ────────────────────────────────────────────────────────────────────
 (async () => {
   connectWebSocket();
   await loadData();
   await initCracker();
+  fetch('/api/config').then(r => r.json()).then(cfg => {
+    serverChunkSize = cfg.chunkSize || 500000;
+    updateKeyspaceEstimate();
+  }).catch(() => updateKeyspaceEstimate());
 })();
