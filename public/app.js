@@ -508,7 +508,7 @@ document.getElementById('btn-decode').addEventListener('click', async () => {
       resultBox.classList.add('success');
       const payloadType = data.payloadType !== undefined ? `Type: ${data.payloadType}` : '';
       const channelHash = data.payload?.decoded?.channelHash;
-      const hashInfo = channelHash !== undefined ? ` | Channel Hash: 0x${typeof channelHash === 'number' ? channelHash.toString(16).padStart(2, '0') : channelHash}` : '';
+      const hashInfo = channelHash != null ? ` | Channel Hash: 0x${typeof channelHash === 'number' ? channelHash.toString(16).padStart(2, '0') : channelHash}` : '';
       resultBox.textContent = `Decoded successfully. ${payloadType}${hashInfo}`;
       jsonBox.textContent = JSON.stringify(data, null, 2);
       jsonBox.classList.remove('hidden');

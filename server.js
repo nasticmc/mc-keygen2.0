@@ -610,9 +610,12 @@ app.post('/api/packets', (req, res) => {
 });
 
 app.delete('/api/packets/:id', (req, res) => {
-  db.prepare('DELETE FROM work_chunks WHERE packet_id = ?').run(req.params.id);
-  db.prepare('DELETE FROM candidate_keys WHERE packet_id = ?').run(req.params.id);
-  db.prepare('DELETE FROM packets WHERE id = ?').run(req.params.id);
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid id' });
+  if (!stmts.getPacketById.get(id)) return res.status(404).json({ error: 'Not found' });
+  db.prepare('DELETE FROM work_chunks WHERE packet_id = ?').run(id);
+  db.prepare('DELETE FROM candidate_keys WHERE packet_id = ?').run(id);
+  db.prepare('DELETE FROM packets WHERE id = ?').run(id);
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
   broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
   res.json({ ok: true });
@@ -692,7 +695,10 @@ app.post('/api/channels', (req, res) => {
 });
 
 app.delete('/api/channels/:id', (req, res) => {
-  stmts.deleteKnownChannel.run(req.params.id);
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid id' });
+  const result = stmts.deleteKnownChannel.run(id);
+  if (result.changes === 0) return res.status(404).json({ error: 'Not found' });
   broadcast({ type: 'channels', channels: stmts.getKnownChannels.all() });
   res.json({ ok: true });
 });
