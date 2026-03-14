@@ -77,6 +77,10 @@ function connectWebSocket() {
       case 'worker_update':
         updateWorkerDisplay(msg.workerId, msg.hashRate);
         break;
+      case 'worker_removed':
+        workerData.delete(msg.workerId);
+        refreshWorkerDisplay();
+        break;
       case 'work':
         if (pendingWorkResolvers.length > 0) {
           const resolve = pendingWorkResolvers.shift();
@@ -120,6 +124,10 @@ function updateStats(stats) {
   const pct = Math.round((stats.completed / total) * 100);
   document.getElementById('progress-bar').style.width = `${pct}%`;
   document.getElementById('progress-text').textContent = `${pct}% (${stats.completed}/${total})`;
+
+  if (stats.totalHashRate !== undefined) {
+    document.getElementById('stat-hashrate').textContent = formatHashRate(stats.totalHashRate);
+  }
 }
 
 function formatNumber(n) {
@@ -146,14 +154,11 @@ function formatHashRate(n) {
 // ── Workers Display ─────────────────────────────────────────────────────────
 const workerData = new Map();
 
-function updateWorkerDisplay(workerId, hashRate) {
-  workerData.set(workerId, hashRate);
+function refreshWorkerDisplay() {
   const container = document.getElementById('workers-list');
   container.innerHTML = '';
 
-  let totalRate = 0;
   for (const [id, rate] of workerData) {
-    totalRate += rate;
     const card = document.createElement('div');
     card.className = 'worker-card';
     card.innerHTML = `
@@ -162,8 +167,11 @@ function updateWorkerDisplay(workerId, hashRate) {
     `;
     container.appendChild(card);
   }
+}
 
-  document.getElementById('stat-hashrate').textContent = formatHashRate(totalRate);
+function updateWorkerDisplay(workerId, hashRate) {
+  workerData.set(workerId, hashRate);
+  refreshWorkerDisplay();
 }
 
 // ── Packets Table ───────────────────────────────────────────────────────────
@@ -556,6 +564,9 @@ document.getElementById('btn-stop-cracking').addEventListener('click', () => {
   document.getElementById('btn-start-cracking').classList.remove('hidden');
   document.getElementById('btn-stop-cracking').classList.add('hidden');
   setCrackingStatus('Stopped.');
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'hashrate_update', hashRate: 0 }));
+  }
 });
 
 async function runCrackingLoop() {
