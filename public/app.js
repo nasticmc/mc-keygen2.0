@@ -6,6 +6,14 @@ let cracking = false;
 let currentCharset = 'abcdefghijklmnopqrstuvwxyz0123456789';
 const pendingWorkResolvers = [];
 const queuedWorkMessages = [];
+let lastCrackingStatus = 'Idle.';
+
+const charsetByKey = {
+  alnum: 'abcdefghijklmnopqrstuvwxyz0123456789',
+  lower: 'abcdefghijklmnopqrstuvwxyz',
+  numeric: '0123456789',
+  full: 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.',
+};
 
 // ── Tab Navigation ──────────────────────────────────────────────────────────
 document.querySelectorAll('.tab').forEach(tab => {
@@ -50,12 +58,14 @@ function connectWebSocket() {
         break;
       case 'candidate_found':
         showNotification(`Prefix match: ${msg.channelName} — trying decryption...`);
+        setCrackingStatus(`Prefix match found for packet #${msg.packetId} (${msg.channelName}). Validating decode...`);
         break;
       case 'candidates':
         renderCandidates(msg.candidates);
         break;
       case 'key_found':
         showNotification(`Decrypted! Packet #${msg.packetId}: channel ${msg.channelName}`);
+        setCrackingStatus(`Packet #${msg.packetId} cracked with ${msg.channelName}.`);
         loadDecodedPackets();
         break;
       case 'worker_update':
@@ -169,7 +179,7 @@ function renderPackets(packets) {
       <td>${formatLocalTime(p.created_at)}</td>
       <td>
         <button class="btn-sm" onclick="deletePacket(${p.id})">Delete</button>
-        ${p.status !== 'cracked' ? `<button class="btn-sm" onclick="autoDecrypt(${p.id})">Try Decrypt</button>` : ''}
+        ${p.status !== 'cracked' ? `<button class="btn-sm" onclick="autoDecrypt(${p.id})">Try Decrypt</button>` : `<button class="btn-sm btn-warning" onclick="retryPacket(${p.id}, '${escapeAttr(p.channel_name || '')}')">Retry (Ignore Channel)</button>`}
       </td>
     `;
     tbody.appendChild(tr);
@@ -191,6 +201,28 @@ async function autoDecrypt(id) {
     }
   } catch (err) {
     console.error('Auto-decrypt failed:', err);
+  }
+}
+
+async function retryPacket(id, channelName) {
+  const channel = channelName || '';
+  const crackConfig = getCrackConfigFromUI();
+  setCrackingStatus(`Retrying packet #${id}${channel ? ` and ignoring ${channel}` : ''}...`);
+  try {
+    const res = await fetch(`/api/packets/${id}/retry`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channelName: channel, crackConfig })
+    });
+    const data = await res.json();
+    if (data.error) {
+      showNotification(`Retry failed for packet #${id}: ${data.error}`);
+      return;
+    }
+    showNotification(`Packet #${id} reset for retry${data.ignoredChannel ? ` (ignored ${data.ignoredChannel})` : ''}.`);
+    setCrackingStatus(`Packet #${id} queued with ${crackConfig.charset} length ${crackConfig.minLen}-${crackConfig.maxLen}.`);
+  } catch (err) {
+    showNotification(`Retry failed for packet #${id}: ${err.message}`);
   }
 }
 
@@ -336,6 +368,10 @@ function escapeHtml(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+function escapeAttr(str) {
+  return String(str || '').replace(/'/g, '&#39;');
+}
+
 function toggleJson(id) {
   const el = document.getElementById(id);
   if (el) el.classList.toggle('hidden');
@@ -365,11 +401,13 @@ document.getElementById('btn-upload').addEventListener('click', async () => {
   const resultBox = document.getElementById('upload-result');
   resultBox.classList.remove('hidden', 'success', 'info', 'error');
 
+  const crackConfig = getCrackConfigFromUI();
+
   try {
     const res = await fetch('/api/packets', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rawData })
+      body: JSON.stringify({ rawData, crackConfig })
     });
     const data = await res.json();
 
@@ -501,6 +539,7 @@ document.getElementById('btn-start-cracking').addEventListener('click', async ()
 
   document.getElementById('btn-start-cracking').classList.add('hidden');
   document.getElementById('btn-stop-cracking').classList.remove('hidden');
+  setCrackingStatus('Starting worker loop...');
 
   await runCrackingLoop();
 });
@@ -510,26 +549,61 @@ document.getElementById('btn-stop-cracking').addEventListener('click', () => {
   if (cracker) cracker.stop();
   document.getElementById('btn-start-cracking').classList.remove('hidden');
   document.getElementById('btn-stop-cracking').classList.add('hidden');
+  setCrackingStatus('Stopped.');
 });
 
 async function runCrackingLoop() {
   while (cracking && ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'request_work', count: 4 }));
+    setCrackingStatus('Requesting work from server...');
+    const count = parseInt(document.getElementById('work-batch-count')?.value, 10) || 8;
+    ws.send(JSON.stringify({ type: 'request_work', count }));
     const response = await waitForWork(5000);
 
     const chunks = response.chunks;
     if (response.charset) currentCharset = response.charset;
 
     if (chunks.length === 0) {
+      setCrackingStatus('No work available. Polling again in 2s...');
       await new Promise(r => setTimeout(r, 2000));
       continue;
     }
 
+    const packetIds = [...new Set(chunks.map(c => c.packet_id))];
+    setCrackingStatus(`Processing ${chunks.length} chunk(s) for packet ${packetIds.join(', ')}...`);
+
     await cracker.processChunks(chunks, ws, (hashRate) => {
       document.getElementById('stat-hashrate').textContent = formatHashRate(hashRate);
+      setCrackingStatus(`Crunching ${chunks.length} chunk(s) at ${formatHashRate(hashRate)}.`);
       ws.send(JSON.stringify({ type: 'hashrate_update', hashRate }));
     }, currentCharset);
+
+    setCrackingStatus(`Finished ${chunks.length} chunk(s). Requesting more work...`);
   }
+
+  if (cracking && (!ws || ws.readyState !== WebSocket.OPEN)) {
+    setCrackingStatus('Waiting for WebSocket reconnection...');
+  }
+}
+
+function getCrackConfigFromUI() {
+  const charsetKey = document.getElementById('keyspace-charset')?.value || 'alnum';
+  let minLen = parseInt(document.getElementById('keyspace-min-len')?.value, 10) || 1;
+  let maxLen = parseInt(document.getElementById('keyspace-max-len')?.value, 10) || 6;
+  minLen = Math.max(1, Math.min(minLen, 10));
+  maxLen = Math.max(minLen, Math.min(maxLen, 10));
+
+  return {
+    charset: charsetKey,
+    minLen,
+    maxLen,
+    charsetString: charsetByKey[charsetKey] || charsetByKey.alnum,
+  };
+}
+
+function setCrackingStatus(text) {
+  lastCrackingStatus = text;
+  const el = document.getElementById('cracking-feedback');
+  if (el) el.textContent = text;
 }
 
 // ── Notifications ───────────────────────────────────────────────────────────

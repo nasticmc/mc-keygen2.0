@@ -76,14 +76,65 @@ function tryDecrypt(hexData, channelKey) {
     const decoded = MeshCorePacketDecoder.decode(hexData, options);
     const payloadDecoded = decoded.payload?.decoded;
     const decrypted = payloadDecoded?.decrypted ?? payloadDecoded?.message ?? null;
+    const validation = validateDecryptedContent(decoded);
     return {
-      success: decrypted !== null,
+      success: decrypted !== null && validation.valid,
       decoded,
       channelKey,
+      validation,
     };
   } catch (err) {
     return { error: err.message, success: false };
   }
+}
+
+function validateDecryptedContent(decodedPacket) {
+  const payload = decodedPacket?.payload?.decoded;
+  if (!payload) return { valid: false, reason: 'missing_payload' };
+
+  const interestingPaths = ['decrypted', 'message', 'text', 'msg', 'content', 'payload'];
+  const strings = [];
+
+  function visit(value, path = '', depth = 0) {
+    if (depth > 4 || strings.length > 20 || value === null || value === undefined) return;
+    if (typeof value === 'string') {
+      strings.push({ value, path });
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) visit(value[i], `${path}[${i}]`, depth + 1);
+      return;
+    }
+    if (typeof value === 'object') {
+      for (const [key, inner] of Object.entries(value)) {
+        const nextPath = path ? `${path}.${key}` : key;
+        visit(inner, nextPath, depth + 1);
+      }
+    }
+  }
+
+  for (const key of interestingPaths) {
+    if (payload[key] !== undefined) visit(payload[key], key);
+  }
+
+  if (strings.length === 0) return { valid: false, reason: 'missing_text' };
+
+  const best = strings.find(({ value }) => isReadableMessage(value));
+  if (!best) return { valid: false, reason: 'non_readable_text' };
+  return { valid: true, reason: 'ok', path: best.path };
+}
+
+function isReadableMessage(input) {
+  if (typeof input !== 'string') return false;
+  const value = input.trim();
+  if (value.length < 2) return false;
+
+  const allowedChars = /^[\x09\x0A\x0D\x20-\x7E\p{Extended_Pictographic}\uFE0F\u200D]+$/u;
+  if (!allowedChars.test(value)) return false;
+
+  const hasAsciiWord = /[A-Za-z0-9]/.test(value);
+  const hasEmoji = /\p{Extended_Pictographic}/u.test(value);
+  return hasAsciiWord || hasEmoji;
 }
 
 // Auto-decrypt: try all candidate keys for a packet
@@ -93,7 +144,7 @@ function autoDecryptCandidates(packetId) {
 
   const candidates = stmts.getCandidates.all(packetId);
   for (const candidate of candidates) {
-    if (candidate.verified) continue;
+    if (candidate.verified || candidate.ignored) continue;
 
     try {
       const result = tryDecrypt(packet.raw_data, candidate.key);
@@ -128,6 +179,9 @@ db.exec(`
     prefix INTEGER NOT NULL,
     channel_hash TEXT,
     decoded_json TEXT,
+    charset TEXT DEFAULT 'alnum',
+    min_len INTEGER DEFAULT 1,
+    max_len INTEGER DEFAULT 6,
     status TEXT DEFAULT 'pending',
     cracked_key TEXT,
     channel_name TEXT,
@@ -165,6 +219,7 @@ db.exec(`
     prefix TEXT NOT NULL,
     verified INTEGER DEFAULT 0,
     decode_success INTEGER DEFAULT 0,
+    ignored INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (packet_id) REFERENCES packets(id)
   );
@@ -172,10 +227,14 @@ db.exec(`
 
 // Migration: add decrypted_json column for storing decoded message content
 try { db.exec('ALTER TABLE packets ADD COLUMN decrypted_json TEXT'); } catch {}
+try { db.exec("ALTER TABLE packets ADD COLUMN charset TEXT DEFAULT 'alnum'"); } catch {}
+try { db.exec('ALTER TABLE packets ADD COLUMN min_len INTEGER DEFAULT 1'); } catch {}
+try { db.exec('ALTER TABLE packets ADD COLUMN max_len INTEGER DEFAULT 6'); } catch {}
+try { db.exec('ALTER TABLE candidate_keys ADD COLUMN ignored INTEGER DEFAULT 0'); } catch {}
 
 // ── Prepared Statements ─────────────────────────────────────────────────────
 const stmts = {
-  insertPacket: db.prepare('INSERT INTO packets (raw_data, prefix, channel_hash, decoded_json) VALUES (?, ?, ?, ?)'),
+  insertPacket: db.prepare('INSERT INTO packets (raw_data, prefix, channel_hash, decoded_json, charset, min_len, max_len) VALUES (?, ?, ?, ?, ?, ?, ?)'),
   getPackets: db.prepare('SELECT * FROM packets ORDER BY created_at DESC'),
   getPacketById: db.prepare('SELECT * FROM packets WHERE id = ?'),
   updatePacketStatus: db.prepare('UPDATE packets SET status = ?, cracked_key = ?, channel_name = ?, cracked_at = CURRENT_TIMESTAMP WHERE id = ?'),
@@ -231,24 +290,51 @@ const CHUNK_SIZE = 500_000;
 
 const CHARSETS = {
   alnum: 'abcdefghijklmnopqrstuvwxyz0123456789',
+  lower: 'abcdefghijklmnopqrstuvwxyz',
+  numeric: '0123456789',
   full: 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.',
 };
 
-function createWorkChunks(packetId, targetPrefix) {
-  const charset = CHARSETS.alnum;
+function clampInt(value, min, max, fallback) {
+  const parsed = parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
+
+function normalizeCrackConfig(input = {}) {
+  const charsetKey = CHARSETS[input.charset] ? input.charset : 'alnum';
+  const minLen = clampInt(input.minLen, 1, 10, 1);
+  const maxLen = clampInt(input.maxLen, minLen, 10, 6);
+  return {
+    charset: charsetKey,
+    minLen,
+    maxLen,
+  };
+}
+
+function indexRangeForLengths(base, minLen, maxLen) {
+  let start = 0;
+  for (let len = 1; len < minLen; len++) start += Math.pow(base, len);
+  let span = 0;
+  for (let len = minLen; len <= maxLen; len++) span += Math.pow(base, len);
+  return { start, end: start + span };
+}
+
+function createWorkChunks(packetId, targetPrefix, crackConfig = {}) {
+  const cfg = normalizeCrackConfig(crackConfig);
+  const charset = CHARSETS[cfg.charset];
   const base = charset.length;
-  let totalCandidates = 0;
-  for (let len = 1; len <= 6; len++) {
-    totalCandidates += Math.pow(base, len);
-  }
+  const { start: totalStart, end: totalEnd } = indexRangeForLengths(base, cfg.minLen, cfg.maxLen);
 
   const insert = db.transaction(() => {
-    for (let start = 0; start < totalCandidates; start += CHUNK_SIZE) {
-      const end = Math.min(start + CHUNK_SIZE, totalCandidates);
-      stmts.insertChunk.run(packetId, targetPrefix, start, end, 'alnum');
+    for (let start = totalStart; start < totalEnd; start += CHUNK_SIZE) {
+      const end = Math.min(start + CHUNK_SIZE, totalEnd);
+      stmts.insertChunk.run(packetId, targetPrefix, start, end, cfg.charset);
     }
   });
   insert();
+
+  return cfg;
 }
 
 // ── Connected Workers ───────────────────────────────────────────────────────
@@ -278,7 +364,7 @@ wss.on('connection', (ws) => {
         ws.send(JSON.stringify({
           type: 'work',
           chunks,
-          charset: CHARSETS.alnum,
+          charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
         }));
         broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
         break;
@@ -395,8 +481,9 @@ app.post('/api/packets/:id/decode', async (req, res) => {
 
 // Upload a packet — decode it with meshcoredecoder to extract channelHash
 app.post('/api/packets', (req, res) => {
-  const { rawData } = req.body;
+  const { rawData, crackConfig } = req.body;
   if (!rawData) return res.status(400).json({ error: 'rawData required' });
+  const cfg = normalizeCrackConfig(crackConfig);
 
   const hexData = rawData.trim().replace(/\s+/g, '');
 
@@ -437,7 +524,7 @@ app.post('/api/packets', (req, res) => {
       try {
         const decryptResult = tryDecrypt(hexData, match.key);
         if (decryptResult.success) {
-          const result = stmts.insertPacket.run(hexData, prefix, channelHash, JSON.stringify(decoded));
+          const result = stmts.insertPacket.run(hexData, prefix, channelHash, JSON.stringify(decoded), cfg.charset, cfg.minLen, cfg.maxLen);
           stmts.updatePacketStatus.run('cracked', match.key, match.channel_name, result.lastInsertRowid);
           if (decryptResult.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(decryptResult.decoded), result.lastInsertRowid);
           const packet = stmts.getPacketById.get(result.lastInsertRowid);
@@ -450,8 +537,8 @@ app.post('/api/packets', (req, res) => {
     }
   }
 
-  const result = stmts.insertPacket.run(hexData, prefix, channelHash, decoded ? JSON.stringify(decoded) : null);
-  createWorkChunks(result.lastInsertRowid, prefix);
+  const result = stmts.insertPacket.run(hexData, prefix, channelHash, decoded ? JSON.stringify(decoded) : null, cfg.charset, cfg.minLen, cfg.maxLen);
+  createWorkChunks(result.lastInsertRowid, prefix, cfg);
   const packet = stmts.getPacketById.get(result.lastInsertRowid);
 
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
@@ -495,6 +582,37 @@ app.post('/api/packets/:id/auto-decrypt', (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+app.post('/api/packets/:id/retry', (req, res) => {
+  const packetId = parseInt(req.params.id);
+  const packet = stmts.getPacketById.get(packetId);
+  if (!packet) return res.status(404).json({ error: 'Packet not found' });
+
+  const channelName = (req.body?.channelName || packet.channel_name || '').trim();
+  const cfg = normalizeCrackConfig({
+    charset: req.body?.crackConfig?.charset || packet.charset,
+    minLen: req.body?.crackConfig?.minLen || packet.min_len,
+    maxLen: req.body?.crackConfig?.maxLen || packet.max_len,
+  });
+  if (channelName) {
+    db.prepare('UPDATE candidate_keys SET ignored = 1 WHERE packet_id = ? AND channel_name = ?')
+      .run(packetId, channelName);
+  }
+
+  db.prepare("UPDATE packets SET status = 'pending', cracked_key = NULL, channel_name = NULL, cracked_at = NULL, decrypted_json = NULL WHERE id = ?")
+    .run(packetId);
+  db.prepare('UPDATE packets SET charset = ?, min_len = ?, max_len = ? WHERE id = ?')
+    .run(cfg.charset, cfg.minLen, cfg.maxLen, packetId);
+  db.prepare('DELETE FROM work_chunks WHERE packet_id = ?')
+    .run(packetId);
+  createWorkChunks(packetId, packet.prefix, cfg);
+
+  broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+  broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
+  broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+
+  res.json({ ok: true, ignoredChannel: channelName || null, crackConfig: cfg });
 });
 
 app.get('/api/channels', (req, res) => {
