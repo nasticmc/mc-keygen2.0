@@ -157,7 +157,7 @@ function autoDecryptCandidates(packetId) {
         db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
           .run(packetId);
         broadcast({ type: 'key_found', packetId, key: candidate.key, channelName: candidate.channel_name, decoded: result.decoded });
-        broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+        broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
         broadcast({ type: 'packets', packets: stmts.getPackets.all() });
         return result;
       }
@@ -179,9 +179,9 @@ db.exec(`
     prefix INTEGER NOT NULL,
     channel_hash TEXT,
     decoded_json TEXT,
-    charset TEXT DEFAULT 'alnum',
+    charset TEXT DEFAULT 'lower',
     min_len INTEGER DEFAULT 1,
-    max_len INTEGER DEFAULT 6,
+    max_len INTEGER DEFAULT 5,
     status TEXT DEFAULT 'pending',
     cracked_key TEXT,
     channel_name TEXT,
@@ -254,6 +254,16 @@ const stmts = {
       (SELECT COUNT(*) FROM work_chunks WHERE status = 'completed') as completed,
       (SELECT COUNT(*) FROM work_chunks) as total
   `),
+  getActiveJobStats: db.prepare(`
+    SELECT
+      COALESCE(SUM(CASE WHEN w.status = 'pending' THEN 1 ELSE 0 END), 0) as pending,
+      COALESCE(SUM(CASE WHEN w.status = 'assigned' THEN 1 ELSE 0 END), 0) as assigned,
+      COALESCE(SUM(CASE WHEN w.status = 'completed' THEN 1 ELSE 0 END), 0) as completed,
+      COALESCE(COUNT(*), 0) as total
+    FROM work_chunks w
+    JOIN packets p ON p.id = w.packet_id
+    WHERE p.status != 'cracked'
+  `),
   expireStaleChunks: db.prepare(`
     UPDATE work_chunks SET status = 'pending', assigned_to = NULL, assigned_at = NULL
     WHERE status = 'assigned' AND assigned_at < datetime('now', '-5 minutes')
@@ -302,9 +312,9 @@ function clampInt(value, min, max, fallback) {
 }
 
 function normalizeCrackConfig(input = {}) {
-  const charsetKey = CHARSETS[input.charset] ? input.charset : 'alnum';
+  const charsetKey = CHARSETS[input.charset] ? input.charset : 'lower';
   const minLen = clampInt(input.minLen, 1, 10, 1);
-  const maxLen = clampInt(input.maxLen, minLen, 10, 6);
+  const maxLen = clampInt(input.maxLen, minLen, 10, 5);
   return {
     charset: charsetKey,
     minLen,
@@ -366,7 +376,7 @@ function getTotalHashRate() {
 }
 
 setInterval(() => {
-  if (wss.clients.size > 0) broadcast({ type: 'stats', ...stmts.getQueueStats.get(), totalHashRate: getTotalHashRate() });
+  if (wss.clients.size > 0) broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get(), totalHashRate: getTotalHashRate() });
 }, 2000);
 
 wss.on('connection', (ws) => {
@@ -389,7 +399,7 @@ wss.on('connection', (ws) => {
           chunks,
           charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
         }));
-        broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+        broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
         break;
       }
 
@@ -400,7 +410,7 @@ wss.on('connection', (ws) => {
           worker.chunksCompleted++;
           worker.hashRate = msg.hashRate || 0;
         }
-        broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+        broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
         broadcast({ type: 'worker_update', workerId, hashRate: msg.hashRate || 0 });
         break;
       }
@@ -439,7 +449,7 @@ wss.on('connection', (ws) => {
               db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
                 .run(packetId);
               broadcast({ type: 'key_found', packetId, key, channelName, decoded: result.decoded });
-              broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+              broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
               broadcast({ type: 'packets', packets: stmts.getPackets.all() });
             }
             broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
@@ -476,7 +486,7 @@ wss.on('connection', (ws) => {
               db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
                 .run(batchPacketId);
               broadcast({ type: 'key_found', packetId: batchPacketId, key: keyHex, channelName: cn, decoded: result.decoded });
-              broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+              broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
               broadcast({ type: 'packets', packets: stmts.getPackets.all() });
               foundKey = true;
             }
@@ -493,7 +503,7 @@ wss.on('connection', (ws) => {
         db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
           .run(msg.packetId);
         broadcast({ type: 'key_found', packetId: msg.packetId, key: msg.key, channelName: msg.channelName });
-        broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+        broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
         broadcast({ type: 'packets', packets: stmts.getPackets.all() });
         break;
       }
@@ -512,7 +522,7 @@ wss.on('connection', (ws) => {
     workers.delete(workerId);
     broadcast({ type: 'worker_removed', workerId });
     broadcast({ type: 'worker_count', count: workers.size });
-    broadcast({ type: 'stats', ...stmts.getQueueStats.get(), totalHashRate: getTotalHashRate() });
+    broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get(), totalHashRate: getTotalHashRate() });
   });
 });
 
@@ -611,7 +621,7 @@ app.post('/api/packets', (req, res) => {
   const packet = stmts.getPacketById.get(result.lastInsertRowid);
 
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
-  broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+  broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
 
   res.json({ packet, alreadyKnown: false, prefixByte: prefixHex, decoded });
 });
@@ -624,7 +634,7 @@ app.delete('/api/packets/:id', (req, res) => {
   db.prepare('DELETE FROM candidate_keys WHERE packet_id = ?').run(id);
   db.prepare('DELETE FROM packets WHERE id = ?').run(id);
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
-  broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+  broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
   res.json({ ok: true });
 });
 
@@ -682,7 +692,7 @@ app.post('/api/packets/:id/retry', (req, res) => {
 
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
   broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
-  broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+  broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
 
   res.json({ ok: true, ignoredChannel: channelName || null, crackConfig: cfg });
 });
@@ -721,11 +731,12 @@ app.get('/api/candidates', (req, res) => {
 app.get('/api/stats', (req, res) => {
   stmts.expireStaleChunks.run();
   const stats = stmts.getQueueStats.get();
+  const activeStats = stmts.getActiveJobStats.get();
   const workerList = [];
   for (const [id, w] of workers) {
     workerList.push({ id: id.substring(0, 8), hashRate: w.hashRate, chunksCompleted: w.chunksCompleted });
   }
-  res.json({ ...stats, workers: workerList, workerCount: workers.size });
+  res.json({ ...stats, activeStats, workers: workerList, workerCount: workers.size, totalHashRate: getTotalHashRate() });
 });
 
 app.post('/api/derive', (req, res) => {

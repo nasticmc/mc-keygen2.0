@@ -140,15 +140,21 @@ textarea:focus, input[type="text"]:focus {
 /* ── Mobile Responsive ──────────────────────────────────────────────── */
 @media (max-width: 768px) {
   header {
-    flex-wrap: wrap;
-    gap: 8px;
-    padding: 12px 16px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 10px 14px;
+  }
+
+  header h1 {
+    font-size: 1.2rem;
   }
 
   .status-bar {
-    gap: 10px;
-    font-size: 0.78rem;
+    gap: 8px;
+    font-size: 0.76rem;
     flex-wrap: wrap;
+    width: 100%;
   }
 
   .tabs {
@@ -161,26 +167,36 @@ textarea:focus, input[type="text"]:focus {
   .tabs::-webkit-scrollbar { display: none; }
 
   .tab {
-    padding: 10px 14px;
-    font-size: 0.85rem;
+    padding: 10px 12px;
+    font-size: 0.82rem;
     white-space: nowrap;
     flex-shrink: 0;
   }
 
   .tab-content {
-    padding: 12px;
+    padding: 10px;
   }
 
   .panel {
-    padding: 16px;
+    padding: 14px;
+    margin-bottom: 10px;
   }
 
   .stats-grid {
     grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+  }
+
+  .stat-card {
+    padding: 12px 10px;
   }
 
   .stat-value {
     font-size: 1.4rem;
+  }
+
+  .stat-label {
+    font-size: 0.7rem;
   }
 
   .add-channel-form {
@@ -194,7 +210,28 @@ textarea:focus, input[type="text"]:focus {
   }
 
   .cracking-controls {
-    flex-wrap: wrap;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .cracking-controls .btn-primary,
+  .cracking-controls .btn-danger {
+    width: 100%;
+    text-align: center;
+    margin-top: 0;
+  }
+
+  .gpu-badge {
+    text-align: center;
+  }
+
+  .keyspace-controls {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .btn-primary, .btn-danger {
+    width: 100%;
   }
 
   .decoded-message-fields {
@@ -204,11 +241,23 @@ textarea:focus, input[type="text"]:focus {
   .decoded-card-header {
     flex-wrap: wrap;
   }
+
+  .progress-bar-container {
+    height: 20px;
+  }
+
+  .progress-text {
+    font-size: 0.7rem;
+  }
 }
 
 @media (max-width: 900px) and (min-width: 769px) {
   .add-channel-form {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .stats-grid {
+    grid-template-columns: repeat(3, 1fr);
   }
 }
 
@@ -307,7 +356,7 @@ textarea:focus, input[type="text"]:focus {
 /* ── Stats Grid ──────────────────────────────────────────────────── */
 .stats-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 12px;
   margin: 16px 0;
 }

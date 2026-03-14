@@ -4,7 +4,7 @@ let ws = null;
 let cracker = null;
 let cracking = false;
 let loopRunning = false;
-let currentCharset = 'abcdefghijklmnopqrstuvwxyz0123456789';
+let currentCharset = 'abcdefghijklmnopqrstuvwxyz';
 let serverChunkSize = 500000;
 const pendingWorkResolvers = [];
 const queuedWorkMessages = [];
@@ -116,24 +116,46 @@ function waitForWork(timeoutMs = 5000) {
 
 // ── Stats ───────────────────────────────────────────────────────────────────
 function updateStats(stats) {
-  document.getElementById('stat-pending').textContent = formatNumber(stats.pending);
-  document.getElementById('stat-assigned').textContent = formatNumber(stats.assigned);
-  document.getElementById('stat-completed').textContent = formatNumber(stats.completed);
+  // Use active job stats (non-cracked packets only) so completed/pending reflect current work
+  const active = stats.activeStats || stats;
 
-  const total = stats.total || 1;
-  const pct = Math.round((stats.completed / total) * 100);
+  document.getElementById('stat-pending').textContent = formatNumber(active.pending);
+  document.getElementById('stat-assigned').textContent = formatNumber(active.assigned);
+  document.getElementById('stat-completed').textContent = formatNumber(active.completed);
+
+  const total = active.total || 1;
+  const pct = total > 0 ? Math.round((active.completed / total) * 100) : 0;
   document.getElementById('progress-bar').style.width = `${pct}%`;
-  document.getElementById('progress-text').textContent = `${pct}% (${stats.completed}/${total})`;
+  document.getElementById('progress-text').textContent = `${pct}% (${active.completed}/${total})`;
 
+  const hashRate = stats.totalHashRate ?? 0;
   if (stats.totalHashRate !== undefined) {
-    document.getElementById('stat-hashrate').textContent = formatHashRate(stats.totalHashRate);
+    document.getElementById('stat-hashrate').textContent = formatHashRate(hashRate);
   }
+
+  // ETA based on remaining chunks × chunk size ÷ hash rate
+  const remaining = (active.pending + active.assigned) * serverChunkSize;
+  const eta = hashRate > 0 && remaining > 0 ? remaining / hashRate : Infinity;
+  const etaEl = document.getElementById('stat-eta');
+  if (etaEl) etaEl.textContent = formatETA(eta);
 }
 
 function formatNumber(n) {
+  if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(1) + 'B';
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
   if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
   return String(n);
+}
+
+function formatETA(seconds) {
+  if (!isFinite(seconds) || seconds <= 0) return '—';
+  if (seconds < 60) return '< 1m';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h >= 24 * 7) return '> 1wk';
+  if (h >= 24) return `${Math.floor(h / 24)}d ${h % 24}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
 }
 
 // Convert SQLite UTC timestamp (YYYY-MM-DD HH:MM:SS) to local time string
@@ -609,9 +631,9 @@ async function runCrackingLoop() {
 }
 
 function getCrackConfigFromUI() {
-  const charsetKey = document.getElementById('keyspace-charset')?.value || 'alnum';
+  const charsetKey = document.getElementById('keyspace-charset')?.value || 'lower';
   let minLen = parseInt(document.getElementById('keyspace-min-len')?.value, 10) || 1;
-  let maxLen = parseInt(document.getElementById('keyspace-max-len')?.value, 10) || 6;
+  let maxLen = parseInt(document.getElementById('keyspace-max-len')?.value, 10) || 5;
   minLen = Math.max(1, Math.min(minLen, 10));
   maxLen = Math.max(minLen, Math.min(maxLen, 10));
 
@@ -690,9 +712,8 @@ function updateKeyspaceEstimate() {
   const maxLen = parseInt(document.getElementById('keyspace-max-len')?.value, 10) || 6;
   const charsetLen = CHARSET_LENS[charsetKey] || 36;
   const keyspaceSize = calculateKeyspaceSize(charsetLen, minLen, maxLen);
-  const estimatedChunks = Math.ceil(keyspaceSize / serverChunkSize);
-  const el = document.getElementById('stat-keyspace-chunks');
-  if (el) el.textContent = formatNumber(estimatedChunks);
+  const el = document.getElementById('stat-keyspace-size');
+  if (el) el.textContent = formatNumber(keyspaceSize);
 }
 
 ['keyspace-charset', 'keyspace-min-len', 'keyspace-max-len'].forEach(id => {
