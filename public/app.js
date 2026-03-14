@@ -33,6 +33,9 @@ function connectWebSocket() {
   ws = new WebSocket(`${protocol}//${location.host}`);
 
   ws.onopen = () => {
+    // Clear stale work queues from before the disconnect
+    pendingWorkResolvers.length = 0;
+    queuedWorkMessages.length = 0;
     document.getElementById('connection-status').textContent = 'Connected';
     document.getElementById('connection-status').className = 'connected';
     if (cracking && !loopRunning) runCrackingLoop();
