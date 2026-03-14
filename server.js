@@ -359,8 +359,14 @@ const heartbeatInterval = setInterval(() => {
 wss.on('close', () => clearInterval(heartbeatInterval));
 
 // ── Periodic Stats Broadcast ────────────────────────────────────────────────
+function getTotalHashRate() {
+  let total = 0;
+  for (const w of workers.values()) total += w.hashRate;
+  return total;
+}
+
 setInterval(() => {
-  if (wss.clients.size > 0) broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+  if (wss.clients.size > 0) broadcast({ type: 'stats', ...stmts.getQueueStats.get(), totalHashRate: getTotalHashRate() });
 }, 2000);
 
 wss.on('connection', (ws) => {
@@ -504,8 +510,9 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     stmts.unassignWorkerChunks.run(workerId);
     workers.delete(workerId);
+    broadcast({ type: 'worker_removed', workerId });
     broadcast({ type: 'worker_count', count: workers.size });
-    broadcast({ type: 'stats', ...stmts.getQueueStats.get() });
+    broadcast({ type: 'stats', ...stmts.getQueueStats.get(), totalHashRate: getTotalHashRate() });
   });
 });
 
