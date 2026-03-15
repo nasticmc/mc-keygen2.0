@@ -150,21 +150,33 @@ function connectWebSocket() {
         workerData.delete(msg.workerId);
         refreshWorkerDisplay();
         break;
-      case 'work':
+      case 'work': {
         // Only decrement inFlight for solicited responses (replies to request_work).
         // Unsolicited pushes from maybePushWork should not affect the counter.
         if (msg.solicited) {
           workRequestsInFlight = Math.max(0, workRequestsInFlight - 1);
           if (workRequestsInFlight === 0) workRequestSentAt = 0;
         }
+
+        const chunkCount = msg.chunks?.length || 0;
+
+        // Empty replies are useful to satisfy a waiter, but should never be
+        // queued as "available work" or they inflate queued batch/chunk counts.
+        if (chunkCount === 0 && pendingWorkResolvers.length === 0) {
+          clog(`work received: 0 chunk(s) [${msg.solicited ? 'solicited' : 'push'}] — dropped empty payload (queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight} waiting=${pendingWorkResolvers.length})`);
+          if (cracking && loopRunning) topUpWorkQueue();
+          break;
+        }
+
         if (pendingWorkResolvers.length > 0) {
           const resolve = pendingWorkResolvers.shift();
           resolve(msg);
         } else {
           queuedWorkMessages.push(msg);
         }
-        clog(`work received: ${msg.chunks?.length || 0} chunk(s) [${msg.solicited ? 'solicited' : 'push'}] — queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight} waiting=${pendingWorkResolvers.length}`);
+        clog(`work received: ${chunkCount} chunk(s) [${msg.solicited ? 'solicited' : 'push'}] — queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight} waiting=${pendingWorkResolvers.length}`);
         break;
+      }
     }
   };
 }
