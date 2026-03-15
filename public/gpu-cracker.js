@@ -374,7 +374,7 @@ class GPUCracker {
       if (!this.running) break;
 
       const rangeSize = chunk.range_end - chunk.range_start;
-      const batchSize = 2097152; // 2M — ~20ms GPU compute vs ~5ms mapAsync overhead
+      const batchSize = 4194304; // 4M — matches server chunk size, halves mapAsync round-trips
 
       for (let offset = 0; offset < rangeSize && this.running; offset += batchSize) {
         const size = Math.min(batchSize, rangeSize - offset);

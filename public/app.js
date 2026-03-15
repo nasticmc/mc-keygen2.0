@@ -598,21 +598,35 @@ document.getElementById('btn-stop-cracking').addEventListener('click', () => {
 async function runCrackingLoop() {
   if (loopRunning) return;
   loopRunning = true;
+
+  function batchCount() {
+    return parseInt(document.getElementById('work-batch-count')?.value, 10) || 4;
+  }
+
+  // Kick off the first work request before entering the loop so there's no
+  // idle time between starting and actually receiving work.
+  ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
+  let nextWork = waitForWork(8000);
+
   try {
     while (cracking && ws && ws.readyState === WebSocket.OPEN) {
-      setCrackingStatus('Requesting work from server...');
-      const count = parseInt(document.getElementById('work-batch-count')?.value, 10) || 8;
-      ws.send(JSON.stringify({ type: 'request_work', count }));
-      const response = await waitForWork(5000);
-
+      setCrackingStatus('Waiting for work from server...');
+      const response = await nextWork;
       const chunks = response.chunks;
       if (response.charset) currentCharset = response.charset;
 
       if (chunks.length === 0) {
-        setCrackingStatus('No work available. Polling again in 2s...');
+        setCrackingStatus('No work available. Retrying in 2s...');
         await new Promise(r => setTimeout(r, 2000));
+        ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
+        nextWork = waitForWork(8000);
         continue;
       }
+
+      // Request the next batch immediately while we process this one so the
+      // GPU never idles waiting on a round-trip to the server.
+      ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
+      nextWork = waitForWork(30000);
 
       const packetIds = [...new Set(chunks.map(c => c.packet_id))];
       setCrackingStatus(`Processing ${chunks.length} chunk(s) for packet ${packetIds.join(', ')}...`);
@@ -622,8 +636,6 @@ async function runCrackingLoop() {
         setCrackingStatus(`Crunching ${chunks.length} chunk(s) at ${formatHashRate(hashRate)}.`);
         ws.send(JSON.stringify({ type: 'hashrate_update', hashRate }));
       }, currentCharset);
-
-      setCrackingStatus(`Finished ${chunks.length} chunk(s). Requesting more work...`);
     }
   } finally {
     loopRunning = false;
