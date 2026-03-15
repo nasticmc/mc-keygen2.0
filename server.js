@@ -312,7 +312,7 @@ const stmts = {
   deleteKnownChannel: db.prepare('DELETE FROM known_channels WHERE id = ?'),
   findByPrefix: db.prepare('SELECT * FROM known_channels WHERE prefix = ?'),
   insertAssignedChunk: db.prepare('INSERT INTO work_chunks (packet_id, target_prefix, range_start, range_end, charset, status, assigned_to, assigned_at) VALUES (?, ?, ?, ?, ?, \'assigned\', ?, CURRENT_TIMESTAMP)'),
-  completeChunk: db.prepare("UPDATE work_chunks SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?"),
+  completeChunkByWorker: db.prepare("UPDATE work_chunks SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'assigned' AND assigned_to = ?"),
   getChunksByPacket: db.prepare('SELECT * FROM work_chunks WHERE packet_id = ?'),
   // Stats now compute pending virtually from packet keyspace offsets
   getAssignedCount: db.prepare("SELECT COUNT(*) as assigned FROM work_chunks WHERE status = 'assigned'"),
@@ -449,6 +449,19 @@ function releaseWorkerChunks(workerId) {
     }
   }
 }
+
+const completeChunksForWorker = db.transaction((workerId, chunkIds) => {
+  let completedNow = 0;
+  let alreadyCompletedOrMissing = 0;
+
+  for (const chunkId of chunkIds) {
+    const result = stmts.completeChunkByWorker.run(chunkId, workerId);
+    if (result.changes > 0) completedNow += 1;
+    else alreadyCompletedOrMissing += 1;
+  }
+
+  return { completedNow, alreadyCompletedOrMissing };
+});
 
 function recycleStaleChunks() {
   const stale = stmts.getStaleChunks.all();
@@ -927,21 +940,23 @@ wss.on('connection', (ws) => {
 
       case 'chunk_complete': {
         if (!workerId) registerWorker(msg.clientId);
-        const result = stmts.completeChunk.run(msg.chunkId);
-        let completionNote = '';
-        if (result.changes === 0) {
-          // Chunk was already completed or deleted (stale recycler).
-          // Delete by ID as a fallback to prevent re-assignment.
-          stmts.deleteChunkById.run(msg.chunkId);
-          completionNote = ' (chunk already completed or recycled)';
-        }
+        const rawIds = Array.isArray(msg.chunkIds)
+          ? msg.chunkIds
+          : (msg.chunkId != null ? [msg.chunkId] : []);
+        const chunkIds = [...new Set(rawIds.map(id => parseInt(id, 10)).filter(Number.isFinite))];
+        if (chunkIds.length === 0) break;
+
+        const { completedNow, alreadyCompletedOrMissing } = completeChunksForWorker(workerId, chunkIds);
+        const completionNote = alreadyCompletedOrMissing > 0
+          ? ` (${alreadyCompletedOrMissing} chunk${alreadyCompletedOrMissing !== 1 ? 's' : ''} already completed, reassigned, or recycled)`
+          : '';
         const worker = workers.get(workerId);
         if (worker) {
-          worker.chunksCompleted++;
+          worker.chunksCompleted += completedNow;
           worker.hashRate = msg.hashRate || 0;
         }
         const remainingAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
-        console.log(`[done] ${wName(workerId)} chunk=${msg.chunkId} total_done=${worker?.chunksCompleted || '?'} remaining=${remainingAssigned} rate=${formatHashRate(msg.hashRate || 0)}${completionNote}`);
+        console.log(`[done] ${wName(workerId)} chunks=${chunkIds.length} completed_now=${completedNow} total_done=${worker?.chunksCompleted || '?'} remaining=${remainingAssigned} rate=${formatHashRate(msg.hashRate || 0)}${completionNote}`);
         // Don't push work here — let the client pull via request_work.
         // Server pushes caused assigned count to diverge from what the
         // client actually had queued (push messages piled up in network
