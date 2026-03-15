@@ -1,19 +1,19 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 :root {
-  --bg:           #060a06;
-  --surface:      #0a0f0a;
-  --surface2:     #0d150d;
+  --bg:           #020402;
+  --surface:      #060906;
+  --surface2:     #0a0e0a;
   --border:       #1a3a1a;
   --border-bright:#2aff4a44;
-  --text:         #a8f0a8;
-  --text-dim:     #4a7a4a;
-  --accent:       #00ff41;
-  --accent-dim:   #00cc33;
-  --accent-glow:  #00ff4133;
-  --accent-glow2: #00ff4108;
-  --green:        #00ff41;
-  --red:          #ff2222;
+  --text:         #d8f5d8;
+  --text-dim:     #6a9a6a;
+  --accent:       #00e838;
+  --accent-dim:   #00b82e;
+  --accent-glow:  #00e83833;
+  --accent-glow2: #00e83808;
+  --green:        #00e838;
+  --red:          #ff3333;
   --yellow:       #ccff00;
   --blue:         #00ccff;
 }
@@ -49,13 +49,12 @@ header {
   padding: 14px 24px;
   border-bottom: 1px solid var(--border);
   background: var(--surface);
-  box-shadow: 0 1px 12px var(--accent-glow2);
 }
+
 
 header h1 {
   font-size: 1.4rem;
   color: var(--accent);
-  text-shadow: 0 0 8px var(--accent), 0 0 18px var(--accent-glow);
   letter-spacing: 0.12em;
   text-transform: uppercase;
   font-family: 'Courier New', monospace;
@@ -78,7 +77,7 @@ header h1::after {
   letter-spacing: 0.04em;
 }
 
-.status-bar .connected { color: var(--green); text-shadow: 0 0 6px var(--accent-glow); }
+.status-bar .connected { color: var(--green); }
 .status-bar .disconnected { color: var(--red); }
 
 #connection-status::before {
@@ -92,7 +91,6 @@ header h1::after {
 }
 #connection-status.connected::before {
   background: var(--green);
-  box-shadow: 0 0 6px var(--accent);
 }
 
 .worker-id-badge {
@@ -104,7 +102,6 @@ header h1::after {
   border-radius: 2px;
   padding: 2px 8px;
   letter-spacing: 0.06em;
-  text-shadow: 0 0 4px var(--accent-glow);
 }
 
 /* ── Tabs ────────────────────────────────────────────────────────── */
@@ -134,7 +131,6 @@ header h1::after {
 .tab.active {
   color: var(--accent);
   border-bottom-color: var(--accent);
-  text-shadow: 0 0 6px var(--accent-glow);
 }
 
 .tab-content { display: none; padding: 24px; }
@@ -147,7 +143,6 @@ header h1::after {
   border-radius: 2px;
   padding: 20px 24px;
   margin-bottom: 14px;
-  box-shadow: inset 0 0 30px var(--accent-glow2);
 }
 
 .panel h2 {
@@ -156,7 +151,6 @@ header h1::after {
   color: var(--accent);
   text-transform: uppercase;
   letter-spacing: 0.1em;
-  text-shadow: 0 0 6px var(--accent-glow);
 }
 .panel h3 {
   margin: 16px 0 8px;
@@ -205,20 +199,17 @@ select, input[type="number"] {
 
 input[type="number"][readonly] {
   color: var(--accent);
-  text-shadow: 0 0 4px var(--accent-glow);
   cursor: default;
 }
 
 textarea:focus, input[type="text"]:focus {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-glow), 0 0 12px var(--accent-glow2);
 }
 
 select:focus, input[type="number"]:focus {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-glow);
 }
 
 .add-channel-form {
@@ -294,12 +285,10 @@ select:focus, input[type="number"]:focus {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   margin-top: 12px;
-  transition: background 0.15s, box-shadow 0.15s;
+  transition: background 0.15s;
 }
 .btn-primary:hover {
   background: var(--accent-glow);
-  box-shadow: 0 0 10px var(--accent-glow), 0 0 20px var(--accent-glow2);
-  text-shadow: 0 0 6px var(--accent);
 }
 
 .btn-danger {
@@ -314,11 +303,10 @@ select:focus, input[type="number"]:focus {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   margin-top: 12px;
-  transition: background 0.15s, box-shadow 0.15s;
+  transition: background 0.15s;
 }
 .btn-danger:hover {
   background: rgba(255,34,34,0.12);
-  box-shadow: 0 0 10px rgba(255,34,34,0.3);
 }
 
 .btn-sm {
@@ -351,7 +339,6 @@ select:focus, input[type="number"]:focus {
   text-transform: uppercase;
   letter-spacing: 0.1em;
   font-family: 'Courier New', monospace;
-  text-shadow: 0 0 4px var(--accent-glow);
 }
 
 .data-table td {
@@ -390,7 +377,7 @@ select:focus, input[type="number"]:focus {
 
 .badge-pending  { background: transparent; border: 1px solid var(--yellow); color: var(--yellow); }
 .badge-cracking { background: transparent; border: 1px solid var(--blue);   color: var(--blue); }
-.badge-cracked  { background: transparent; border: 1px solid var(--green);  color: var(--green); text-shadow: 0 0 4px var(--accent-glow); }
+.badge-cracked  { background: transparent; border: 1px solid var(--green);  color: var(--green); }
 
 .gpu-badge {
   padding: 3px 10px;
@@ -401,7 +388,7 @@ select:focus, input[type="number"]:focus {
   border: 1px solid var(--border);
   letter-spacing: 0.04em;
 }
-.gpu-badge.supported   { border-color: var(--green); color: var(--green); text-shadow: 0 0 4px var(--accent-glow); }
+.gpu-badge.supported   { border-color: var(--green); color: var(--green); }
 .gpu-badge.unsupported { border-color: var(--red);   color: var(--red); }
 
 /* ── Stats Grid ──────────────────────────────────────────────────── */
@@ -418,14 +405,12 @@ select:focus, input[type="number"]:focus {
   border-radius: 2px;
   padding: 14px;
   text-align: center;
-  box-shadow: inset 0 0 20px var(--accent-glow2);
 }
 
 .stat-value {
   font-size: 1.7rem;
   font-weight: 700;
   color: var(--accent);
-  text-shadow: 0 0 10px var(--accent), 0 0 20px var(--accent-glow);
   font-family: 'Courier New', monospace;
 }
 
@@ -472,14 +457,12 @@ select:focus, input[type="number"]:focus {
 .progress-bar {
   height: 100%;
   background: linear-gradient(90deg, #003a10, var(--accent));
-  box-shadow: 0 0 10px var(--accent-glow);
   transition: width 0.3s ease;
   width: 0%;
 }
 
 .local-progress-bar {
   background: linear-gradient(90deg, #001a2a, var(--blue));
-  box-shadow: 0 0 10px rgba(0,204,255,0.3);
 }
 
 .progress-text {
@@ -506,7 +489,6 @@ select:focus, input[type="number"]:focus {
   border: 1px solid var(--border);
   border-radius: 2px;
   padding: 10px 12px;
-  box-shadow: inset 0 0 16px var(--accent-glow2);
 }
 
 .worker-card .worker-id {
@@ -521,7 +503,6 @@ select:focus, input[type="number"]:focus {
   font-size: 1rem;
   font-weight: 700;
   color: var(--accent);
-  text-shadow: 0 0 8px var(--accent-glow);
   margin-top: 4px;
   font-family: 'Courier New', monospace;
 }
@@ -535,7 +516,7 @@ select:focus, input[type="number"]:focus {
   border: 1px solid var(--border);
   font-family: 'Courier New', monospace;
 }
-.result-box.success { border-color: var(--green); background: rgba(0,255,65,0.06); color: var(--green); text-shadow: 0 0 4px var(--accent-glow); }
+.result-box.success { border-color: var(--green); background: rgba(0,255,65,0.06); color: var(--green); }
 .result-box.info    { border-color: var(--blue);  background: rgba(0,204,255,0.06); color: var(--blue); }
 .result-box.error   { border-color: var(--red);   background: rgba(255,34,34,0.06); color: var(--red); }
 
@@ -622,7 +603,6 @@ select:focus, input[type="number"]:focus {
 }
 #decoder-status.connected::before {
   background: var(--green);
-  box-shadow: 0 0 5px var(--accent);
 }
 
 /* ── Decoded Packets ──────────────────────────────────────────────── */
@@ -640,7 +620,6 @@ select:focus, input[type="number"]:focus {
   border-radius: 2px;
   padding: 14px 18px;
   margin-bottom: 10px;
-  box-shadow: inset 0 0 20px var(--accent-glow2);
 }
 
 .decoded-card-header {
@@ -654,7 +633,6 @@ select:focus, input[type="number"]:focus {
   font-weight: 700;
   color: var(--accent);
   font-size: 0.9rem;
-  text-shadow: 0 0 4px var(--accent-glow);
 }
 
 .decoded-card-time {
