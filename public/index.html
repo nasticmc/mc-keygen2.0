@@ -13,6 +13,7 @@
       <span id="worker-count">Workers: 0</span>
       <span id="decoder-status" class="disconnected">Decoder: Checking...</span>
       <span id="connection-status" class="disconnected">Disconnected</span>
+      <span id="worker-id" class="worker-id-badge"></span>
     </div>
   </header>
 
@@ -61,7 +62,7 @@
           <input id="keyspace-max-len" type="number" min="1" max="10" value="5">
         </label>
         <label>Work Request Size
-          <input id="work-batch-count" type="number" min="1" max="24" value="4">
+          <input id="work-batch-count" type="number" min="1" max="64" value="4">
         </label>
       </div>
 

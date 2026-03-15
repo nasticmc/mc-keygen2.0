@@ -50,6 +50,7 @@ function connectWebSocket() {
   ws.onclose = () => {
     document.getElementById('connection-status').textContent = 'Disconnected';
     document.getElementById('connection-status').className = 'disconnected';
+    document.getElementById('worker-id').textContent = '';
     workRequestPending = false;
     clearInterval(ws._keepAliveTimer);
     setTimeout(connectWebSocket, 2000);
@@ -92,6 +93,9 @@ function connectWebSocket() {
         break;
       case 'worker_update':
         updateWorkerDisplay(msg.workerId, msg.hashRate);
+        break;
+      case 'worker_hello':
+        document.getElementById('worker-id').textContent = `ID: ${msg.workerId}`;
         break;
       case 'worker_removed':
         workerData.delete(msg.workerId);
@@ -643,7 +647,7 @@ async function runCrackingLoop() {
   }
 
   function batchCount() {
-    return parseInt(document.getElementById('work-batch-count')?.value, 10) || (isMobile() ? 1 : 4);
+    return parseInt(document.getElementById('work-batch-count')?.value, 10) || (isMobile() ? 2 : 16);
   }
 
   try {
@@ -673,6 +677,12 @@ async function runCrackingLoop() {
         if (!cracking || !ws || ws.readyState !== WebSocket.OPEN) break;
         // Only send a new request if one isn't already in-flight (avoids
         // duplicate requests when the timeout fires while a response is pending).
+        // However, if the in-flight request has been pending longer than two
+        // retry cycles (i.e. the server never responded), force-reset the flag
+        // so we don't silently stall forever.
+        if (workRequestPending && queuedWorkMessages.length === 0) {
+          workRequestPending = false;
+        }
         if (!workRequestPending) {
           workRequestPending = true;
           ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
@@ -845,7 +855,7 @@ function updateKeyspaceEstimate() {
   const batchInput = document.getElementById('work-batch-count');
   if (batchInput) {
     const mobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
-    batchInput.value = mobile ? 1 : 4;
+    batchInput.value = mobile ? 2 : 16;
   }
 
   connectWebSocket();

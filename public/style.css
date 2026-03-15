@@ -59,6 +59,17 @@ header h1 {
 }
 #connection-status.connected::before { background: var(--green); }
 
+.worker-id-badge {
+  font-size: 0.75rem;
+  font-family: monospace;
+  color: var(--text-dim);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 7px;
+  letter-spacing: 0.05em;
+}
+
 /* ── Tabs ────────────────────────────────────────────────────────── */
 .tabs {
   display: flex;
