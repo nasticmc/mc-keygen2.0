@@ -33,9 +33,13 @@ function connectWebSocket() {
   ws = new WebSocket(`${protocol}//${location.host}`);
 
   ws.onopen = () => {
-    // Clear stale work queues from before the disconnect
-    pendingWorkResolvers.length = 0;
+    // Resolve any stale waitForWork promises immediately so the loop wakes up
+    // rather than waiting up to 30s for the old timeout to fire.
+    const staleResolvers = pendingWorkResolvers.splice(0);
     queuedWorkMessages.length = 0;
+    for (const resolve of staleResolvers) {
+      resolve({ chunks: [], _reconnected: true });
+    }
     document.getElementById('connection-status').textContent = 'Connected';
     document.getElementById('connection-status').className = 'connected';
     if (cracking && !loopRunning) runCrackingLoop();
@@ -613,8 +617,12 @@ async function runCrackingLoop() {
   if (loopRunning) return;
   loopRunning = true;
 
+  function isMobile() {
+    return /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
+  }
+
   function batchCount() {
-    return parseInt(document.getElementById('work-batch-count')?.value, 10) || 4;
+    return parseInt(document.getElementById('work-batch-count')?.value, 10) || (isMobile() ? 1 : 4);
   }
 
   // Kick off the first work request before entering the loop so there's no
@@ -630,8 +638,11 @@ async function runCrackingLoop() {
       if (response.charset) currentCharset = response.charset;
 
       if (chunks.length === 0) {
-        setCrackingStatus('No work available. Retrying in 2s...');
-        await new Promise(r => setTimeout(r, 2000));
+        if (!response._reconnected) {
+          setCrackingStatus('No work available. Retrying in 2s...');
+          await new Promise(r => setTimeout(r, 2000));
+        }
+        if (!cracking || !ws || ws.readyState !== WebSocket.OPEN) break;
         ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
         nextWork = waitForWork(8000);
         continue;
@@ -648,11 +659,19 @@ async function runCrackingLoop() {
       await cracker.processChunks(chunks, ws, (hashRate) => {
         document.getElementById('stat-hashrate').textContent = formatHashRate(hashRate);
         setCrackingStatus(`Crunching ${chunks.length} chunk(s) at ${formatHashRate(hashRate)}.`);
-        ws.send(JSON.stringify({ type: 'hashrate_update', hashRate }));
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'hashrate_update', hashRate }));
+        }
       }, currentCharset);
     }
   } finally {
     loopRunning = false;
+    // If the loop crashed (e.g. ws.send on a closed socket) but the connection
+    // has since recovered, restart immediately rather than going dark.
+    if (cracking && ws && ws.readyState === WebSocket.OPEN) {
+      setTimeout(runCrackingLoop, 0);
+      return;
+    }
   }
 
   if (cracking && (!ws || ws.readyState !== WebSocket.OPEN)) {
@@ -756,6 +775,13 @@ function updateKeyspaceEstimate() {
 
 // ── Boot ────────────────────────────────────────────────────────────────────
 (async () => {
+  // Set work batch default based on device type
+  const batchInput = document.getElementById('work-batch-count');
+  if (batchInput) {
+    const mobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
+    batchInput.value = mobile ? 1 : 4;
+  }
+
   connectWebSocket();
   await loadData();
   await initCracker();

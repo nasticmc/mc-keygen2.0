@@ -404,11 +404,13 @@ class GPUCracker {
               batchMatches.push({ channelName, keyHex, prefixHex });
             }
             if (batchMatches.length > 0) {
-              ws.send(JSON.stringify({
-                type: 'prefix_match_batch',
-                packetId: chunk.packet_id,
-                matches: batchMatches,
-              }));
+              try {
+                ws.send(JSON.stringify({
+                  type: 'prefix_match_batch',
+                  packetId: chunk.packet_id,
+                  matches: batchMatches,
+                }));
+              } catch (_) { /* ws closed mid-batch; loop will detect on next iteration */ }
             }
           }
         } catch (err) {
@@ -416,11 +418,13 @@ class GPUCracker {
         }
       }
 
-      ws.send(JSON.stringify({
-        type: 'chunk_complete',
-        chunkId: chunk.id,
-        hashRate: this.hashRate
-      }));
+      try {
+        ws.send(JSON.stringify({
+          type: 'chunk_complete',
+          chunkId: chunk.id,
+          hashRate: this.hashRate
+        }));
+      } catch (_) { /* ws closed; server will re-queue this chunk via stale-chunk expiry */ }
     }
 
     return { found: false };
@@ -499,13 +503,15 @@ class CPUCracker {
         const prefix = await derivePrefixJS(key);
 
         if (prefix === chunk.target_prefix) {
-          ws.send(JSON.stringify({
-            type: 'prefix_match',
-            packetId: chunk.packet_id,
-            channelName,
-            key: bufToHex(key),
-            prefix: prefix.toString(16).padStart(2, '0'),
-          }));
+          try {
+            ws.send(JSON.stringify({
+              type: 'prefix_match',
+              packetId: chunk.packet_id,
+              channelName,
+              key: bufToHex(key),
+              prefix: prefix.toString(16).padStart(2, '0'),
+            }));
+          } catch (_) { /* ws closed; loop will detect and recover */ }
         }
 
         totalHashed++;
@@ -518,11 +524,13 @@ class CPUCracker {
         }
       }
 
-      ws.send(JSON.stringify({
-        type: 'chunk_complete',
-        chunkId: chunk.id,
-        hashRate: this.hashRate
-      }));
+      try {
+        ws.send(JSON.stringify({
+          type: 'chunk_complete',
+          chunkId: chunk.id,
+          hashRate: this.hashRate
+        }));
+      } catch (_) { /* ws closed; server will re-queue via stale-chunk expiry */ }
 
       totalHashed = 0;
       lastTime = performance.now();
