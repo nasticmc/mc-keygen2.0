@@ -338,6 +338,12 @@ textarea:focus, input[type="text"]:focus {
   white-space: nowrap;
 }
 
+.data-table td:last-child {
+  max-width: none;
+  overflow: visible;
+  white-space: normal;
+}
+
 .data-table tr:hover { background: var(--surface2); }
 
 /* ── Status Badges ───────────────────────────────────────────────── */
