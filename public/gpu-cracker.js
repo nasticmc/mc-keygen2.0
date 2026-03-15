@@ -433,6 +433,7 @@ class GPUCracker {
     };
 
     let _lastProgressTime = 0;
+    const completedChunkIds = new Set();
     const finishBatch = async (matches, batch) => {
       processedCandidates += batch.size;
       _rateWindowCount += batch.size;
@@ -454,11 +455,7 @@ class GPUCracker {
       }
       // Send matches without blocking the pipeline — fire and forget
       if (matches.length > 0) sendMatches(matches, batch.chunk);
-      if (batch.isLastInChunk) {
-        try {
-          ws.send(JSON.stringify({ type: 'chunk_complete', chunkId: batch.chunk.id, hashRate: this.hashRate }));
-        } catch (_) { /* ws closed; server will re-queue via stale-chunk expiry */ }
-      }
+      if (batch.isLastInChunk) completedChunkIds.add(batch.chunk.id);
     };
 
     // Ping-pong pipeline: dispatch batch i, then await batch i-1's readback
@@ -509,6 +506,16 @@ class GPUCracker {
       } catch (err) {
         console.error('GPU readback error:', err);
       }
+    }
+
+    if (completedChunkIds.size > 0) {
+      try {
+        ws.send(JSON.stringify({
+          type: 'chunk_complete',
+          chunkIds: [...completedChunkIds],
+          hashRate: this.hashRate,
+        }));
+      } catch (_) { /* ws closed; server will re-queue via stale-chunk expiry */ }
     }
 
     return { found: false };
@@ -579,6 +586,8 @@ class CPUCracker {
     const totalCandidates = chunks.reduce((sum, c) => sum + (c.range_end - c.range_start), 0);
     let processedCandidates = 0;
 
+    const completedChunkIds = [];
+
     for (const chunk of chunks) {
       if (!this.running) break;
 
@@ -625,16 +634,20 @@ class CPUCracker {
         if (onProgress) onProgress(this.hashRate, processedCandidates, totalCandidates);
       }
 
-      try {
-        ws.send(JSON.stringify({
-          type: 'chunk_complete',
-          chunkId: chunk.id,
-          hashRate: this.hashRate
-        }));
-      } catch (_) { /* ws closed; server will re-queue via stale-chunk expiry */ }
+      completedChunkIds.push(chunk.id);
 
       totalHashed = 0;
       lastTime = performance.now();
+    }
+
+    if (completedChunkIds.length > 0) {
+      try {
+        ws.send(JSON.stringify({
+          type: 'chunk_complete',
+          chunkIds: completedChunkIds,
+          hashRate: this.hashRate,
+        }));
+      } catch (_) { /* ws closed; server will re-queue via stale-chunk expiry */ }
     }
 
     return { found: false };

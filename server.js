@@ -312,7 +312,7 @@ const stmts = {
   deleteKnownChannel: db.prepare('DELETE FROM known_channels WHERE id = ?'),
   findByPrefix: db.prepare('SELECT * FROM known_channels WHERE prefix = ?'),
   insertAssignedChunk: db.prepare('INSERT INTO work_chunks (packet_id, target_prefix, range_start, range_end, charset, status, assigned_to, assigned_at) VALUES (?, ?, ?, ?, ?, \'assigned\', ?, CURRENT_TIMESTAMP)'),
-  completeChunk: db.prepare("UPDATE work_chunks SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?"),
+  completeChunk: db.prepare("UPDATE work_chunks SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'assigned'"),
   getChunksByPacket: db.prepare('SELECT * FROM work_chunks WHERE packet_id = ?'),
   // Stats now compute pending virtually from packet keyspace offsets
   getAssignedCount: db.prepare("SELECT COUNT(*) as assigned FROM work_chunks WHERE status = 'assigned'"),
@@ -927,21 +927,32 @@ wss.on('connection', (ws) => {
 
       case 'chunk_complete': {
         if (!workerId) registerWorker(msg.clientId);
-        const result = stmts.completeChunk.run(msg.chunkId);
-        let completionNote = '';
-        if (result.changes === 0) {
-          // Chunk was already completed or deleted (stale recycler).
-          // Delete by ID as a fallback to prevent re-assignment.
-          stmts.deleteChunkById.run(msg.chunkId);
-          completionNote = ' (chunk already completed or recycled)';
+        const chunkIds = Array.isArray(msg.chunkIds)
+          ? msg.chunkIds.map(id => parseInt(id, 10)).filter(Number.isFinite)
+          : [parseInt(msg.chunkId, 10)].filter(Number.isFinite);
+        let completedNow = 0;
+        let recycledOrMissing = 0;
+        for (const chunkId of chunkIds) {
+          const result = stmts.completeChunk.run(chunkId);
+          if (result.changes > 0) {
+            completedNow += 1;
+          } else {
+            // Chunk was already completed or deleted (stale recycler).
+            // Delete by ID as a fallback to prevent re-assignment.
+            stmts.deleteChunkById.run(chunkId);
+            recycledOrMissing += 1;
+          }
         }
+        const completionNote = recycledOrMissing > 0
+          ? ` (${recycledOrMissing} chunk${recycledOrMissing !== 1 ? 's' : ''} already completed or recycled)`
+          : '';
         const worker = workers.get(workerId);
         if (worker) {
-          worker.chunksCompleted++;
+          worker.chunksCompleted += completedNow;
           worker.hashRate = msg.hashRate || 0;
         }
         const remainingAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
-        console.log(`[done] ${wName(workerId)} chunk=${msg.chunkId} total_done=${worker?.chunksCompleted || '?'} remaining=${remainingAssigned} rate=${formatHashRate(msg.hashRate || 0)}${completionNote}`);
+        console.log(`[done] ${wName(workerId)} chunks=${chunkIds.length} completed_now=${completedNow} total_done=${worker?.chunksCompleted || '?'} remaining=${remainingAssigned} rate=${formatHashRate(msg.hashRate || 0)}${completionNote}`);
         // Don't push work here — let the client pull via request_work.
         // Server pushes caused assigned count to diverge from what the
         // client actually had queued (push messages piled up in network
