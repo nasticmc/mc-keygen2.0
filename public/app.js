@@ -782,7 +782,7 @@ async function runCrackingLoop() {
     clog('cracking loop started');
     topUpWorkQueue();
     clog(`sent initial work requests: inFlight=${workRequestsInFlight} queued=${queuedWorkMessages.length}`);
-    let nextWork = waitForWork(10000);
+    let nextWork = waitForWork(30000);
 
     while (cracking && ws && ws.readyState === WebSocket.OPEN) {
       const qLen = queuedWorkMessages.length;
@@ -811,7 +811,7 @@ async function runCrackingLoop() {
         if (!cracking || !ws || ws.readyState !== WebSocket.OPEN) break;
 
         const silentForMs = Date.now() - lastWsMessageAt;
-        if (response._timeout && workRequestsInFlight > 0 && queuedWorkMessages.length === 0 && (Date.now() - workRequestSentAt) > 5000) {
+        if (response._timeout && workRequestsInFlight > 0 && queuedWorkMessages.length === 0 && (Date.now() - workRequestSentAt) > 15000) {
           clog(`stuck request detected — resetting in-flight counter (silent=${silentForMs}ms)`);
           workRequestsInFlight = 0;
           workRequestSentAt = 0;
@@ -838,7 +838,7 @@ async function runCrackingLoop() {
       // Top up before processing so next batch is ready when this one finishes
       topUpWorkQueue();
       clog(`pipeline: inFlight=${workRequestsInFlight} queued=${queuedWorkMessages.length}`);
-      nextWork = waitForWork(10000);
+      nextWork = waitForWork(30000);
 
       setCrackingStatus(`Starting batch: ${chunks.length} chunk(s), ${formatNumber(totalCandidates)} candidates for packet ${packetIds.join(', ')}...`);
 

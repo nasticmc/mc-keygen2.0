@@ -156,7 +156,7 @@ function autoDecryptCandidates(packetId) {
       if (result.success) {
         stmts.updatePacketStatus.run('cracked', candidate.key, candidate.channel_name, packetId);
         if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), packetId);
-        db.prepare('UPDATE packets SET chunk_gen_offset = keyspace_end WHERE id = ?').run(packetId);
+        stmts.advancePacketCursorToEnd.run(packetId);
         stmts.deletePacketAssigned.run(packetId);
         broadcast({ type: 'key_found', packetId, key: candidate.key, channelName: candidate.channel_name, decoded: result.decoded });
         broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats() });
@@ -351,6 +351,9 @@ const stmts = {
   deletePacketAssigned: db.prepare("DELETE FROM work_chunks WHERE packet_id = ? AND status = 'assigned'"),
   countAssignedToWorker: db.prepare("SELECT COUNT(*) AS cnt FROM work_chunks WHERE status = 'assigned' AND assigned_to = ?"),
   getActivePackets: db.prepare("SELECT * FROM packets WHERE status != 'cracked' AND chunk_gen_offset IS NOT NULL AND keyspace_end IS NOT NULL"),
+  advancePacketCursor: db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?'),
+  advancePacketCursorToEnd: db.prepare('UPDATE packets SET chunk_gen_offset = keyspace_end WHERE id = ?'),
+  initPacketKeyspace: db.prepare('UPDATE packets SET chunk_gen_offset = ?, keyspace_end = ? WHERE id = ?'),
 };
 
 // ── Virtual Stats ────────────────────────────────────────────────────────────
@@ -390,7 +393,7 @@ function markPacketCracked(packetId, channelName, key, decoded) {
   stmts.updatePacketStatus.run('cracked', key, channelName, packetId);
   if (decoded) stmts.updatePacketDecrypted.run(JSON.stringify(decoded), packetId);
   // Stop virtual generation and clean up assigned chunks for this packet
-  db.prepare('UPDATE packets SET chunk_gen_offset = keyspace_end WHERE id = ?').run(packetId);
+  stmts.advancePacketCursorToEnd.run(packetId);
   stmts.deletePacketAssigned.run(packetId);
   broadcast({ type: 'key_found', packetId, key, channelName, decoded });
   broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats() });
@@ -450,7 +453,7 @@ function releaseWorkerChunks(workerId) {
   for (const { packet_id, min_start } of rows) {
     const packet = stmts.getPacketById.get(packet_id);
     if (packet && packet.chunk_gen_offset > min_start) {
-      db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(min_start, packet_id);
+      stmts.advancePacketCursor.run(min_start, packet_id);
     }
   }
 }
@@ -486,7 +489,7 @@ function recycleStaleChunks() {
   for (const [packetId, minStart] of rewindTo) {
     const packet = stmts.getPacketById.get(packetId);
     if (packet && packet.chunk_gen_offset > minStart) {
-      db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(minStart, packetId);
+      stmts.advancePacketCursor.run(minStart, packetId);
       console.log(`[stale] rewound packet ${packetId} cursor from ${packet.chunk_gen_offset} to ${minStart}`);
     }
   }
@@ -528,7 +531,7 @@ const assignVirtualChunks = db.transaction((workerId, count) => {
       offset = rangeEnd;
     }
     // Advance the packet's cursor
-    db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(offset, packet.id);
+    stmts.advancePacketCursor.run(offset, packet.id);
   }
 
   return assigned;
@@ -563,7 +566,7 @@ const assignExactChunks = db.transaction((workerId, count) => {
       });
       offset = rangeEnd;
     }
-    db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(offset, packet.id);
+    stmts.advancePacketCursor.run(offset, packet.id);
   }
 
   return assigned;
@@ -694,8 +697,7 @@ function initWorkForPacket(packetId, targetPrefix, crackConfig = {}) {
     : totalStart;
 
   const totalChunks = Math.ceil((totalEnd - genStart) / CHUNK_SIZE);
-  db.prepare('UPDATE packets SET chunk_gen_offset = ?, keyspace_end = ? WHERE id = ?')
-    .run(genStart, totalEnd, packetId);
+  stmts.initPacketKeyspace.run(genStart, totalEnd, packetId);
 
   console.log(`[chunks] packet ${packetId}: keyspace ready — ${totalChunks} virtual chunks (${genStart}→${totalEnd})`);
   return cfg;
@@ -1001,7 +1003,7 @@ wss.on('connection', (ws) => {
           for (const { packet_id, min_start } of minStarts) {
             const pkt = stmts.getPacketById.get(packet_id);
             if (pkt && pkt.chunk_gen_offset > min_start) {
-              db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(min_start, packet_id);
+              stmts.advancePacketCursor.run(min_start, packet_id);
             }
           }
           console.warn(`[work] send failed to ${wName(workerId)} — released ${chunkIds.length} chunk(s) back to pool`);
@@ -1088,10 +1090,15 @@ wss.on('connection', (ws) => {
           w.hashRate = msg.hashRate || 0;
           // Refresh assignment lease while a worker is actively reporting
           // progress so long-running chunks are not recycled mid-processing.
-          stmts.touchWorkerAssignedChunks.run(workerId);
+          // Throttled to once per 30s — WAL write transactions are cheap but
+          // still add up when the GPU fires hashrate_update every second.
+          const now = Date.now();
+          if (now - (w.lastTouchAt || 0) >= 30000) {
+            w.lastTouchAt = now;
+            stmts.touchWorkerAssignedChunks.run(workerId);
+          }
           // Throttle broadcasts to once per second per worker to avoid an
           // O(workers²) message storm when many clients are active.
-          const now = Date.now();
           if (now - w.lastWorkerUpdateAt >= 1000) {
             w.lastWorkerUpdateAt = now;
             broadcast({ type: 'worker_update', workerId, hashRate: w.hashRate });
