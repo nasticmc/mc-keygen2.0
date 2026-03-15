@@ -554,6 +554,28 @@ setInterval(() => {
 // ── Connected Workers ───────────────────────────────────────────────────────
 const workers = new Map();
 
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const HEARTBEAT_MISS_LIMIT = 4;
+
+const serverStatus = {
+  phase: 'idle',
+  detail: 'Server booted',
+  updatedAt: Date.now(),
+};
+
+function setServerStatus(phase, detail) {
+  serverStatus.phase = phase;
+  serverStatus.detail = detail;
+  serverStatus.updatedAt = Date.now();
+  console.log(`[server] ${phase}: ${detail}`);
+  broadcast({ type: 'server_status', ...serverStatus });
+}
+
+function makeWorkerId(inputId) {
+  const normalized = String(inputId || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24);
+  return normalized || crypto.randomUUID().replace(/-/g, '').slice(0, 12);
+}
+
 function broadcast(data) {
   const msg = JSON.stringify(data);
   for (const ws of wss.clients) {
@@ -579,21 +601,27 @@ setInterval(() => {
 
 // ── WebSocket Handler ───────────────────────────────────────────────────────
 // ── WebSocket Keepalive ─────────────────────────────────────────────────────
-// Heartbeat runs every 20s so proxies with 30s idle timeouts don't drop the
-// connection. A client must miss 2 consecutive pings before being terminated,
-// providing tolerance for a single transient network hiccup.
+// Heartbeat runs every 15s and allows 4 misses before termination. This keeps
+// idle proxies alive while being tolerant of transient network jitter.
 const heartbeatInterval = setInterval(() => {
   wss.clients.forEach(client => {
     if (client.isAlive === false) {
       client.missedPings = (client.missedPings || 0) + 1;
-      if (client.missedPings >= 2) { client.terminate(); return; }
+      if (client.workerId) {
+        console.warn(`[ws] missed heartbeat id=${client.workerId} miss=${client.missedPings}/${HEARTBEAT_MISS_LIMIT}`);
+      }
+      if (client.missedPings >= HEARTBEAT_MISS_LIMIT) {
+        if (client.workerId) console.warn(`[ws] terminating unresponsive worker id=${client.workerId}`);
+        client.terminate();
+        return;
+      }
     } else {
       client.missedPings = 0;
     }
     client.isAlive = false;
     client.ping();
   });
-}, 20000);
+}, HEARTBEAT_INTERVAL_MS);
 wss.on('close', () => clearInterval(heartbeatInterval));
 
 // ── Periodic Stats Broadcast ────────────────────────────────────────────────
@@ -608,14 +636,38 @@ setInterval(() => {
 }, 2000);
 
 wss.on('connection', (ws) => {
-  const workerId = crypto.randomUUID();
+  let workerId = null;
   ws.isAlive = true;
   ws.missedPings = 0;
   ws.on('pong', () => { ws.isAlive = true; ws.missedPings = 0; });
-  workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0 });
-  console.log(`[ws] worker connected  id=${workerId.substring(0, 8)} total=${workers.size}`);
-  ws.send(JSON.stringify({ type: 'worker_hello', workerId: workerId.substring(0, 8) }));
-  broadcast({ type: 'worker_count', count: workers.size });
+  setServerStatus('connection', 'Worker socket connected. Waiting for registration...');
+
+  function registerWorker(requestedId) {
+    const nextWorkerId = makeWorkerId(requestedId);
+    if (workerId && workerId === nextWorkerId) return;
+
+    const existing = workers.get(nextWorkerId);
+    if (existing && existing.ws !== ws) {
+      try { existing.ws.terminate(); } catch {}
+      workers.delete(nextWorkerId);
+      stmts.unassignWorkerChunks.run(nextWorkerId);
+    }
+
+    if (workerId && workerId !== nextWorkerId) {
+      workers.delete(workerId);
+      stmts.unassignWorkerChunks.run(workerId);
+    }
+
+    workerId = nextWorkerId;
+    ws.workerId = workerId;
+    workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0 });
+
+    console.log(`[ws] worker registered id=${workerId} total=${workers.size}`);
+    setServerStatus('worker_registered', `Worker ${workerId} is online (${workers.size} total).`);
+    ws.send(JSON.stringify({ type: 'worker_hello', workerId }));
+    ws.send(JSON.stringify({ type: 'server_status', ...serverStatus }));
+    broadcast({ type: 'worker_count', count: workers.size });
+  }
 
   ws.on('message', (raw) => {
     let msg;
@@ -624,9 +676,16 @@ wss.on('connection', (ws) => {
     const _t0 = Date.now();
     try {
     switch (msg.type) {
+      case 'worker_register': {
+        registerWorker(msg.clientId);
+        break;
+      }
+
       case 'request_work': {
+        if (!workerId) registerWorker(msg.clientId);
         const expired = stmts.expireStaleChunks.run().changes;
         if (expired > 0) console.log(`[stale] re-queued ${expired} stale chunk(s)`);
+        setServerStatus('assigning_work', `Assigning work to ${workerId}...`);
         let chunks = assignPendingChunks(workerId, msg.count || 1);
         // If the queue is empty, synchronously trigger lazy refill so workers
         // never stall waiting for the 5-second background interval to fire.
@@ -644,17 +703,22 @@ wss.on('connection', (ws) => {
           chunks,
           charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
         }));
+        setServerStatus('work_response', chunks.length > 0
+          ? `Sent ${chunks.length} chunk(s) to ${workerId}.`
+          : `No work available for ${workerId}; worker is waiting.`);
         broadcastStats();
         break;
       }
 
       case 'chunk_complete': {
+        if (!workerId) registerWorker(msg.clientId);
         stmts.completeChunk.run(msg.chunkId, workerId);
         const worker = workers.get(workerId);
         if (worker) {
           worker.chunksCompleted++;
           worker.hashRate = msg.hashRate || 0;
         }
+        setServerStatus('chunk_complete', `Chunk ${msg.chunkId} completed by ${workerId}.`);
         broadcastStats();
         broadcast({ type: 'worker_update', workerId, hashRate: msg.hashRate || 0 });
         break;
@@ -702,6 +766,7 @@ wss.on('connection', (ws) => {
       }
 
       case 'hashrate_update': {
+        if (!workerId) registerWorker(msg.clientId);
         const w = workers.get(workerId);
         if (w) w.hashRate = msg.hashRate || 0;
         broadcast({ type: 'worker_update', workerId, hashRate: msg.hashRate || 0 });
@@ -714,21 +779,24 @@ wss.on('connection', (ws) => {
         // frame was dropped by an intermediate proxy.
         ws.isAlive = true;
         ws.missedPings = 0;
+        if (!workerId && msg.clientId) registerWorker(msg.clientId);
         break;
       }
     }
     } catch (err) {
-      console.error(`[ws-error] unhandled error in ${msg.type} handler (worker=${workerId.substring(0, 8)}):`, err.message);
+      console.error(`[ws-error] unhandled error in ${msg.type} handler (worker=${workerId || 'unregistered'}):`, err.message);
     }
     const _elapsed = Date.now() - _t0;
-    if (_elapsed > 100) console.warn(`[ws-slow] ${msg.type} took ${_elapsed}ms (worker=${workerId.substring(0, 8)})`);
+    if (_elapsed > 100) console.warn(`[ws-slow] ${msg.type} took ${_elapsed}ms (worker=${workerId || 'unregistered'})`);
   });
 
   ws.on('close', () => {
+    if (!workerId) return;
     const w = workers.get(workerId);
     stmts.unassignWorkerChunks.run(workerId);
     workers.delete(workerId);
-    console.log(`[ws] worker disconnected id=${workerId.substring(0, 8)} chunks=${w?.chunksCompleted ?? 0} total=${workers.size}`);
+    console.log(`[ws] worker disconnected id=${workerId} chunks=${w?.chunksCompleted ?? 0} total=${workers.size}`);
+    setServerStatus('worker_disconnected', `Worker ${workerId} disconnected. ${workers.size} workers online.`);
     broadcast({ type: 'worker_removed', workerId });
     broadcast({ type: 'worker_count', count: workers.size });
     broadcastStats();
