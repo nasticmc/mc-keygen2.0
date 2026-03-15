@@ -219,7 +219,9 @@ function renderPackets(packets) {
       <td>${formatLocalTime(p.created_at)}</td>
       <td>
         <button class="btn-sm" onclick="deletePacket(${p.id})">Delete</button>
-        ${p.status !== 'cracked' ? `<button class="btn-sm" onclick="autoDecrypt(${p.id})">Try Decrypt</button>` : `<button class="btn-sm btn-warning" onclick="retryPacket(${p.id}, '${escapeAttr(p.channel_name || '')}')">Retry (Ignore Channel)</button>`}
+        ${p.status !== 'cracked'
+          ? `<button class="btn-sm" onclick="autoDecrypt(${p.id})">Try Decrypt</button> <button class="btn-sm" onclick="retryPacket(${p.id}, '')">Retry / Change Keyspace</button>`
+          : `<button class="btn-sm btn-warning" onclick="retryPacket(${p.id}, '${escapeAttr(p.channel_name || '')}')">Retry (Ignore Channel)</button>`}
       </td>
     `;
     tbody.appendChild(tr);
