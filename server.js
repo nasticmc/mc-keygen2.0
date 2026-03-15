@@ -608,6 +608,13 @@ function wName(id) { return id ? `${workerIdToName(id)} (${id})` : 'unregistered
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_MISS_LIMIT = 4;
 
+function formatHashRate(n) {
+  if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + ' GH/s';
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + ' MH/s';
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + ' KH/s';
+  return n + ' H/s';
+}
+
 const serverStatus = {
   phase: 'idle',
   detail: 'Server booted',
@@ -699,7 +706,13 @@ function broadcastStats() {
 setInterval(() => {
   const m = process.memoryUsage();
   const s = stmts.getQueueStats.get();
-  console.log(`[health] workers=${workers.size} pending=${s.pending} assigned=${s.assigned} completed=${s.completed} rss=${Math.round(m.rss / 1024 / 1024)}MB heap=${Math.round(m.heapUsed / 1024 / 1024)}MB`);
+  const workerDetails = [];
+  for (const [id, w] of workers) {
+    const assigned = stmts.countAssignedToWorker.get(id)?.cnt || 0;
+    workerDetails.push(`${workerIdToName(id)}:${formatHashRate(w.hashRate)}/a=${assigned}/d=${w.chunksCompleted}`);
+  }
+  console.log(`[health] workers=${workers.size} pending=${s.pending} assigned=${s.assigned} completed=${s.completed} rate=${formatHashRate(getTotalHashRate())} rss=${Math.round(m.rss / 1024 / 1024)}MB`);
+  if (workerDetails.length > 0) console.log(`[health] ${workerDetails.join(' | ')}`);
 }, 30_000);
 
 // ── WebSocket Handler ───────────────────────────────────────────────────────
@@ -794,9 +807,6 @@ wss.on('connection', (ws) => {
 
       case 'request_work': {
         if (!workerId) registerWorker(msg.clientId);
-        // Treat msg.count as "give me this many MORE chunks on top of what I
-        // already have".  Use a generous cap (256) so fast workers with deep
-        // prefetch queues never starve.
         const requestedCount = Math.max(1, parseInt(msg.count, 10) || 1);
         const alreadyAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
         const newTarget = Math.min(256, alreadyAssigned + requestedCount);
@@ -804,18 +814,16 @@ wss.on('connection', (ws) => {
         const expired = stmts.expireStaleChunks.run().changes;
         if (expired > 0) console.log(`[stale] re-queued ${expired} stale chunk(s)`);
         let chunks = assignWorkRespectingInFlight(workerId, newTarget);
-        // If the queue is empty, synchronously trigger lazy refill so workers
-        // never stall waiting for the 5-second background interval to fire.
         if (chunks.length === 0) {
           const refillable = db.prepare(
             "SELECT id FROM packets WHERE status != 'cracked' AND chunk_gen_offset IS NOT NULL"
           ).all();
           if (refillable.length > 0) {
+            console.log(`[work] ${wName(workerId)} triggered lazy refill for ${refillable.length} packet(s)`);
             for (const { id } of refillable) refillWorkChunks(id);
             chunks = assignWorkRespectingInFlight(workerId, newTarget);
           }
         }
-        // Include raw packet data so clients can attempt decryption themselves
         const packetRawData = {};
         for (const chunk of chunks) {
           if (!(chunk.packet_id in packetRawData)) {
@@ -823,6 +831,7 @@ wss.on('connection', (ws) => {
             if (pkt) packetRawData[chunk.packet_id] = pkt.raw_data;
           }
         }
+        console.log(`[work] ${wName(workerId)} requested=${requestedCount} assigned=${alreadyAssigned} target=${newTarget} → sending ${chunks.length} chunk(s)`);
         ws.send(JSON.stringify({
           type: 'work',
           chunks,
@@ -835,12 +844,14 @@ wss.on('connection', (ws) => {
 
       case 'chunk_complete': {
         if (!workerId) registerWorker(msg.clientId);
-        stmts.completeChunk.run(msg.chunkId, workerId);
+        const result = stmts.completeChunk.run(msg.chunkId, workerId);
         const worker = workers.get(workerId);
         if (worker) {
           worker.chunksCompleted++;
           worker.hashRate = msg.hashRate || 0;
         }
+        const remainingAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
+        console.log(`[done] ${wName(workerId)} chunk=${msg.chunkId} total_done=${worker?.chunksCompleted || '?'} remaining=${remainingAssigned} rate=${formatHashRate(msg.hashRate || 0)}${result.changes === 0 ? ' (WARNING: chunk not found or not assigned to this worker)' : ''}`);
         maybePushWork(workerId, 'chunk_complete');
         broadcastStats();
         broadcast({ type: 'worker_update', workerId, hashRate: msg.hashRate || 0 });

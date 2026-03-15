@@ -22,6 +22,12 @@ function workerIdToName(id) {
   return `${emotion} ${animal}`;
 }
 
+// ── Client Console Logger ───────────────────────────────────────────────────
+function clog(msg) {
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  console.log(`[mc ${ts}] ${msg}`);
+}
+
 let ws = null;
 let cracker = null;
 let cracking = false;
@@ -59,8 +65,7 @@ function connectWebSocket() {
   ws = new WebSocket(`${protocol}//${location.host}`);
 
   ws.onopen = () => {
-    // Resolve any stale waitForWork promises immediately so the loop wakes up
-    // rather than waiting up to 30s for the old timeout to fire.
+    clog(`websocket connected (stale resolvers: ${pendingWorkResolvers.length}, queued: ${queuedWorkMessages.length})`);
     workRequestsInFlight = 0;
     workRequestSentAt = 0;
     const staleResolvers = pendingWorkResolvers.splice(0);
@@ -72,10 +77,14 @@ function connectWebSocket() {
     document.getElementById('connection-status').className = 'connected';
     setCrackingStatus('Connected to server. Registering worker identity...');
     ws.send(JSON.stringify({ type: 'worker_register', clientId: getClientId() }));
-    if (cracking && !loopRunning) runCrackingLoop();
+    if (cracking && !loopRunning) {
+      clog('restarting cracking loop after reconnect');
+      runCrackingLoop();
+    }
   };
 
   ws.onclose = () => {
+    clog('websocket disconnected');
     document.getElementById('connection-status').textContent = 'Disconnected';
     document.getElementById('connection-status').className = 'disconnected';
     document.getElementById('worker-id').textContent = '';
@@ -150,6 +159,7 @@ function connectWebSocket() {
         } else {
           queuedWorkMessages.push(msg);
         }
+        clog(`work received: ${msg.chunks?.length || 0} chunk(s) — queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight} waiting=${pendingWorkResolvers.length}`);
         break;
     }
   };
@@ -180,7 +190,11 @@ function getMinAhead() {
 // in-flight at all times.  Called on loop start and after each batch finishes.
 function topUpWorkQueue() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const need = getMinAhead() - (queuedWorkMessages.length + workRequestsInFlight);
+  const minAhead = getMinAhead();
+  const need = minAhead - (queuedWorkMessages.length + workRequestsInFlight);
+  if (need > 0) {
+    clog(`topUp: requesting ${need} batch(es) (minAhead=${minAhead} queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight})`);
+  }
   for (let i = 0; i < need; i++) {
     if (workRequestsInFlight === 0) workRequestSentAt = Date.now();
     workRequestsInFlight++;
@@ -735,34 +749,44 @@ document.getElementById('btn-stop-cracking').addEventListener('click', () => {
 async function runCrackingLoop() {
   if (loopRunning) return;
   loopRunning = true;
+  let batchesCompleted = 0;
 
   try {
-    // If the socket isn't open yet, exit cleanly — ws.onopen will restart us
-    // once the connection is established.  This prevents ws.send() throwing a
-    // DOMException (INVALID_STATE_ERR) outside the try/finally, which would
-    // permanently strand loopRunning === true and kill the cracking loop.
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      clog('loop exiting — socket not open, will restart on reconnect');
+      return;
+    }
 
-    // Fill the lookahead queue before entering the loop so the GPU never idles
-    // waiting on the first round-trip to the server.
+    clog('cracking loop started');
     topUpWorkQueue();
+    clog(`sent initial work requests: inFlight=${workRequestsInFlight} queued=${queuedWorkMessages.length}`);
     let nextWork = waitForWork(10000);
 
     while (cracking && ws && ws.readyState === WebSocket.OPEN) {
-      setCrackingStatus('Waiting for work from server...');
+      const qLen = queuedWorkMessages.length;
+      if (qLen > 0) {
+        setCrackingStatus(`${qLen} batch${qLen !== 1 ? 'es' : ''} queued. Loading next...`);
+      } else {
+        setCrackingStatus(`Waiting for work (${workRequestsInFlight} request${workRequestsInFlight !== 1 ? 's' : ''} in-flight)...`);
+      }
+
+      const t0 = performance.now();
       const response = await nextWork;
+      const waitMs = Math.round(performance.now() - t0);
       const chunks = response.chunks;
       const packetRawData = response.packetRawData || {};
       if (response.charset) currentCharset = response.charset;
 
       if (chunks.length === 0) {
-        if (!response._reconnected) {
-          setCrackingStatus('No work available. Requesting more work...');
+        if (response._reconnected) {
+          clog('woke from reconnect — re-requesting work');
+        } else {
+          clog(`empty response after ${waitMs}ms (inFlight=${workRequestsInFlight} queued=${queuedWorkMessages.length})`);
+          setCrackingStatus(`No work available — retrying (waited ${waitMs}ms)...`);
         }
         if (!cracking || !ws || ws.readyState !== WebSocket.OPEN) break;
-        // If all in-flight requests have been stuck for >10s with nothing queued,
-        // assume they were dropped and reset the counter so topUpWorkQueue will retry.
         if (workRequestsInFlight > 0 && queuedWorkMessages.length === 0 && (Date.now() - workRequestSentAt) > 10000) {
+          clog('stuck request detected — resetting in-flight counter');
           workRequestsInFlight = 0;
           workRequestSentAt = 0;
         }
@@ -771,36 +795,54 @@ async function runCrackingLoop() {
         continue;
       }
 
-      // Top up the lookahead queue while we process this batch so the GPU
-      // never idles waiting on a round-trip to the server.
+      const totalCandidates = chunks.reduce((sum, c) => sum + (c.range_end - c.range_start), 0);
+      const packetIds = [...new Set(chunks.map(c => c.packet_id))];
+      clog(`received ${chunks.length} chunk(s) for packet [${packetIds}] — ${formatNumber(totalCandidates)} candidates (wait=${waitMs}ms)`);
+
+      // Top up before processing so next batch is ready when this one finishes
       topUpWorkQueue();
+      clog(`pipeline: inFlight=${workRequestsInFlight} queued=${queuedWorkMessages.length}`);
       nextWork = waitForWork(30000);
 
-      const packetIds = [...new Set(chunks.map(c => c.packet_id))];
-      setCrackingStatus(`Processing ${chunks.length} chunk(s) for packet ${packetIds.join(', ')}...`);
+      setCrackingStatus(`Starting batch: ${chunks.length} chunk(s), ${formatNumber(totalCandidates)} candidates for packet ${packetIds.join(', ')}...`);
 
-      // Show chunk count label and reset local progress bar before processing starts.
       document.getElementById('local-chunk-label').textContent =
         `${chunks.length} chunk${chunks.length !== 1 ? 's' : ''}`;
       setLocalProgress(0, 1);
 
+      const batchStart = performance.now();
+      let lastProgressLog = 0;
       await cracker.processChunks(chunks, ws, (hashRate, processed, total) => {
         lastMeasuredHashRate = hashRate;
         document.getElementById('stat-hashrate').textContent = formatHashRate(hashRate);
-        setCrackingStatus(`Crunching ${chunks.length} chunk(s) at ${formatHashRate(hashRate)}.`);
+        const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
+        const elapsed = (performance.now() - batchStart) / 1000;
+        const remaining = hashRate > 0 ? (total - processed) / hashRate : 0;
+        setCrackingStatus(
+          `Crunching: ${pct}% (${formatNumber(processed)}/${formatNumber(total)}) at ${formatHashRate(hashRate)}` +
+          (remaining > 0 ? ` — ${formatETA(remaining)} left` : '') +
+          ` [batch ${batchesCompleted + 1}, queued: ${queuedWorkMessages.length}]`
+        );
         setLocalProgress(processed, total);
+        // Log progress every ~10 seconds
+        if (elapsed - lastProgressLog >= 10) {
+          lastProgressLog = elapsed;
+          clog(`progress: ${pct}% (${formatNumber(processed)}/${formatNumber(total)}) at ${formatHashRate(hashRate)} elapsed=${Math.round(elapsed)}s`);
+        }
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'hashrate_update', hashRate, clientId: getClientId() }));
         }
       }, currentCharset, packetRawData);
 
-      // Fill bar to 100% once the batch finishes.
+      const batchMs = Math.round(performance.now() - batchStart);
+      batchesCompleted++;
       setLocalProgress(1, 1);
+      clog(`batch ${batchesCompleted} done: ${chunks.length} chunk(s), ${formatNumber(totalCandidates)} candidates in ${batchMs}ms`);
+      setCrackingStatus(`Batch ${batchesCompleted} complete (${formatNumber(totalCandidates)} candidates in ${(batchMs / 1000).toFixed(1)}s). Loading next...`);
     }
   } finally {
     loopRunning = false;
-    // If the loop crashed (e.g. ws.send on a closed socket) but the connection
-    // has since recovered, restart immediately rather than going dark.
+    clog(`cracking loop exited — batches=${batchesCompleted} cracking=${cracking} socket=${ws?.readyState}`);
     if (cracking && ws && ws.readyState === WebSocket.OPEN) {
       setTimeout(runCrackingLoop, 0);
       return;
