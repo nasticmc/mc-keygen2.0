@@ -343,6 +343,11 @@ const stmts = {
     DELETE FROM work_chunks
     WHERE status = 'assigned' AND assigned_to = ?
   `),
+  touchWorkerAssignedChunks: db.prepare(`
+    UPDATE work_chunks
+    SET assigned_at = CURRENT_TIMESTAMP
+    WHERE status = 'assigned' AND assigned_to = ?
+  `),
   deletePacketAssigned: db.prepare("DELETE FROM work_chunks WHERE packet_id = ? AND status = 'assigned'"),
   countAssignedToWorker: db.prepare("SELECT COUNT(*) AS cnt FROM work_chunks WHERE status = 'assigned' AND assigned_to = ?"),
   getActivePackets: db.prepare("SELECT * FROM packets WHERE status != 'cracked' AND chunk_gen_offset IS NOT NULL AND keyspace_end IS NOT NULL"),
@@ -725,6 +730,9 @@ function wName(id) { return id ? `${workerIdToName(id)} (${id})` : 'unregistered
 
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_MISS_LIMIT = 4;
+const HEARTBEAT_ACTIVITY_GRACE_MS = 120_000;
+const WS_MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
+const WS_BACKPRESSURE_TERMINATE_MS = 45_000;
 
 function formatHashRate(n) {
   if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + ' GH/s';
@@ -768,32 +776,53 @@ function maybePushWork(workerId, reason = 'scheduler') {
   const chunks = assignVirtualChunks(workerId, desired);
 
   if (chunks.length > 0) {
-    // Include raw packet data so clients can attempt decryption themselves
+    // Include raw packet data only once per packet per worker to avoid
+    // repeatedly sending large payloads over constrained websocket tunnels.
     const packetRawData = {};
+    const sentPacketRaw = worker.sentPacketRaw || new Set();
+    worker.sentPacketRaw = sentPacketRaw;
     for (const chunk of chunks) {
-      if (!(chunk.packet_id in packetRawData)) {
-        const pkt = stmts.getPacketById.get(chunk.packet_id);
-        if (pkt) packetRawData[chunk.packet_id] = pkt.raw_data;
-      }
+      if (sentPacketRaw.has(chunk.packet_id) || (chunk.packet_id in packetRawData)) continue;
+      const pkt = stmts.getPacketById.get(chunk.packet_id);
+      if (!pkt) continue;
+      packetRawData[chunk.packet_id] = pkt.raw_data;
+      sentPacketRaw.add(chunk.packet_id);
     }
-    worker.ws.send(JSON.stringify({
+    safeSend(worker.ws, {
       type: 'work',
       chunks,
       charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
       packetRawData,
-    }));
-    console.log(`[sched] pushed ${chunks.length} chunk(s) to ${wName(workerId)} (${reason})`);
+    }, 'work_push');
+    console.log(`[sched] pushed ${chunks.length} chunk(s) to ${wName(workerId)} (${reason}, raw_packets=${Object.keys(packetRawData).length})`);
     broadcastStats();
   }
 
   return chunks.length;
 }
 
-function broadcast(data) {
-  const msg = JSON.stringify(data);
-  for (const ws of wss.clients) {
-    if (ws.readyState === 1) ws.send(msg);
+function safeSend(ws, data, label = 'msg') {
+  if (!ws || ws.readyState !== 1) return false;
+
+  if (ws.bufferedAmount > WS_MAX_BUFFERED_BYTES) {
+    ws.backpressureSince = ws.backpressureSince || Date.now();
+    const bufferedMb = (ws.bufferedAmount / 1024 / 1024).toFixed(1);
+    if (ws.workerId) console.warn(`[ws] backpressure ${bufferedMb}MB while sending ${label} to ${wName(ws.workerId)}`);
+    return false;
   }
+
+  ws.backpressureSince = 0;
+  try {
+    ws.send(typeof data === 'string' ? data : JSON.stringify(data));
+    return true;
+  } catch (err) {
+    if (ws.workerId) console.warn(`[ws] send failed ${label} to ${wName(ws.workerId)}: ${err.message}`);
+    return false;
+  }
+}
+
+function broadcast(data) {
+  for (const ws of wss.clients) safeSend(ws, data, data?.type || 'broadcast');
 }
 
 // Throttled stats broadcast — avoids hammering COUNT(*) queries on every event
@@ -824,19 +853,40 @@ setInterval(() => {
 // idle proxies alive while being tolerant of transient network jitter.
 const heartbeatInterval = setInterval(() => {
   wss.clients.forEach(client => {
+    const lastSeenAt = client.lastSeenAt || 0;
+    const recentlyActive = (Date.now() - lastSeenAt) < HEARTBEAT_ACTIVITY_GRACE_MS;
+
     if (client.isAlive === false) {
-      client.missedPings = (client.missedPings || 0) + 1;
-      if (client.workerId) {
-        console.warn(`[ws] missed heartbeat ${wName(client.workerId)} miss=${client.missedPings}/${HEARTBEAT_MISS_LIMIT}`);
-      }
-      if (client.missedPings >= HEARTBEAT_MISS_LIMIT) {
-        if (client.workerId) console.warn(`[ws] terminating unresponsive worker ${wName(client.workerId)}`);
-        client.terminate();
-        return;
+      // Some websocket tunnels/proxies can drop ping/pong frames even while
+      // app-level traffic is still flowing. If we've seen recent activity,
+      // avoid counting this tick as a missed heartbeat.
+      if (recentlyActive) {
+        if (client.workerId) {
+          console.warn(`[ws] missed heartbeat frame but recent activity from ${wName(client.workerId)}; keeping connection alive`);
+        }
+      } else {
+        client.missedPings = (client.missedPings || 0) + 1;
+        if (client.workerId) {
+          console.warn(`[ws] missed heartbeat ${wName(client.workerId)} miss=${client.missedPings}/${HEARTBEAT_MISS_LIMIT}`);
+        }
+        if (client.missedPings >= HEARTBEAT_MISS_LIMIT) {
+          if (client.workerId) console.warn(`[ws] terminating unresponsive worker ${wName(client.workerId)}`);
+          client.terminate();
+          return;
+        }
       }
     } else {
       client.missedPings = 0;
     }
+    const backpressureAge = client.backpressureSince ? (Date.now() - client.backpressureSince) : 0;
+    if (backpressureAge > WS_BACKPRESSURE_TERMINATE_MS) {
+      if (client.workerId) {
+        console.warn(`[ws] terminating backpressured connection ${wName(client.workerId)} buffered=${Math.round(client.bufferedAmount / 1024 / 1024)}MB age=${Math.round(backpressureAge / 1000)}s`);
+      }
+      client.terminate();
+      return;
+    }
+
     client.isAlive = false;
     client.ping();
   });
@@ -846,6 +896,7 @@ wss.on('close', () => clearInterval(heartbeatInterval));
 function markConnectionAlive(ws) {
   ws.isAlive = true;
   ws.missedPings = 0;
+  ws.lastSeenAt = Date.now();
 }
 
 // ── Periodic Stats Broadcast ────────────────────────────────────────────────
@@ -883,12 +934,12 @@ wss.on('connection', (ws) => {
 
     workerId = nextWorkerId;
     ws.workerId = workerId;
-    workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0, desiredInFlight: 1, lastWorkerUpdateAt: 0 });
+    workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0, desiredInFlight: 1, lastWorkerUpdateAt: 0, sentPacketRaw: new Set() });
 
     console.log(`[ws] worker registered ${wName(workerId)} total=${workers.size}`);
     setServerStatus('worker_registered', `Worker ${workerIdToName(workerId)} is online (${workers.size} total).`);
-    ws.send(JSON.stringify({ type: 'worker_hello', workerId }));
-    ws.send(JSON.stringify({ type: 'server_status', ...serverStatus }));
+    safeSend(ws, { type: 'worker_hello', workerId }, 'worker_hello');
+    safeSend(ws, { type: 'server_status', ...serverStatus }, 'server_status');
     broadcast({ type: 'worker_count', count: workers.size });
   }
 
@@ -913,27 +964,31 @@ wss.on('connection', (ws) => {
         const requestedCount = Math.max(1, Math.min(64, parseInt(msg.count, 10) || 1));
         const expired = recycleStaleChunks();
         if (expired > 0) console.log(`[stale] recycled ${expired} stale chunk(s) back to virtual pool`);
-        // Assign exactly what the client asked for — client manages its own
-        // pipeline depth via topUpWorkQueue / minAhead.  Don't factor in
-        // alreadyAssigned; that count can drift from reality and cause
-        // under-assignment.
+        // Treat each request as additive demand from the client's local
+        // prefetch pipeline (topUpWorkQueue/minAhead). This keeps queued
+        // batches available client-side instead of starving on deficit math.
         const chunks = assignExactChunks(workerId, requestedCount);
         const packetRawData = {};
+        const worker = workers.get(workerId);
+        const sentPacketRaw = worker?.sentPacketRaw || new Set();
+        if (worker) worker.sentPacketRaw = sentPacketRaw;
         for (const chunk of chunks) {
-          if (!(chunk.packet_id in packetRawData)) {
-            const pkt = stmts.getPacketById.get(chunk.packet_id);
-            if (pkt) packetRawData[chunk.packet_id] = pkt.raw_data;
-          }
+          if (sentPacketRaw.has(chunk.packet_id) || (chunk.packet_id in packetRawData)) continue;
+          const pkt = stmts.getPacketById.get(chunk.packet_id);
+          if (!pkt) continue;
+          packetRawData[chunk.packet_id] = pkt.raw_data;
+          sentPacketRaw.add(chunk.packet_id);
         }
         const dbAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
-        console.log(`[work] ${wName(workerId)} requested=${requestedCount} → sending ${chunks.length} chunk(s) (db_assigned=${dbAssigned})`);
-        ws.send(JSON.stringify({
+        const rawPacketCount = Object.keys(packetRawData).length;
+        console.log(`[work] ${wName(workerId)} requested=${requestedCount} → sending ${chunks.length} chunk(s) (db_assigned=${dbAssigned}, raw_packets=${rawPacketCount})`);
+        safeSend(ws, {
           type: 'work',
           solicited: true,
           chunks,
           charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
           packetRawData,
-        }));
+        }, 'work_reply');
         broadcastStats();
         break;
       }
@@ -1014,6 +1069,9 @@ wss.on('connection', (ws) => {
         const w = workers.get(workerId);
         if (w) {
           w.hashRate = msg.hashRate || 0;
+          // Refresh assignment lease while a worker is actively reporting
+          // progress so long-running chunks are not recycled mid-processing.
+          stmts.touchWorkerAssignedChunks.run(workerId);
           // Throttle broadcasts to once per second per worker to avoid an
           // O(workers²) message storm when many clients are active.
           const now = Date.now();
@@ -1031,6 +1089,7 @@ wss.on('connection', (ws) => {
         // frame was dropped by an intermediate proxy.
         markConnectionAlive(ws);
         if (!workerId && msg.clientId) registerWorker(msg.clientId);
+        if (workerId) stmts.touchWorkerAssignedChunks.run(workerId);
         break;
       }
     }

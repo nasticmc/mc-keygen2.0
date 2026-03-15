@@ -383,11 +383,13 @@ class GPUCracker {
     let _rateWindowStart = performance.now();
     let _rateWindowCount = 0;
 
-    // Size each dispatch to the maximum the GPU supports.
-    // workgroup_size(256), so max candidates = maxDispatch * 256.
-    // Default limit is 65535 workgroups = ~16.7M candidates.
+    // Size each dispatch conservatively to avoid very long-running kernels
+    // that can make the page appear hung and delay websocket traffic on some
+    // desktop drivers/tunnel setups.
+    // workgroup_size(256), so candidates = dispatchWorkgroups * 256.
     const maxDispatch = this._maxDispatch || 65535;
-    const batchSize = maxDispatch * 256;
+    const maxKernelCandidates = 2_097_152; // 2M candidates per GPU submit
+    const batchSize = Math.max(256, Math.min(maxDispatch * 256, maxKernelCandidates));
 
     // Flatten all work into a single batch list so the ping-pong pipeline can
     // span chunk boundaries without extra complexity.
@@ -403,6 +405,10 @@ class GPUCracker {
         });
       }
     }
+
+    try {
+      console.debug(`[gpu] processing ${chunks.length} chunk(s) as ${batches.length} GPU batch(es), batchSize=${batchSize}`);
+    } catch (_) {}
 
     const sendMatches = async (matches, chunk) => {
       if (matches.length === 0) return;
