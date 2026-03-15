@@ -731,6 +731,8 @@ function wName(id) { return id ? `${workerIdToName(id)} (${id})` : 'unregistered
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_MISS_LIMIT = 4;
 const HEARTBEAT_ACTIVITY_GRACE_MS = 120_000;
+const WS_MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
+const WS_BACKPRESSURE_TERMINATE_MS = 45_000;
 
 function formatHashRate(n) {
   if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + ' GH/s';
@@ -786,12 +788,12 @@ function maybePushWork(workerId, reason = 'scheduler') {
       packetRawData[chunk.packet_id] = pkt.raw_data;
       sentPacketRaw.add(chunk.packet_id);
     }
-    worker.ws.send(JSON.stringify({
+    safeSend(worker.ws, {
       type: 'work',
       chunks,
       charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
       packetRawData,
-    }));
+    }, 'work_push');
     console.log(`[sched] pushed ${chunks.length} chunk(s) to ${wName(workerId)} (${reason}, raw_packets=${Object.keys(packetRawData).length})`);
     broadcastStats();
   }
@@ -799,11 +801,28 @@ function maybePushWork(workerId, reason = 'scheduler') {
   return chunks.length;
 }
 
-function broadcast(data) {
-  const msg = JSON.stringify(data);
-  for (const ws of wss.clients) {
-    if (ws.readyState === 1) ws.send(msg);
+function safeSend(ws, data, label = 'msg') {
+  if (!ws || ws.readyState !== 1) return false;
+
+  if (ws.bufferedAmount > WS_MAX_BUFFERED_BYTES) {
+    ws.backpressureSince = ws.backpressureSince || Date.now();
+    const bufferedMb = (ws.bufferedAmount / 1024 / 1024).toFixed(1);
+    if (ws.workerId) console.warn(`[ws] backpressure ${bufferedMb}MB while sending ${label} to ${wName(ws.workerId)}`);
+    return false;
   }
+
+  ws.backpressureSince = 0;
+  try {
+    ws.send(typeof data === 'string' ? data : JSON.stringify(data));
+    return true;
+  } catch (err) {
+    if (ws.workerId) console.warn(`[ws] send failed ${label} to ${wName(ws.workerId)}: ${err.message}`);
+    return false;
+  }
+}
+
+function broadcast(data) {
+  for (const ws of wss.clients) safeSend(ws, data, data?.type || 'broadcast');
 }
 
 // Throttled stats broadcast — avoids hammering COUNT(*) queries on every event
@@ -859,6 +878,15 @@ const heartbeatInterval = setInterval(() => {
     } else {
       client.missedPings = 0;
     }
+    const backpressureAge = client.backpressureSince ? (Date.now() - client.backpressureSince) : 0;
+    if (backpressureAge > WS_BACKPRESSURE_TERMINATE_MS) {
+      if (client.workerId) {
+        console.warn(`[ws] terminating backpressured connection ${wName(client.workerId)} buffered=${Math.round(client.bufferedAmount / 1024 / 1024)}MB age=${Math.round(backpressureAge / 1000)}s`);
+      }
+      client.terminate();
+      return;
+    }
+
     client.isAlive = false;
     client.ping();
   });
@@ -910,8 +938,8 @@ wss.on('connection', (ws) => {
 
     console.log(`[ws] worker registered ${wName(workerId)} total=${workers.size}`);
     setServerStatus('worker_registered', `Worker ${workerIdToName(workerId)} is online (${workers.size} total).`);
-    ws.send(JSON.stringify({ type: 'worker_hello', workerId }));
-    ws.send(JSON.stringify({ type: 'server_status', ...serverStatus }));
+    safeSend(ws, { type: 'worker_hello', workerId }, 'worker_hello');
+    safeSend(ws, { type: 'server_status', ...serverStatus }, 'server_status');
     broadcast({ type: 'worker_count', count: workers.size });
   }
 
@@ -954,13 +982,13 @@ wss.on('connection', (ws) => {
         const dbAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
         const rawPacketCount = Object.keys(packetRawData).length;
         console.log(`[work] ${wName(workerId)} requested=${requestedCount} → sending ${chunks.length} chunk(s) (db_assigned=${dbAssigned}, raw_packets=${rawPacketCount})`);
-        ws.send(JSON.stringify({
+        safeSend(ws, {
           type: 'work',
           solicited: true,
           chunks,
           charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
           packetRawData,
-        }));
+        }, 'work_reply');
         broadcastStats();
         break;
       }
