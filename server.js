@@ -463,7 +463,7 @@ function decodeAsync(hexData, channelKey, cb) {
 for (let i = 0; i < DECODER_POOL_SIZE; i++) _decoderPool.push(_spawnDecoderWorker());
 
 // ── Work Chunk Generation ───────────────────────────────────────────────────
-const CHUNK_SIZE = 4_000_000;
+const CHUNK_SIZE = 16_000_000;
 const INITIAL_CHUNK_BATCH = 5000; // max chunks inserted upfront; rest generated lazily
 const REFILL_LOW_WATER    = 1000; // refill a packet when its pending queue drops below this
 const REFILL_BATCH        = 5000; // chunks added per refill cycle
