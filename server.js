@@ -343,6 +343,11 @@ const stmts = {
     DELETE FROM work_chunks
     WHERE status = 'assigned' AND assigned_to = ?
   `),
+  touchWorkerAssignedChunks: db.prepare(`
+    UPDATE work_chunks
+    SET assigned_at = CURRENT_TIMESTAMP
+    WHERE status = 'assigned' AND assigned_to = ?
+  `),
   deletePacketAssigned: db.prepare("DELETE FROM work_chunks WHERE packet_id = ? AND status = 'assigned'"),
   countAssignedToWorker: db.prepare("SELECT COUNT(*) AS cnt FROM work_chunks WHERE status = 'assigned' AND assigned_to = ?"),
   getActivePackets: db.prepare("SELECT * FROM packets WHERE status != 'cracked' AND chunk_gen_offset IS NOT NULL AND keyspace_end IS NOT NULL"),
@@ -1014,6 +1019,9 @@ wss.on('connection', (ws) => {
         const w = workers.get(workerId);
         if (w) {
           w.hashRate = msg.hashRate || 0;
+          // Refresh assignment lease while a worker is actively reporting
+          // progress so long-running chunks are not recycled mid-processing.
+          stmts.touchWorkerAssignedChunks.run(workerId);
           // Throttle broadcasts to once per second per worker to avoid an
           // O(workers²) message storm when many clients are active.
           const now = Date.now();
