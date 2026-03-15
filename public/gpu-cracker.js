@@ -400,32 +400,64 @@ class GPUCracker {
       console.debug(`[gpu] processing ${chunks.length} chunk(s) as ${batches.length} GPU batch(es), batchSize=${batchSize}`);
     } catch (_) {}
 
+    // Pre-check packet type once per chunk to decide if client decrypt is worth trying.
+    // parseMeshCorePacket is synchronous so this costs nothing.
+    const _packetTypeCache = {};
+    const isGroupTextPacket = (packetId) => {
+      if (_packetTypeCache[packetId] !== undefined) return _packetTypeCache[packetId];
+      const rawData = packetRawData[packetId];
+      if (!rawData || typeof parseMeshCorePacket !== 'function') {
+        return (_packetTypeCache[packetId] = false);
+      }
+      const parsed = parseMeshCorePacket(rawData);
+      return (_packetTypeCache[packetId] = (parsed !== null && parsed.payloadType === 5 /* GROUP_TEXT */));
+    };
+
     const sendMatches = async (matches, chunk) => {
       if (matches.length === 0) return;
-      const batchMatches = [];
-      for (const m of matches) {
+
+      // Cap candidates sent per dispatch — the GPU result buffer holds 8192 slots
+      // but the 1-byte prefix check yields ~65K false positives per dispatch, so
+      // the buffer always overflows.  The server can only verify a finite set; cap
+      // here so we don't flood the WebSocket with hundreds of KB per dispatch.
+      const MAX_MATCHES_PER_DISPATCH = 256;
+      const capped = matches.length > MAX_MATCHES_PER_DISPATCH
+        ? matches.slice(0, MAX_MATCHES_PER_DISPATCH)
+        : matches;
+
+      const prefixHex = chunk.target_prefix.toString(16).padStart(2, '0');
+      const rawData = packetRawData[chunk.packet_id];
+      const canClientDecrypt = rawData
+        && typeof clientTryDecrypt === 'function'
+        && isGroupTextPacket(chunk.packet_id);
+
+      // Build base entries synchronously (no awaits in the loop)
+      const entries = [];
+      for (const m of capped) {
         const channelName = this.indexToChannelName(m.index, charset);
         if (!channelName) continue;
         const keyHex = [m.key0, m.key1, m.key2, m.key3]
           .map(w => w.toString(16).padStart(8, '0')).join('');
-        const entry = {
-          channelName,
-          keyHex,
-          prefixHex: chunk.target_prefix.toString(16).padStart(2, '0'),
-        };
-        // Attempt client-side decryption to skip a server round-trip
-        const rawData = packetRawData[chunk.packet_id];
-        if (rawData && typeof clientTryDecrypt === 'function') {
-          const decoded = await clientTryDecrypt(rawData, keyHex);
-          if (decoded) entry.clientDecoded = decoded;
+        entries.push({ channelName, keyHex, prefixHex });
+      }
+
+      if (entries.length === 0) return;
+
+      // For GroupText packets attempt client-side decrypt in parallel (not serially)
+      // so the event loop is only blocked for a single microtask batch per dispatch
+      // rather than 256+ sequential awaits.
+      if (canClientDecrypt) {
+        const decodeResults = await Promise.all(
+          entries.map(e => clientTryDecrypt(rawData, e.keyHex).catch(() => null))
+        );
+        for (let i = 0; i < entries.length; i++) {
+          if (decodeResults[i]) entries[i].clientDecoded = decodeResults[i];
         }
-        batchMatches.push(entry);
       }
-      if (batchMatches.length > 0) {
-        try {
-          ws.send(JSON.stringify({ type: 'prefix_match_batch', packetId: chunk.packet_id, matches: batchMatches }));
-        } catch (_) { /* ws closed mid-batch; loop will detect on next iteration */ }
-      }
+
+      try {
+        ws.send(JSON.stringify({ type: 'prefix_match_batch', packetId: chunk.packet_id, matches: entries }));
+      } catch (_) { /* ws closed mid-batch; loop will detect on next iteration */ }
     };
 
     let _lastProgressTime = 0;
