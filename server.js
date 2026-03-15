@@ -450,13 +450,21 @@ setInterval(() => {
 
 // ── WebSocket Handler ───────────────────────────────────────────────────────
 // ── WebSocket Keepalive ─────────────────────────────────────────────────────
+// Heartbeat runs every 20s so proxies with 30s idle timeouts don't drop the
+// connection. A client must miss 2 consecutive pings before being terminated,
+// providing tolerance for a single transient network hiccup.
 const heartbeatInterval = setInterval(() => {
   wss.clients.forEach(client => {
-    if (client.isAlive === false) { client.terminate(); return; }
+    if (client.isAlive === false) {
+      client.missedPings = (client.missedPings || 0) + 1;
+      if (client.missedPings >= 2) { client.terminate(); return; }
+    } else {
+      client.missedPings = 0;
+    }
     client.isAlive = false;
     client.ping();
   });
-}, 30000);
+}, 20000);
 wss.on('close', () => clearInterval(heartbeatInterval));
 
 // ── Periodic Stats Broadcast ────────────────────────────────────────────────
@@ -473,7 +481,8 @@ setInterval(() => {
 wss.on('connection', (ws) => {
   const workerId = crypto.randomUUID();
   ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
+  ws.missedPings = 0;
+  ws.on('pong', () => { ws.isAlive = true; ws.missedPings = 0; });
   workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0 });
   console.log(`[ws] worker connected  id=${workerId.substring(0, 8)} total=${workers.size}`);
   broadcast({ type: 'worker_count', count: workers.size });
@@ -609,6 +618,15 @@ wss.on('connection', (ws) => {
         const w = workers.get(workerId);
         if (w) w.hashRate = msg.hashRate || 0;
         broadcast({ type: 'worker_update', workerId, hashRate: msg.hashRate || 0 });
+        break;
+      }
+
+      case 'keepalive': {
+        // Application-level ping from client — keep the connection marked alive
+        // so the heartbeat doesn't terminate it even if a WebSocket ping/pong
+        // frame was dropped by an intermediate proxy.
+        ws.isAlive = true;
+        ws.missedPings = 0;
         break;
       }
     }

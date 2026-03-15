@@ -4,6 +4,7 @@ let ws = null;
 let cracker = null;
 let cracking = false;
 let loopRunning = false;
+let workRequestPending = false;
 let currentCharset = 'abcdefghijklmnopqrstuvwxyz';
 let serverChunkSize = 500000;
 const pendingWorkResolvers = [];
@@ -35,6 +36,7 @@ function connectWebSocket() {
   ws.onopen = () => {
     // Resolve any stale waitForWork promises immediately so the loop wakes up
     // rather than waiting up to 30s for the old timeout to fire.
+    workRequestPending = false;
     const staleResolvers = pendingWorkResolvers.splice(0);
     queuedWorkMessages.length = 0;
     for (const resolve of staleResolvers) {
@@ -48,8 +50,18 @@ function connectWebSocket() {
   ws.onclose = () => {
     document.getElementById('connection-status').textContent = 'Disconnected';
     document.getElementById('connection-status').className = 'disconnected';
+    workRequestPending = false;
+    clearInterval(ws._keepAliveTimer);
     setTimeout(connectWebSocket, 2000);
   };
+
+  // Application-level keep-alive: send a lightweight ping every 15s so that
+  // intermediate proxies/load-balancers don't close the idle connection.
+  ws._keepAliveTimer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'keepalive' }));
+    }
+  }, 15000);
 
   ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
@@ -86,6 +98,7 @@ function connectWebSocket() {
         refreshWorkerDisplay();
         break;
       case 'work':
+        workRequestPending = false;
         if (pendingWorkResolvers.length > 0) {
           const resolve = pendingWorkResolvers.shift();
           resolve(msg);
@@ -627,8 +640,9 @@ async function runCrackingLoop() {
 
   // Kick off the first work request before entering the loop so there's no
   // idle time between starting and actually receiving work.
+  workRequestPending = true;
   ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
-  let nextWork = waitForWork(8000);
+  let nextWork = waitForWork(25000);
 
   try {
     while (cracking && ws && ws.readyState === WebSocket.OPEN) {
@@ -643,15 +657,25 @@ async function runCrackingLoop() {
           await new Promise(r => setTimeout(r, 2000));
         }
         if (!cracking || !ws || ws.readyState !== WebSocket.OPEN) break;
-        ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
-        nextWork = waitForWork(8000);
+        // Only send a new request if one isn't already in-flight (avoids
+        // duplicate requests when the timeout fires while a response is pending).
+        if (!workRequestPending) {
+          workRequestPending = true;
+          ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
+        }
+        nextWork = waitForWork(15000);
         continue;
       }
 
       // Request the next batch immediately while we process this one so the
       // GPU never idles waiting on a round-trip to the server.
-      ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
-      nextWork = waitForWork(30000);
+      // Guard against sending a duplicate if the previous pre-fetch response
+      // hasn't arrived yet (e.g. after a waitForWork timeout).
+      if (!workRequestPending) {
+        workRequestPending = true;
+        ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
+      }
+      nextWork = waitForWork(90000);
 
       const packetIds = [...new Set(chunks.map(c => c.packet_id))];
       setCrackingStatus(`Processing ${chunks.length} chunk(s) for packet ${packetIds.join(', ')}...`);
