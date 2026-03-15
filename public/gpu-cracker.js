@@ -227,9 +227,15 @@ class GPUCracker {
         return false;
       }
 
+      // Request the adapter's actual workgroup dispatch limit so we can
+      // size GPU batches as large as the hardware supports.
+      const maxDispatch = adapter.limits.maxComputeWorkgroupsPerDimension || 65535;
+      this._maxDispatch = maxDispatch;
+
       this.device = await adapter.requestDevice({
         requiredLimits: {
           maxComputeWorkgroupSizeX: 256,
+          maxComputeWorkgroupsPerDimension: maxDispatch,
           maxStorageBufferBindingSize: 128 * 1024 * 1024,
         }
       });
@@ -241,7 +247,7 @@ class GPUCracker {
       });
 
       this.supported = true;
-      console.log('WebGPU initialized successfully');
+      console.log(`WebGPU initialized: maxDispatch=${maxDispatch} → batchSize=${(maxDispatch * 256 / 1e6).toFixed(1)}M candidates/dispatch`);
       return true;
     } catch (err) {
       console.error('WebGPU init failed:', err);
@@ -377,10 +383,11 @@ class GPUCracker {
     let _rateWindowStart = performance.now();
     let _rateWindowCount = 0;
 
-    // 32M candidates per dispatch — saturates the GPU with enough work to
-    // amortise mapAsync and buffer copy overhead.  At workgroup_size(256) this
-    // is 131,072 workgroups which keeps even high-end GPUs busy.
-    const batchSize = 33554432;
+    // Size each dispatch to the maximum the GPU supports.
+    // workgroup_size(256), so max candidates = maxDispatch * 256.
+    // Default limit is 65535 workgroups = ~16.7M candidates.
+    const maxDispatch = this._maxDispatch || 65535;
+    const batchSize = maxDispatch * 256;
 
     // Flatten all work into a single batch list so the ping-pong pipeline can
     // span chunk boundaries without extra complexity.
