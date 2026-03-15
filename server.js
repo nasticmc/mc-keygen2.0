@@ -298,7 +298,7 @@ const assignPendingChunks = db.transaction((workerId, count) => {
 });
 
 // ── Work Chunk Generation ───────────────────────────────────────────────────
-const CHUNK_SIZE = 500_000;
+const CHUNK_SIZE = 2_000_000;
 
 const CHARSETS = {
   alnum: 'abcdefghijklmnopqrstuvwxyz0123456789',

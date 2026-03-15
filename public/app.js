@@ -595,24 +595,39 @@ document.getElementById('btn-stop-cracking').addEventListener('click', () => {
   }
 });
 
+function requestWork() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const count = parseInt(document.getElementById('work-batch-count')?.value, 10) || 16;
+  ws.send(JSON.stringify({ type: 'request_work', count }));
+}
+
 async function runCrackingLoop() {
   if (loopRunning) return;
   loopRunning = true;
+
+  // Pre-fetch first batch so it arrives before we even start waiting
+  requestWork();
+
   try {
     while (cracking && ws && ws.readyState === WebSocket.OPEN) {
-      setCrackingStatus('Requesting work from server...');
-      const count = parseInt(document.getElementById('work-batch-count')?.value, 10) || 8;
-      ws.send(JSON.stringify({ type: 'request_work', count }));
+      setCrackingStatus('Waiting for work...');
       const response = await waitForWork(5000);
 
       const chunks = response.chunks;
       if (response.charset) currentCharset = response.charset;
 
       if (chunks.length === 0) {
-        setCrackingStatus('No work available. Polling again in 2s...');
+        setCrackingStatus('No work available. Retrying in 2s...');
         await new Promise(r => setTimeout(r, 2000));
+        requestWork();
         continue;
       }
+
+      // Pipeline: fire off the next work request immediately so the server
+      // can assign the next batch while the GPU is busy with this one.
+      // The response will queue in queuedWorkMessages and be consumed instantly
+      // on the next iteration without any wait.
+      requestWork();
 
       const packetIds = [...new Set(chunks.map(c => c.packet_id))];
       setCrackingStatus(`Processing ${chunks.length} chunk(s) for packet ${packetIds.join(', ')}...`);
@@ -622,8 +637,6 @@ async function runCrackingLoop() {
         setCrackingStatus(`Crunching ${chunks.length} chunk(s) at ${formatHashRate(hashRate)}.`);
         ws.send(JSON.stringify({ type: 'hashrate_update', hashRate }));
       }, currentCharset);
-
-      setCrackingStatus(`Finished ${chunks.length} chunk(s). Requesting more work...`);
     }
   } finally {
     loopRunning = false;
