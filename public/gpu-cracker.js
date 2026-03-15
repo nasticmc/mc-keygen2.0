@@ -370,6 +370,9 @@ class GPUCracker {
     this._lastTime = performance.now();
     this._lastCount = 0;
 
+    const totalCandidates = chunks.reduce((sum, c) => sum + (c.range_end - c.range_start), 0);
+    let processedCandidates = 0;
+
     for (const chunk of chunks) {
       if (!this.running) break;
 
@@ -384,13 +387,14 @@ class GPUCracker {
           const matches = await this.crackChunk(chunk.target_prefix, start, size, charset);
 
           this._lastCount += size;
+          processedCandidates += size;
           const elapsed = (performance.now() - this._lastTime) / 1000;
           if (elapsed > 0.5) {
             this.hashRate = Math.round(this._lastCount / elapsed);
             this._lastCount = 0;
             this._lastTime = performance.now();
-            if (onProgress) onProgress(this.hashRate);
           }
+          if (onProgress) onProgress(this.hashRate, processedCandidates, totalCandidates);
 
           // Build key hex directly from GPU result buffer — no async crypto needed
           if (matches.length > 0) {
@@ -492,6 +496,9 @@ class CPUCracker {
     let totalHashed = 0;
     let lastTime = performance.now();
 
+    const totalCandidates = chunks.reduce((sum, c) => sum + (c.range_end - c.range_start), 0);
+    let processedCandidates = 0;
+
     for (const chunk of chunks) {
       if (!this.running) break;
 
@@ -515,11 +522,12 @@ class CPUCracker {
         }
 
         totalHashed++;
+        processedCandidates++;
         if (totalHashed % 5000 === 0) {
           const now = performance.now();
           const elapsed = (now - lastTime) / 1000;
           this.hashRate = Math.round(totalHashed / elapsed);
-          if (onProgress) onProgress(this.hashRate);
+          if (onProgress) onProgress(this.hashRate, processedCandidates, totalCandidates);
           await new Promise(r => setTimeout(r, 0));
         }
       }

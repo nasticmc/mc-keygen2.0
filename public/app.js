@@ -4,6 +4,7 @@ let ws = null;
 let cracker = null;
 let cracking = false;
 let loopRunning = false;
+let workRequestPending = false;
 let currentCharset = 'abcdefghijklmnopqrstuvwxyz';
 let serverChunkSize = 500000;
 const pendingWorkResolvers = [];
@@ -35,6 +36,7 @@ function connectWebSocket() {
   ws.onopen = () => {
     // Resolve any stale waitForWork promises immediately so the loop wakes up
     // rather than waiting up to 30s for the old timeout to fire.
+    workRequestPending = false;
     const staleResolvers = pendingWorkResolvers.splice(0);
     queuedWorkMessages.length = 0;
     for (const resolve of staleResolvers) {
@@ -48,8 +50,18 @@ function connectWebSocket() {
   ws.onclose = () => {
     document.getElementById('connection-status').textContent = 'Disconnected';
     document.getElementById('connection-status').className = 'disconnected';
+    workRequestPending = false;
+    clearInterval(ws._keepAliveTimer);
     setTimeout(connectWebSocket, 2000);
   };
+
+  // Application-level keep-alive: send a lightweight ping every 15s so that
+  // intermediate proxies/load-balancers don't close the idle connection.
+  ws._keepAliveTimer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'keepalive' }));
+    }
+  }, 15000);
 
   ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
@@ -86,6 +98,7 @@ function connectWebSocket() {
         refreshWorkerDisplay();
         break;
       case 'work':
+        workRequestPending = false;
         if (pendingWorkResolvers.length > 0) {
           const resolve = pendingWorkResolvers.shift();
           resolve(msg);
@@ -576,6 +589,11 @@ document.getElementById('btn-decode').addEventListener('click', async () => {
 // ── Cracking Controls ───────────────────────────────────────────────────────
 async function initCracker() {
   const gpuStatus = document.getElementById('gpu-status');
+  const startBtn = document.getElementById('btn-start-cracking');
+
+  // Disable start button until the cracker is ready — clicking before init
+  // completes would leave cracker as null and crash processChunks.
+  startBtn.disabled = true;
 
   cracker = new GPUCracker();
   const gpuOk = await cracker.init();
@@ -589,6 +607,8 @@ async function initCracker() {
     gpuStatus.textContent = 'WebGPU: N/A (CPU fallback)';
     gpuStatus.classList.add('unsupported');
   }
+
+  startBtn.disabled = false;
 }
 
 document.getElementById('btn-start-cracking').addEventListener('click', async () => {
@@ -608,6 +628,7 @@ document.getElementById('btn-stop-cracking').addEventListener('click', () => {
   document.getElementById('btn-start-cracking').classList.remove('hidden');
   document.getElementById('btn-stop-cracking').classList.add('hidden');
   setCrackingStatus('Stopped.');
+  resetLocalProgress();
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'hashrate_update', hashRate: 0 }));
   }
@@ -625,12 +646,19 @@ async function runCrackingLoop() {
     return parseInt(document.getElementById('work-batch-count')?.value, 10) || (isMobile() ? 1 : 4);
   }
 
-  // Kick off the first work request before entering the loop so there's no
-  // idle time between starting and actually receiving work.
-  ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
-  let nextWork = waitForWork(8000);
-
   try {
+    // If the socket isn't open yet, exit cleanly — ws.onopen will restart us
+    // once the connection is established.  This prevents ws.send() throwing a
+    // DOMException (INVALID_STATE_ERR) outside the try/finally, which would
+    // permanently strand loopRunning === true and kill the cracking loop.
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    // Kick off the first work request before entering the loop so there's no
+    // idle time between starting and actually receiving work.
+    workRequestPending = true;
+    ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
+    let nextWork = waitForWork(25000);
+
     while (cracking && ws && ws.readyState === WebSocket.OPEN) {
       setCrackingStatus('Waiting for work from server...');
       const response = await nextWork;
@@ -643,26 +671,45 @@ async function runCrackingLoop() {
           await new Promise(r => setTimeout(r, 2000));
         }
         if (!cracking || !ws || ws.readyState !== WebSocket.OPEN) break;
-        ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
-        nextWork = waitForWork(8000);
+        // Only send a new request if one isn't already in-flight (avoids
+        // duplicate requests when the timeout fires while a response is pending).
+        if (!workRequestPending) {
+          workRequestPending = true;
+          ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
+        }
+        nextWork = waitForWork(15000);
         continue;
       }
 
       // Request the next batch immediately while we process this one so the
       // GPU never idles waiting on a round-trip to the server.
-      ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
-      nextWork = waitForWork(30000);
+      // Guard against sending a duplicate if the previous pre-fetch response
+      // hasn't arrived yet (e.g. after a waitForWork timeout).
+      if (!workRequestPending) {
+        workRequestPending = true;
+        ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
+      }
+      nextWork = waitForWork(90000);
 
       const packetIds = [...new Set(chunks.map(c => c.packet_id))];
       setCrackingStatus(`Processing ${chunks.length} chunk(s) for packet ${packetIds.join(', ')}...`);
 
-      await cracker.processChunks(chunks, ws, (hashRate) => {
+      // Show chunk count label and reset local progress bar before processing starts.
+      document.getElementById('local-chunk-label').textContent =
+        `${chunks.length} chunk${chunks.length !== 1 ? 's' : ''}`;
+      setLocalProgress(0, 1);
+
+      await cracker.processChunks(chunks, ws, (hashRate, processed, total) => {
         document.getElementById('stat-hashrate').textContent = formatHashRate(hashRate);
         setCrackingStatus(`Crunching ${chunks.length} chunk(s) at ${formatHashRate(hashRate)}.`);
+        setLocalProgress(processed, total);
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'hashrate_update', hashRate }));
         }
       }, currentCharset);
+
+      // Fill bar to 100% once the batch finishes.
+      setLocalProgress(1, 1);
     }
   } finally {
     loopRunning = false;
@@ -698,6 +745,25 @@ function setCrackingStatus(text) {
   lastCrackingStatus = text;
   const el = document.getElementById('cracking-feedback');
   if (el) el.textContent = text;
+}
+
+function setLocalProgress(processed, total) {
+  const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
+  const bar = document.getElementById('local-progress-bar');
+  const text = document.getElementById('local-progress-text');
+  if (bar) bar.style.width = `${pct}%`;
+  if (text) text.textContent = total > 0
+    ? `${pct}% (${formatNumber(processed)} / ${formatNumber(total)})`
+    : '—';
+}
+
+function resetLocalProgress() {
+  const bar = document.getElementById('local-progress-bar');
+  const text = document.getElementById('local-progress-text');
+  const label = document.getElementById('local-chunk-label');
+  if (bar) bar.style.width = '0%';
+  if (text) text.textContent = '—';
+  if (label) label.textContent = '';
 }
 
 // ── Notifications ───────────────────────────────────────────────────────────
