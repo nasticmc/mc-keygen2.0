@@ -573,6 +573,13 @@ class CPUCracker {
         }
       }
 
+      // Emit a final rate for the chunk even if it had <5000 candidates
+      if (totalHashed > 0) {
+        const elapsed = (performance.now() - lastTime) / 1000;
+        if (elapsed > 0) this.hashRate = Math.round(totalHashed / elapsed);
+        if (onProgress) onProgress(this.hashRate, processedCandidates, totalCandidates);
+      }
+
       try {
         ws.send(JSON.stringify({
           type: 'chunk_complete',
