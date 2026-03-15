@@ -590,8 +590,13 @@ class CPUCracker {
 
     for (const chunk of chunks) {
       if (!this.running) break;
+      let chunkFullyProcessed = true;
 
-      for (let i = chunk.range_start; i < chunk.range_end && this.running; i++) {
+      for (let i = chunk.range_start; i < chunk.range_end; i++) {
+        if (!this.running) {
+          chunkFullyProcessed = false;
+          break;
+        }
         const channelName = this.indexToChannelName(i, charset);
         if (!channelName) continue;
 
@@ -634,7 +639,7 @@ class CPUCracker {
         if (onProgress) onProgress(this.hashRate, processedCandidates, totalCandidates);
       }
 
-      completedChunkIds.push(chunk.id);
+      if (chunkFullyProcessed) completedChunkIds.push(chunk.id);
 
       totalHashed = 0;
       lastTime = performance.now();
