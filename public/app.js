@@ -174,7 +174,7 @@ function isMobile() {
 }
 
 function batchCount() {
-  return parseInt(document.getElementById('work-batch-count')?.value, 10) || (isMobile() ? 2 : 16);
+  return parseInt(document.getElementById('work-batch-count')?.value, 10) || (isMobile() ? 2 : 8);
 }
 
 function getMinAhead() {
@@ -977,7 +977,7 @@ function updateKeyspaceEstimate() {
   const batchInput = document.getElementById('work-batch-count');
   if (batchInput) {
     const mobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
-    batchInput.value = mobile ? 2 : 16;
+    batchInput.value = mobile ? 2 : 8;
   }
 
   connectWebSocket();

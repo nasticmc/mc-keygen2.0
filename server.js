@@ -576,7 +576,7 @@ function decodeAsync(hexData, channelKey, cb) {
 for (let i = 0; i < DECODER_POOL_SIZE; i++) _decoderPool.push(_spawnDecoderWorker());
 
 // ── Work Chunk Generation ───────────────────────────────────────────────────
-const CHUNK_SIZE = 32_000_000;
+const CHUNK_SIZE = 64_000_000;
 
 const CHARSETS = {
   alnum: 'abcdefghijklmnopqrstuvwxyz0123456789',
