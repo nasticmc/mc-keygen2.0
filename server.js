@@ -245,6 +245,23 @@ try { db.exec('ALTER TABLE candidate_keys ADD COLUMN ignored INTEGER DEFAULT 0')
 // Lazy chunk generation cursor: NULL = all chunks already inserted (or no work left)
 try { db.exec('ALTER TABLE packets ADD COLUMN chunk_gen_offset INTEGER'); } catch {}
 
+// Candidate dedupe + uniqueness guard so high-volume prefix-match batches don't
+// spend most of their time doing per-row existence checks.
+try {
+  db.exec(`
+    DELETE FROM candidate_keys
+    WHERE id IN (
+      SELECT c1.id
+      FROM candidate_keys c1
+      JOIN candidate_keys c2
+        ON c1.packet_id = c2.packet_id
+       AND c1.key = c2.key
+       AND c1.id > c2.id
+    )
+  `);
+} catch {}
+try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_ck_packet_key ON candidate_keys(packet_id, key)'); } catch {}
+
 // ── Prepared Statements ─────────────────────────────────────────────────────
 const stmts = {
   insertPacket: db.prepare('INSERT INTO packets (raw_data, prefix, channel_hash, decoded_json, charset, min_len, max_len) VALUES (?, ?, ?, ?, ?, ?, ?)'),
@@ -281,7 +298,7 @@ const stmts = {
     UPDATE work_chunks SET status = 'pending', assigned_to = NULL, assigned_at = NULL
     WHERE status = 'assigned' AND assigned_at < datetime('now', '-5 minutes')
   `),
-  insertCandidate: db.prepare('INSERT INTO candidate_keys (packet_id, channel_name, key, prefix) VALUES (?, ?, ?, ?)'),
+  insertCandidate: db.prepare('INSERT OR IGNORE INTO candidate_keys (packet_id, channel_name, key, prefix, verified, decode_success) VALUES (?, ?, ?, ?, 1, 1)'),
   getCandidates: db.prepare('SELECT * FROM candidate_keys WHERE packet_id = ? ORDER BY created_at DESC'),
   getAllCandidates: db.prepare('SELECT * FROM candidate_keys ORDER BY created_at DESC LIMIT 100'),
   updatePacketDecrypted: db.prepare('UPDATE packets SET decrypted_json = ? WHERE id = ?'),
@@ -296,11 +313,63 @@ const stmts = {
     SET status = 'assigned', assigned_to = ?, assigned_at = CURRENT_TIMESTAMP
     WHERE id = ? AND status = 'pending'
   `),
-  checkCandidateExists: db.prepare('SELECT 1 FROM candidate_keys WHERE packet_id = ? AND key = ? LIMIT 1'),
-  getCandidateByKey: db.prepare('SELECT id FROM candidate_keys WHERE packet_id = ? AND key = ? ORDER BY id DESC LIMIT 1'),
-  setCandidateVerified: db.prepare('UPDATE candidate_keys SET verified = 1, decode_success = ? WHERE id = ?'),
   completePacketChunks: db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'"),
 };
+
+function persistWinningCandidate(packetId, channelName, key, prefix) {
+  stmts.insertCandidate.run(packetId, channelName, key, prefix);
+}
+
+function markPacketCracked(packetId, channelName, key, decoded) {
+  const current = stmts.getPacketById.get(packetId);
+  if (!current || current.status === 'cracked') return false;
+
+  console.log(`[FOUND] packet ${packetId} cracked — channel="${channelName}" key=${key.substring(0, 8)}...`);
+  stmts.updatePacketStatus.run('cracked', key, channelName, packetId);
+  if (decoded) stmts.updatePacketDecrypted.run(JSON.stringify(decoded), packetId);
+  stmts.completePacketChunks.run(packetId);
+  broadcast({ type: 'key_found', packetId, key, channelName, decoded });
+  broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
+  broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+  broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
+  return true;
+}
+
+function findWinningCandidate(packet, matches, onDone) {
+  const MAX_IN_FLIGHT = Math.max(1, DECODER_POOL_SIZE * 2);
+  let index = 0;
+  let inFlight = 0;
+  let done = false;
+
+  const finish = (winner) => {
+    if (done) return;
+    done = true;
+    onDone(winner);
+  };
+
+  const schedule = () => {
+    while (!done && inFlight < MAX_IN_FLIGHT && index < matches.length) {
+      const match = matches[index++];
+      inFlight++;
+      decodeAsync(packet.raw_data, match.keyHex, (result) => {
+        inFlight--;
+        if (done) return;
+        if (result.success) {
+          finish({ match, result });
+          return;
+        }
+        if (index >= matches.length && inFlight === 0) {
+          finish(null);
+          return;
+        }
+        schedule();
+      });
+    }
+  };
+
+  if (matches.length === 0) return finish(null);
+  schedule();
+}
 
 const assignPendingChunks = db.transaction((workerId, count) => {
   const available = stmts.getPendingChunks.all(count);
@@ -593,30 +662,14 @@ wss.on('connection', (ws) => {
 
       case 'prefix_match': {
         const { packetId, channelName, key, prefix } = msg;
-        if (!stmts.checkCandidateExists.get(packetId, key)) {
-          stmts.insertCandidate.run(packetId, channelName, key, prefix);
-        }
-        broadcast({ type: 'candidate_found', packetId, channelName, key, prefix });
-        broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
-
         const packet = stmts.getPacketById.get(packetId);
         if (packet && packet.status !== 'cracked') {
           decodeAsync(packet.raw_data, key, (result) => {
-            const row = stmts.getCandidateByKey.get(packetId, key);
-            if (row) stmts.setCandidateVerified.run(result.success ? 1 : 0, row.id);
             if (result.success) {
-              const current = stmts.getPacketById.get(packetId);
-              if (current && current.status !== 'cracked') {
-                console.log(`[FOUND] packet ${packetId} cracked — channel="${channelName}" key=${key.substring(0, 8)}...`);
-                stmts.updatePacketStatus.run('cracked', key, channelName, packetId);
-                if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), packetId);
-                stmts.completePacketChunks.run(packetId);
-                broadcast({ type: 'key_found', packetId, key, channelName, decoded: result.decoded });
-                broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
-                broadcast({ type: 'packets', packets: stmts.getPackets.all() });
-              }
+              persistWinningCandidate(packetId, channelName, key, prefix);
+              broadcast({ type: 'candidate_found', packetId, channelName, key, prefix });
+              markPacketCracked(packetId, channelName, key, result.decoded);
             }
-            broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
           });
         }
         break;
@@ -627,49 +680,13 @@ wss.on('connection', (ws) => {
         const batchPacket = stmts.getPacketById.get(batchPacketId);
         if (!batchPacket || batchPacket.status === 'cracked') break;
 
-        // Insert all new candidates in a single transaction.  Without an
-        // explicit transaction every INSERT auto-commits, which in WAL mode
-        // serialises each write through the journal and can block the event
-        // loop for several seconds when a batch carries thousands of matches.
-        db.transaction(() => {
-          for (const { channelName: cn, keyHex, prefixHex: ph } of batchMatches) {
-            if (!stmts.checkCandidateExists.get(batchPacketId, keyHex)) {
-              stmts.insertCandidate.run(batchPacketId, cn, keyHex, ph);
-            }
-          }
-        })();
-
-        // Build the verify list after the transaction so reads see committed data.
-        const toVerify = batchMatches.map(({ channelName: cn, keyHex }) => ({ cn, keyHex }));
-        broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
-
-        let pending = toVerify.length;
-        let found = false;
-        for (const { cn, keyHex } of toVerify) {
-          decodeAsync(batchPacket.raw_data, keyHex, (result) => {
-            pending--;
-            if (found) {
-              if (pending === 0) broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
-              return;
-            }
-            const row = stmts.getCandidateByKey.get(batchPacketId, keyHex);
-            if (row) stmts.setCandidateVerified.run(result.success ? 1 : 0, row.id);
-            if (result.success) {
-              const current = stmts.getPacketById.get(batchPacketId);
-              if (current && current.status !== 'cracked') {
-                found = true;
-                console.log(`[FOUND] packet ${batchPacketId} cracked — channel="${cn}" key=${keyHex.substring(0, 8)}...`);
-                stmts.updatePacketStatus.run('cracked', keyHex, cn, batchPacketId);
-                if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), batchPacketId);
-                stmts.completePacketChunks.run(batchPacketId);
-                broadcast({ type: 'key_found', packetId: batchPacketId, key: keyHex, channelName: cn, decoded: result.decoded });
-                broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
-                broadcast({ type: 'packets', packets: stmts.getPackets.all() });
-              }
-            }
-            if (pending === 0) broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
-          });
-        }
+        findWinningCandidate(batchPacket, batchMatches, (winner) => {
+          if (!winner) return;
+          const { match, result } = winner;
+          persistWinningCandidate(batchPacketId, match.channelName, match.keyHex, match.prefixHex);
+          broadcast({ type: 'candidate_found', packetId: batchPacketId, channelName: match.channelName, key: match.keyHex, prefix: match.prefixHex });
+          markPacketCracked(batchPacketId, match.channelName, match.keyHex, result.decoded);
+        });
         break;
       }
 
