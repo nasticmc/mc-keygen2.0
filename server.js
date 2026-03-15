@@ -580,7 +580,7 @@ setInterval(() => {
 
 // ── Connected Workers ───────────────────────────────────────────────────────
 const workers = new Map();
-const PREFETCH_LOW_WATERMARK = 0.4;
+const PREFETCH_LOW_WATERMARK = 0.25;
 
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_MISS_LIMIT = 4;
@@ -607,7 +607,7 @@ function makeWorkerId(inputId) {
 function updateWorkerDesiredInFlight(workerId, requestedCount) {
   const worker = workers.get(workerId);
   if (!worker) return;
-  const nextDesired = Math.max(1, Math.min(64, parseInt(requestedCount, 10) || 1));
+  const nextDesired = Math.max(1, Math.min(256, parseInt(requestedCount, 10) || 1));
   worker.desiredInFlight = nextDesired;
 }
 
@@ -759,13 +759,12 @@ wss.on('connection', (ws) => {
 
       case 'request_work': {
         if (!workerId) registerWorker(msg.clientId);
-        // Treat msg.count as "give me this many MORE chunks", not "I want this
-        // many total".  The old behaviour (capping at msg.count total) meant that
-        // fast workers starved: their second lookahead request always came back
-        // empty because the first had already filled the cap.
+        // Treat msg.count as "give me this many MORE chunks on top of what I
+        // already have".  Use a generous cap (256) so fast workers with deep
+        // prefetch queues never starve.
         const requestedCount = Math.max(1, parseInt(msg.count, 10) || 1);
         const alreadyAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
-        const newTarget = Math.min(64, alreadyAssigned + requestedCount);
+        const newTarget = Math.min(256, alreadyAssigned + requestedCount);
         updateWorkerDesiredInFlight(workerId, newTarget);
         const expired = stmts.expireStaleChunks.run().changes;
         if (expired > 0) console.log(`[stale] re-queued ${expired} stale chunk(s)`);

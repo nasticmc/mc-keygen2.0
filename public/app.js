@@ -88,9 +88,14 @@ function connectWebSocket() {
 
   // Application-level keep-alive: send a lightweight ping every 15s so that
   // intermediate proxies/load-balancers don't close the idle connection.
+  // Also acts as a safety net for stuck work requests — if the cracking loop
+  // is active but has no work queued and no requests in flight, force a top-up.
   ws._keepAliveTimer = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'keepalive', clientId: getClientId() }));
+      if (cracking && loopRunning && queuedWorkMessages.length === 0 && workRequestsInFlight === 0) {
+        topUpWorkQueue();
+      }
     }
   }, 15000);
 
@@ -741,7 +746,7 @@ async function runCrackingLoop() {
     // Fill the lookahead queue before entering the loop so the GPU never idles
     // waiting on the first round-trip to the server.
     topUpWorkQueue();
-    let nextWork = waitForWork(25000);
+    let nextWork = waitForWork(10000);
 
     while (cracking && ws && ws.readyState === WebSocket.OPEN) {
       setCrackingStatus('Waiting for work from server...');
@@ -755,21 +760,21 @@ async function runCrackingLoop() {
           setCrackingStatus('No work available. Requesting more work...');
         }
         if (!cracking || !ws || ws.readyState !== WebSocket.OPEN) break;
-        // If all in-flight requests have been stuck for >30s with nothing queued,
+        // If all in-flight requests have been stuck for >10s with nothing queued,
         // assume they were dropped and reset the counter so topUpWorkQueue will retry.
-        if (workRequestsInFlight > 0 && queuedWorkMessages.length === 0 && (Date.now() - workRequestSentAt) > 30000) {
+        if (workRequestsInFlight > 0 && queuedWorkMessages.length === 0 && (Date.now() - workRequestSentAt) > 10000) {
           workRequestsInFlight = 0;
           workRequestSentAt = 0;
         }
         topUpWorkQueue();
-        nextWork = waitForWork(15000);
+        nextWork = waitForWork(5000);
         continue;
       }
 
       // Top up the lookahead queue while we process this batch so the GPU
       // never idles waiting on a round-trip to the server.
       topUpWorkQueue();
-      nextWork = waitForWork(90000);
+      nextWork = waitForWork(30000);
 
       const packetIds = [...new Set(chunks.map(c => c.packet_id))];
       setCrackingStatus(`Processing ${chunks.length} chunk(s) for packet ${packetIds.join(', ')}...`);
