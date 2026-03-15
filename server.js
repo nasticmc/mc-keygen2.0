@@ -674,6 +674,11 @@ const heartbeatInterval = setInterval(() => {
 }, HEARTBEAT_INTERVAL_MS);
 wss.on('close', () => clearInterval(heartbeatInterval));
 
+function markConnectionAlive(ws) {
+  ws.isAlive = true;
+  ws.missedPings = 0;
+}
+
 // ── Periodic Stats Broadcast ────────────────────────────────────────────────
 function getTotalHashRate() {
   let total = 0;
@@ -687,9 +692,8 @@ setInterval(() => {
 
 wss.on('connection', (ws) => {
   let workerId = null;
-  ws.isAlive = true;
-  ws.missedPings = 0;
-  ws.on('pong', () => { ws.isAlive = true; ws.missedPings = 0; });
+  markConnectionAlive(ws);
+  ws.on('pong', () => markConnectionAlive(ws));
   setServerStatus('connection', 'Worker socket connected. Waiting for registration...');
 
   function registerWorker(requestedId) {
@@ -722,6 +726,10 @@ wss.on('connection', (ws) => {
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
+
+    // Any successfully parsed message proves the client is still responsive,
+    // even if it skipped websocket pong frames while busy processing work.
+    markConnectionAlive(ws);
 
     const _t0 = Date.now();
     try {
@@ -829,8 +837,7 @@ wss.on('connection', (ws) => {
         // Application-level ping from client — keep the connection marked alive
         // so the heartbeat doesn't terminate it even if a WebSocket ping/pong
         // frame was dropped by an intermediate proxy.
-        ws.isAlive = true;
-        ws.missedPings = 0;
+        markConnectionAlive(ws);
         if (!workerId && msg.clientId) registerWorker(msg.clientId);
         break;
       }
