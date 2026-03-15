@@ -232,13 +232,7 @@ class GPUCracker {
       const maxDispatch = adapter.limits.maxComputeWorkgroupsPerDimension || 65535;
       this._maxDispatch = maxDispatch;
 
-      this.device = await adapter.requestDevice({
-        requiredLimits: {
-          maxComputeWorkgroupSizeX: 256,
-          maxComputeWorkgroupsPerDimension: maxDispatch,
-          maxStorageBufferBindingSize: 128 * 1024 * 1024,
-        }
-      });
+      this.device = await adapter.requestDevice();
 
       const shaderModule = this.device.createShaderModule({ code: SHA256_WGSL });
       this.pipeline = this.device.createComputePipeline({
@@ -383,13 +377,9 @@ class GPUCracker {
     let _rateWindowStart = performance.now();
     let _rateWindowCount = 0;
 
-    // Size each dispatch conservatively to avoid very long-running kernels
-    // that can make the page appear hung and delay websocket traffic on some
-    // desktop drivers/tunnel setups.
     // workgroup_size(256), so candidates = dispatchWorkgroups * 256.
     const maxDispatch = this._maxDispatch || 65535;
-    const maxKernelCandidates = 2_097_152; // 2M candidates per GPU submit
-    const batchSize = Math.max(256, Math.min(maxDispatch * 256, maxKernelCandidates));
+    const batchSize = Math.max(256, maxDispatch * 256);
 
     // Flatten all work into a single batch list so the ping-pong pipeline can
     // span chunk boundaries without extra complexity.
