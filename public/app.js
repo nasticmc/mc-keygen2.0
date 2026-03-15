@@ -1,5 +1,27 @@
 // ── MC-Keygen 2.0 Frontend ──────────────────────────────────────────────────
 
+// ── Worker Name Generator ────────────────────────────────────────────────────
+// Maps a raw worker ID to a deterministic two-word "Animal Emotion" display name.
+const _workerNameAnimals = [
+  'Bear', 'Cat', 'Crow', 'Deer', 'Duck', 'Fox', 'Frog', 'Goat', 'Hawk',
+  'Hare', 'Lynx', 'Lion', 'Mole', 'Moose', 'Newt', 'Orca', 'Owl', 'Puma',
+  'Slug', 'Swan', 'Toad', 'Vole', 'Wolf', 'Wren', 'Yak',
+];
+const _workerNameEmotions = [
+  'Bold', 'Brave', 'Bright', 'Calm', 'Cozy', 'Dark', 'Eager', 'Faint',
+  'Fuzzy', 'Glad', 'Giddy', 'Happy', 'Jolly', 'Keen', 'Merry', 'Proud',
+  'Sharp', 'Snug', 'Sunny', 'Swift', 'Tense', 'Warm', 'Wild', 'Zesty', 'Cool',
+];
+
+function workerIdToName(id) {
+  // djb2 hash for stable, well-distributed index
+  let h = 5381;
+  for (let i = 0; i < id.length; i++) h = (h * 33 ^ id.charCodeAt(i)) >>> 0;
+  const emotion = _workerNameEmotions[h % _workerNameEmotions.length];
+  const animal  = _workerNameAnimals[Math.floor(h / _workerNameEmotions.length) % _workerNameAnimals.length];
+  return `${emotion} ${animal}`;
+}
+
 let ws = null;
 let cracker = null;
 let cracking = false;
@@ -103,8 +125,8 @@ function connectWebSocket() {
         break;
       case 'worker_hello':
         setClientId(msg.workerId);
-        document.getElementById('worker-id').textContent = `ID: ${msg.workerId}`;
-        setCrackingStatus(`Worker registered as ${msg.workerId}. Ready.`);
+        document.getElementById('worker-id').textContent = `ID: ${workerIdToName(msg.workerId)}`;
+        setCrackingStatus(`Worker registered as ${workerIdToName(msg.workerId)}. Ready.`);
         break;
       case 'server_status':
         updateServerStatus(msg);
@@ -266,7 +288,7 @@ function refreshWorkerDisplay() {
     const card = document.createElement('div');
     card.className = 'worker-card';
     card.innerHTML = `
-      <div class="worker-id">${id.substring(0, 8)}</div>
+      <div class="worker-id">${workerIdToName(id)}</div>
       <div class="worker-rate">${formatHashRate(rate)}</div>
     `;
     container.appendChild(card);

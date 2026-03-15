@@ -469,7 +469,7 @@ textarea:focus, input[type="text"]:focus {
 .worker-card .worker-id {
   font-size: 0.75rem;
   color: var(--text-dim);
-  font-family: monospace;
+  word-break: break-word;
 }
 
 .worker-card .worker-rate {
