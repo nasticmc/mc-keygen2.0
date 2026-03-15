@@ -730,6 +730,7 @@ function wName(id) { return id ? `${workerIdToName(id)} (${id})` : 'unregistered
 
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_MISS_LIMIT = 4;
+const HEARTBEAT_ACTIVITY_GRACE_MS = 120_000;
 
 function formatHashRate(n) {
   if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + ' GH/s';
@@ -829,15 +830,27 @@ setInterval(() => {
 // idle proxies alive while being tolerant of transient network jitter.
 const heartbeatInterval = setInterval(() => {
   wss.clients.forEach(client => {
+    const lastSeenAt = client.lastSeenAt || 0;
+    const recentlyActive = (Date.now() - lastSeenAt) < HEARTBEAT_ACTIVITY_GRACE_MS;
+
     if (client.isAlive === false) {
-      client.missedPings = (client.missedPings || 0) + 1;
-      if (client.workerId) {
-        console.warn(`[ws] missed heartbeat ${wName(client.workerId)} miss=${client.missedPings}/${HEARTBEAT_MISS_LIMIT}`);
-      }
-      if (client.missedPings >= HEARTBEAT_MISS_LIMIT) {
-        if (client.workerId) console.warn(`[ws] terminating unresponsive worker ${wName(client.workerId)}`);
-        client.terminate();
-        return;
+      // Some websocket tunnels/proxies can drop ping/pong frames even while
+      // app-level traffic is still flowing. If we've seen recent activity,
+      // avoid counting this tick as a missed heartbeat.
+      if (recentlyActive) {
+        if (client.workerId) {
+          console.warn(`[ws] missed heartbeat frame but recent activity from ${wName(client.workerId)}; keeping connection alive`);
+        }
+      } else {
+        client.missedPings = (client.missedPings || 0) + 1;
+        if (client.workerId) {
+          console.warn(`[ws] missed heartbeat ${wName(client.workerId)} miss=${client.missedPings}/${HEARTBEAT_MISS_LIMIT}`);
+        }
+        if (client.missedPings >= HEARTBEAT_MISS_LIMIT) {
+          if (client.workerId) console.warn(`[ws] terminating unresponsive worker ${wName(client.workerId)}`);
+          client.terminate();
+          return;
+        }
       }
     } else {
       client.missedPings = 0;
@@ -851,6 +864,7 @@ wss.on('close', () => clearInterval(heartbeatInterval));
 function markConnectionAlive(ws) {
   ws.isAlive = true;
   ws.missedPings = 0;
+  ws.lastSeenAt = Date.now();
 }
 
 // ── Periodic Stats Broadcast ────────────────────────────────────────────────
