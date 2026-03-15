@@ -5,6 +5,7 @@ let cracker = null;
 let cracking = false;
 let loopRunning = false;
 let workRequestPending = false;
+let workRequestSentAt = 0;
 let currentCharset = 'abcdefghijklmnopqrstuvwxyz';
 let serverChunkSize = 500000;
 let persistedClientId = localStorage.getItem('mc-worker-client-id') || '';
@@ -38,6 +39,7 @@ function connectWebSocket() {
     // Resolve any stale waitForWork promises immediately so the loop wakes up
     // rather than waiting up to 30s for the old timeout to fire.
     workRequestPending = false;
+    workRequestSentAt = 0;
     const staleResolvers = pendingWorkResolvers.splice(0);
     queuedWorkMessages.length = 0;
     for (const resolve of staleResolvers) {
@@ -56,6 +58,7 @@ function connectWebSocket() {
     document.getElementById('worker-id').textContent = '';
     setCrackingStatus('Socket disconnected. Reconnecting in 2s...');
     workRequestPending = false;
+    workRequestSentAt = 0;
     clearInterval(ws._keepAliveTimer);
     setTimeout(connectWebSocket, 2000);
   };
@@ -112,6 +115,7 @@ function connectWebSocket() {
         break;
       case 'work':
         workRequestPending = false;
+        workRequestSentAt = 0;
         if (pendingWorkResolvers.length > 0) {
           const resolve = pendingWorkResolvers.shift();
           resolve(msg);
@@ -689,6 +693,7 @@ async function runCrackingLoop() {
     // Kick off the first work request before entering the loop so there's no
     // idle time between starting and actually receiving work.
     workRequestPending = true;
+    workRequestSentAt = Date.now();
     ws.send(JSON.stringify({ type: 'request_work', count: batchCount(), clientId: getClientId() }));
     let nextWork = waitForWork(25000);
 
@@ -706,14 +711,15 @@ async function runCrackingLoop() {
         if (!cracking || !ws || ws.readyState !== WebSocket.OPEN) break;
         // Only send a new request if one isn't already in-flight (avoids
         // duplicate requests when the timeout fires while a response is pending).
-        // However, if the in-flight request has been pending longer than two
-        // retry cycles (i.e. the server never responded), force-reset the flag
-        // so we don't silently stall forever.
-        if (workRequestPending && queuedWorkMessages.length === 0) {
+        // If the request has been stuck for >30s, assume it was dropped and
+        // allow a retry so the worker doesn't stall forever.
+        if (workRequestPending && queuedWorkMessages.length === 0 && (Date.now() - workRequestSentAt) > 30000) {
           workRequestPending = false;
+          workRequestSentAt = 0;
         }
         if (!workRequestPending) {
           workRequestPending = true;
+          workRequestSentAt = Date.now();
           ws.send(JSON.stringify({ type: 'request_work', count: batchCount(), clientId: getClientId() }));
         }
         nextWork = waitForWork(15000);
@@ -726,6 +732,7 @@ async function runCrackingLoop() {
       // hasn't arrived yet (e.g. after a waitForWork timeout).
       if (!workRequestPending) {
         workRequestPending = true;
+        workRequestSentAt = Date.now();
         ws.send(JSON.stringify({ type: 'request_work', count: batchCount(), clientId: getClientId() }));
       }
       nextWork = waitForWork(90000);
