@@ -54,6 +54,10 @@ Open `http://localhost:3000` in a browser. For distributed cracking, open the UR
 - Processes sub-batches of 64K candidates for UI responsiveness
 - Falls back to a pure JavaScript MD5 implementation when WebGPU is unavailable
 
+## Performance & Scaling
+
+See `BACKEND_SCALING_PLAN.md` for an investigation and phased plan to reduce websocket assignment latency, improve fairness across workers, and evaluate migration paths beyond Node.js.
+
 ## API
 
 ### Packets

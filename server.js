@@ -562,6 +562,7 @@ setInterval(() => {
 
 // ── Connected Workers ───────────────────────────────────────────────────────
 const workers = new Map();
+const PREFETCH_LOW_WATERMARK = 0.4;
 
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_MISS_LIMIT = 4;
@@ -583,6 +584,46 @@ function setServerStatus(phase, detail) {
 function makeWorkerId(inputId) {
   const normalized = String(inputId || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24);
   return normalized || crypto.randomUUID().replace(/-/g, '').slice(0, 12);
+}
+
+function updateWorkerDesiredInFlight(workerId, requestedCount) {
+  const worker = workers.get(workerId);
+  if (!worker) return;
+  const nextDesired = Math.max(1, Math.min(64, parseInt(requestedCount, 10) || 1));
+  worker.desiredInFlight = nextDesired;
+}
+
+function maybePushWork(workerId, reason = 'scheduler') {
+  const worker = workers.get(workerId);
+  if (!worker || !worker.ws || worker.ws.readyState !== 1) return 0;
+
+  const desired = worker.desiredInFlight || 1;
+  const assigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
+  const lowWater = Math.max(1, Math.ceil(desired * PREFETCH_LOW_WATERMARK));
+  if (assigned > lowWater) return 0;
+
+  let chunks = assignWorkRespectingInFlight(workerId, desired);
+  if (chunks.length === 0) {
+    const refillable = db.prepare(
+      "SELECT id FROM packets WHERE status != 'cracked' AND chunk_gen_offset IS NOT NULL"
+    ).all();
+    if (refillable.length > 0) {
+      for (const { id } of refillable) refillWorkChunks(id);
+      chunks = assignWorkRespectingInFlight(workerId, desired);
+    }
+  }
+
+  if (chunks.length > 0) {
+    worker.ws.send(JSON.stringify({
+      type: 'work',
+      chunks,
+      charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
+    }));
+    console.log(`[sched] pushed ${chunks.length} chunk(s) to ${workerId} (${reason})`);
+    broadcastStats();
+  }
+
+  return chunks.length;
 }
 
 function broadcast(data) {
@@ -669,7 +710,7 @@ wss.on('connection', (ws) => {
 
     workerId = nextWorkerId;
     ws.workerId = workerId;
-    workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0 });
+    workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0, desiredInFlight: 1 });
 
     console.log(`[ws] worker registered id=${workerId} total=${workers.size}`);
     setServerStatus('worker_registered', `Worker ${workerId} is online (${workers.size} total).`);
@@ -692,6 +733,7 @@ wss.on('connection', (ws) => {
 
       case 'request_work': {
         if (!workerId) registerWorker(msg.clientId);
+        updateWorkerDesiredInFlight(workerId, msg.count);
         const expired = stmts.expireStaleChunks.run().changes;
         if (expired > 0) console.log(`[stale] re-queued ${expired} stale chunk(s)`);
         setServerStatus('assigning_work', `Assigning work to ${workerId}...`);
@@ -728,6 +770,7 @@ wss.on('connection', (ws) => {
           worker.hashRate = msg.hashRate || 0;
         }
         setServerStatus('chunk_complete', `Chunk ${msg.chunkId} completed by ${workerId}.`);
+        maybePushWork(workerId, 'chunk_complete');
         broadcastStats();
         broadcast({ type: 'worker_update', workerId, hashRate: msg.hashRate || 0 });
         break;

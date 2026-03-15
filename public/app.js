@@ -705,8 +705,7 @@ async function runCrackingLoop() {
 
       if (chunks.length === 0) {
         if (!response._reconnected) {
-          setCrackingStatus('No work available. Retrying in 2s...');
-          await new Promise(r => setTimeout(r, 2000));
+          setCrackingStatus('No work available. Requesting more work...');
         }
         if (!cracking || !ws || ws.readyState !== WebSocket.OPEN) break;
         // Only send a new request if one isn't already in-flight (avoids
