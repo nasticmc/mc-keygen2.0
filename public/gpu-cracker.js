@@ -367,12 +367,15 @@ class GPUCracker {
 
   async processChunks(chunks, ws, onProgress, charset, packetRawData = {}) {
     this.running = true;
-    this._lastTime = performance.now();
-    this._lastCount = 0;
     this.ensureBuffers();
 
     const totalCandidates = chunks.reduce((sum, c) => sum + (c.range_end - c.range_start), 0);
     let processedCandidates = 0;
+    // Track total candidates and wall-clock time for accurate hash rate.
+    // The ping-pong pipeline means finishBatch runs while the GPU is already
+    // computing the next batch, so we must measure over a longer window.
+    let _rateWindowStart = performance.now();
+    let _rateWindowCount = 0;
 
     // 32M candidates per dispatch — saturates the GPU with enough work to
     // amortise mapAsync and buffer copy overhead.  At workgroup_size(256) this
@@ -424,13 +427,16 @@ class GPUCracker {
 
     let _lastProgressTime = 0;
     const finishBatch = async (matches, batch) => {
-      this._lastCount += batch.size;
       processedCandidates += batch.size;
-      const elapsed = (performance.now() - this._lastTime) / 1000;
-      if (elapsed > 0.5) {
-        this.hashRate = Math.round(this._lastCount / elapsed);
-        this._lastCount = 0;
-        this._lastTime = performance.now();
+      _rateWindowCount += batch.size;
+      // Compute hash rate over a rolling window of at least 2 seconds so the
+      // ping-pong pipeline doesn't skew the measurement (finishBatch runs
+      // while the next batch is already on the GPU).
+      const elapsed = (performance.now() - _rateWindowStart) / 1000;
+      if (elapsed >= 2.0) {
+        this.hashRate = Math.round(_rateWindowCount / elapsed);
+        _rateWindowCount = 0;
+        _rateWindowStart = performance.now();
       }
       // Throttle progress callbacks to ~1/sec to avoid DOM/WebSocket overhead
       // between GPU dispatches starving the pipeline.
