@@ -232,6 +232,7 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_wc_status          ON work_chunks(status);
   CREATE INDEX IF NOT EXISTS idx_wc_packet_status   ON work_chunks(packet_id, status);
   CREATE INDEX IF NOT EXISTS idx_wc_expire          ON work_chunks(status, assigned_at);
+  CREATE INDEX IF NOT EXISTS idx_wc_assigned_to     ON work_chunks(status, assigned_to);
 `);
 
 // Migration: add decrypted_json column for storing decoded message content
@@ -402,15 +403,25 @@ const _decoderCallbacks = new Map();
 function _spawnDecoderWorker() {
   const w = new Worker(path.join(__dirname, 'decoder-worker.js'));
   w.busy = false;
+  w.currentTaskId = null;
   w.on('message', ({ id, ...result }) => {
     w.busy = false;
+    w.currentTaskId = null;
     const cb = _decoderCallbacks.get(id);
     if (cb) { _decoderCallbacks.delete(id); cb(result); }
     _drainDecoderPool(w);
   });
+  const _failInFlight = (reason) => {
+    if (w.currentTaskId != null) {
+      const cb = _decoderCallbacks.get(w.currentTaskId);
+      if (cb) { _decoderCallbacks.delete(w.currentTaskId); cb({ success: false, error: reason }); }
+      w.currentTaskId = null;
+    }
+    w.busy = false;
+  };
   w.on('error', (err) => {
     console.error('[decoder-pool] worker error:', err.message);
-    w.busy = false;
+    _failInFlight(err.message);
     const idx = _decoderPool.indexOf(w);
     if (idx >= 0) _decoderPool.splice(idx, 1);
     const replacement = _spawnDecoderWorker();
@@ -420,6 +431,7 @@ function _spawnDecoderWorker() {
   w.on('exit', (code) => {
     if (code === 0) return;
     console.error(`[decoder-pool] worker exited with code ${code}, restarting`);
+    _failInFlight(`worker exited with code ${code}`);
     const idx = _decoderPool.indexOf(w);
     if (idx >= 0) { _decoderPool.splice(idx, 1); _decoderPool.push(_spawnDecoderWorker()); }
   });
@@ -430,6 +442,7 @@ function _drainDecoderPool(worker) {
   if (!worker.busy && _decoderQueue.length > 0) {
     const task = _decoderQueue.shift();
     worker.busy = true;
+    worker.currentTaskId = task.id;
     worker.postMessage(task);
   }
 }
@@ -438,8 +451,13 @@ function decodeAsync(hexData, channelKey, cb) {
   const id = _decoderTaskId++;
   _decoderCallbacks.set(id, cb);
   const free = _decoderPool.find(w => !w.busy);
-  if (free) { free.busy = true; free.postMessage({ id, hexData, channelKey }); }
-  else _decoderQueue.push({ id, hexData, channelKey });
+  if (free) {
+    free.busy = true;
+    free.currentTaskId = id;
+    free.postMessage({ id, hexData, channelKey });
+  } else {
+    _decoderQueue.push({ id, hexData, channelKey });
+  }
 }
 
 for (let i = 0; i < DECODER_POOL_SIZE; i++) _decoderPool.push(_spawnDecoderWorker());
@@ -714,7 +732,7 @@ wss.on('connection', (ws) => {
 
     workerId = nextWorkerId;
     ws.workerId = workerId;
-    workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0, desiredInFlight: 1 });
+    workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0, desiredInFlight: 1, lastWorkerUpdateAt: 0 });
 
     console.log(`[ws] worker registered id=${workerId} total=${workers.size}`);
     setServerStatus('worker_registered', `Worker ${workerId} is online (${workers.size} total).`);
@@ -744,7 +762,6 @@ wss.on('connection', (ws) => {
         updateWorkerDesiredInFlight(workerId, msg.count);
         const expired = stmts.expireStaleChunks.run().changes;
         if (expired > 0) console.log(`[stale] re-queued ${expired} stale chunk(s)`);
-        setServerStatus('assigning_work', `Assigning work to ${workerId}...`);
         let chunks = assignWorkRespectingInFlight(workerId, msg.count || 1);
         // If the queue is empty, synchronously trigger lazy refill so workers
         // never stall waiting for the 5-second background interval to fire.
@@ -762,9 +779,6 @@ wss.on('connection', (ws) => {
           chunks,
           charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
         }));
-        setServerStatus('work_response', chunks.length > 0
-          ? `Sent ${chunks.length} chunk(s) to ${workerId}.`
-          : `No work available for ${workerId}; worker is waiting.`);
         broadcastStats();
         break;
       }
@@ -777,7 +791,6 @@ wss.on('connection', (ws) => {
           worker.chunksCompleted++;
           worker.hashRate = msg.hashRate || 0;
         }
-        setServerStatus('chunk_complete', `Chunk ${msg.chunkId} completed by ${workerId}.`);
         maybePushWork(workerId, 'chunk_complete');
         broadcastStats();
         broadcast({ type: 'worker_update', workerId, hashRate: msg.hashRate || 0 });
@@ -814,22 +827,19 @@ wss.on('connection', (ws) => {
         break;
       }
 
-      case 'key_found': {
-        console.log(`[FOUND] packet ${msg.packetId} cracked — channel="${msg.channelName}" key=${msg.key?.substring(0, 8)}...`);
-        stmts.updatePacketStatus.run('cracked', msg.key, msg.channelName || null, msg.packetId);
-        db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
-          .run(msg.packetId);
-        broadcast({ type: 'key_found', packetId: msg.packetId, key: msg.key, channelName: msg.channelName });
-        broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
-        broadcast({ type: 'packets', packets: stmts.getPackets.all() });
-        break;
-      }
-
       case 'hashrate_update': {
         if (!workerId) registerWorker(msg.clientId);
         const w = workers.get(workerId);
-        if (w) w.hashRate = msg.hashRate || 0;
-        broadcast({ type: 'worker_update', workerId, hashRate: msg.hashRate || 0 });
+        if (w) {
+          w.hashRate = msg.hashRate || 0;
+          // Throttle broadcasts to once per second per worker to avoid an
+          // O(workers²) message storm when many clients are active.
+          const now = Date.now();
+          if (now - w.lastWorkerUpdateAt >= 1000) {
+            w.lastWorkerUpdateAt = now;
+            broadcast({ type: 'worker_update', workerId, hashRate: w.hashRate });
+          }
+        }
         break;
       }
 
@@ -911,7 +921,8 @@ app.post('/api/packets', (req, res) => {
     decoded = extractChannelHash(hexData);
     channelHash = decoded.channelHash;
     if (channelHash !== null && channelHash !== undefined) {
-      prefix = parseInt(channelHash, 16);
+      // Decoder may return channelHash as a number (decimal) or a hex string
+      prefix = typeof channelHash === 'number' ? channelHash : parseInt(channelHash, 16);
     }
   } catch (err) {
     console.error('Decoder error:', err.message);
