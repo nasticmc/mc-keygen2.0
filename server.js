@@ -774,13 +774,17 @@ function maybePushWork(workerId, reason = 'scheduler') {
   const chunks = assignVirtualChunks(workerId, desired);
 
   if (chunks.length > 0) {
-    // Include raw packet data so clients can attempt decryption themselves
+    // Include raw packet data only once per packet per worker to avoid
+    // repeatedly sending large payloads over constrained websocket tunnels.
     const packetRawData = {};
+    const sentPacketRaw = worker.sentPacketRaw || new Set();
+    worker.sentPacketRaw = sentPacketRaw;
     for (const chunk of chunks) {
-      if (!(chunk.packet_id in packetRawData)) {
-        const pkt = stmts.getPacketById.get(chunk.packet_id);
-        if (pkt) packetRawData[chunk.packet_id] = pkt.raw_data;
-      }
+      if (sentPacketRaw.has(chunk.packet_id) || (chunk.packet_id in packetRawData)) continue;
+      const pkt = stmts.getPacketById.get(chunk.packet_id);
+      if (!pkt) continue;
+      packetRawData[chunk.packet_id] = pkt.raw_data;
+      sentPacketRaw.add(chunk.packet_id);
     }
     worker.ws.send(JSON.stringify({
       type: 'work',
@@ -788,7 +792,7 @@ function maybePushWork(workerId, reason = 'scheduler') {
       charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
       packetRawData,
     }));
-    console.log(`[sched] pushed ${chunks.length} chunk(s) to ${wName(workerId)} (${reason})`);
+    console.log(`[sched] pushed ${chunks.length} chunk(s) to ${wName(workerId)} (${reason}, raw_packets=${Object.keys(packetRawData).length})`);
     broadcastStats();
   }
 
@@ -902,7 +906,7 @@ wss.on('connection', (ws) => {
 
     workerId = nextWorkerId;
     ws.workerId = workerId;
-    workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0, desiredInFlight: 1, lastWorkerUpdateAt: 0 });
+    workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0, desiredInFlight: 1, lastWorkerUpdateAt: 0, sentPacketRaw: new Set() });
 
     console.log(`[ws] worker registered ${wName(workerId)} total=${workers.size}`);
     setServerStatus('worker_registered', `Worker ${workerIdToName(workerId)} is online (${workers.size} total).`);
@@ -937,14 +941,19 @@ wss.on('connection', (ws) => {
         // batches available client-side instead of starving on deficit math.
         const chunks = assignExactChunks(workerId, requestedCount);
         const packetRawData = {};
+        const worker = workers.get(workerId);
+        const sentPacketRaw = worker?.sentPacketRaw || new Set();
+        if (worker) worker.sentPacketRaw = sentPacketRaw;
         for (const chunk of chunks) {
-          if (!(chunk.packet_id in packetRawData)) {
-            const pkt = stmts.getPacketById.get(chunk.packet_id);
-            if (pkt) packetRawData[chunk.packet_id] = pkt.raw_data;
-          }
+          if (sentPacketRaw.has(chunk.packet_id) || (chunk.packet_id in packetRawData)) continue;
+          const pkt = stmts.getPacketById.get(chunk.packet_id);
+          if (!pkt) continue;
+          packetRawData[chunk.packet_id] = pkt.raw_data;
+          sentPacketRaw.add(chunk.packet_id);
         }
         const dbAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
-        console.log(`[work] ${wName(workerId)} requested=${requestedCount} → sending ${chunks.length} chunk(s) (db_assigned=${dbAssigned})`);
+        const rawPacketCount = Object.keys(packetRawData).length;
+        console.log(`[work] ${wName(workerId)} requested=${requestedCount} → sending ${chunks.length} chunk(s) (db_assigned=${dbAssigned}, raw_packets=${rawPacketCount})`);
         ws.send(JSON.stringify({
           type: 'work',
           solicited: true,
