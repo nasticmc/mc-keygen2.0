@@ -7,6 +7,7 @@ let loopRunning = false;
 let workRequestPending = false;
 let currentCharset = 'abcdefghijklmnopqrstuvwxyz';
 let serverChunkSize = 500000;
+let persistedClientId = localStorage.getItem('mc-worker-client-id') || '';
 const pendingWorkResolvers = [];
 const queuedWorkMessages = [];
 let lastCrackingStatus = 'Idle.';
@@ -44,6 +45,8 @@ function connectWebSocket() {
     }
     document.getElementById('connection-status').textContent = 'Connected';
     document.getElementById('connection-status').className = 'connected';
+    setCrackingStatus('Connected to server. Registering worker identity...');
+    ws.send(JSON.stringify({ type: 'worker_register', clientId: getClientId() }));
     if (cracking && !loopRunning) runCrackingLoop();
   };
 
@@ -51,6 +54,7 @@ function connectWebSocket() {
     document.getElementById('connection-status').textContent = 'Disconnected';
     document.getElementById('connection-status').className = 'disconnected';
     document.getElementById('worker-id').textContent = '';
+    setCrackingStatus('Socket disconnected. Reconnecting in 2s...');
     workRequestPending = false;
     clearInterval(ws._keepAliveTimer);
     setTimeout(connectWebSocket, 2000);
@@ -60,7 +64,7 @@ function connectWebSocket() {
   // intermediate proxies/load-balancers don't close the idle connection.
   ws._keepAliveTimer = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'keepalive' }));
+      ws.send(JSON.stringify({ type: 'keepalive', clientId: getClientId() }));
     }
   }, 15000);
 
@@ -95,7 +99,12 @@ function connectWebSocket() {
         updateWorkerDisplay(msg.workerId, msg.hashRate);
         break;
       case 'worker_hello':
+        setClientId(msg.workerId);
         document.getElementById('worker-id').textContent = `ID: ${msg.workerId}`;
+        setCrackingStatus(`Worker registered as ${msg.workerId}. Ready.`);
+        break;
+      case 'server_status':
+        updateServerStatus(msg);
         break;
       case 'worker_removed':
         workerData.delete(msg.workerId);
@@ -133,6 +142,26 @@ function waitForWork(timeoutMs = 5000) {
 
     pendingWorkResolvers.push(resolver);
   });
+}
+
+function getClientId() {
+  if (!persistedClientId) {
+    persistedClientId = `client-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+    localStorage.setItem('mc-worker-client-id', persistedClientId);
+  }
+  return persistedClientId;
+}
+
+function setClientId(id) {
+  if (!id) return;
+  persistedClientId = id;
+  localStorage.setItem('mc-worker-client-id', id);
+}
+
+function updateServerStatus(status) {
+  const phase = status.phase ? `(${status.phase}) ` : '';
+  const detail = status.detail || 'Server active.';
+  setCrackingStatus(`Server ${phase}${detail}`);
 }
 
 // ── Stats ───────────────────────────────────────────────────────────────────
@@ -634,7 +663,7 @@ document.getElementById('btn-stop-cracking').addEventListener('click', () => {
   setCrackingStatus('Stopped.');
   resetLocalProgress();
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'hashrate_update', hashRate: 0 }));
+    ws.send(JSON.stringify({ type: 'hashrate_update', hashRate: 0, clientId: getClientId() }));
   }
 });
 
@@ -660,7 +689,7 @@ async function runCrackingLoop() {
     // Kick off the first work request before entering the loop so there's no
     // idle time between starting and actually receiving work.
     workRequestPending = true;
-    ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
+    ws.send(JSON.stringify({ type: 'request_work', count: batchCount(), clientId: getClientId() }));
     let nextWork = waitForWork(25000);
 
     while (cracking && ws && ws.readyState === WebSocket.OPEN) {
@@ -685,7 +714,7 @@ async function runCrackingLoop() {
         }
         if (!workRequestPending) {
           workRequestPending = true;
-          ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
+          ws.send(JSON.stringify({ type: 'request_work', count: batchCount(), clientId: getClientId() }));
         }
         nextWork = waitForWork(15000);
         continue;
@@ -697,7 +726,7 @@ async function runCrackingLoop() {
       // hasn't arrived yet (e.g. after a waitForWork timeout).
       if (!workRequestPending) {
         workRequestPending = true;
-        ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
+        ws.send(JSON.stringify({ type: 'request_work', count: batchCount(), clientId: getClientId() }));
       }
       nextWork = waitForWork(90000);
 
@@ -714,7 +743,7 @@ async function runCrackingLoop() {
         setCrackingStatus(`Crunching ${chunks.length} chunk(s) at ${formatHashRate(hashRate)}.`);
         setLocalProgress(processed, total);
         if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'hashrate_update', hashRate }));
+          ws.send(JSON.stringify({ type: 'hashrate_update', hashRate, clientId: getClientId() }));
         }
       }, currentCharset);
 
