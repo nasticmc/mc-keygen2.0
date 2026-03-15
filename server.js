@@ -918,13 +918,10 @@ wss.on('connection', (ws) => {
         const requestedCount = Math.max(1, Math.min(64, parseInt(msg.count, 10) || 1));
         const expired = recycleStaleChunks();
         if (expired > 0) console.log(`[stale] recycled ${expired} stale chunk(s) back to virtual pool`);
-        // Keep the worker near the requested outstanding chunk count.
-        // This prevents over-assignment when multiple request_work messages
-        // overlap in flight and keeps server-side assigned counts aligned
-        // with what the client can realistically hold.
-        const alreadyAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
-        const toAssign = Math.max(0, requestedCount - alreadyAssigned);
-        const chunks = assignExactChunks(workerId, toAssign);
+        // Treat each request as additive demand from the client's local
+        // prefetch pipeline (topUpWorkQueue/minAhead). This keeps queued
+        // batches available client-side instead of starving on deficit math.
+        const chunks = assignExactChunks(workerId, requestedCount);
         const packetRawData = {};
         for (const chunk of chunks) {
           if (!(chunk.packet_id in packetRawData)) {
@@ -933,7 +930,7 @@ wss.on('connection', (ws) => {
           }
         }
         const dbAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
-        console.log(`[work] ${wName(workerId)} requested=${requestedCount} already_assigned=${alreadyAssigned} to_assign=${toAssign} → sending ${chunks.length} chunk(s) (db_assigned=${dbAssigned})`);
+        console.log(`[work] ${wName(workerId)} requested=${requestedCount} → sending ${chunks.length} chunk(s) (db_assigned=${dbAssigned})`);
         ws.send(JSON.stringify({
           type: 'work',
           solicited: true,
