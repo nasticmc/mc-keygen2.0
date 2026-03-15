@@ -573,6 +573,8 @@ const assignExactChunks = db.transaction((workerId, count) => {
 // Runs MeshCorePacketDecoder in worker threads so the main event loop is never
 // blocked while verifying prefix-match candidates.  Pool size = min(cpus-1, 4).
 const DECODER_POOL_SIZE = Math.max(1, os.cpus().length - 1);
+const DECODER_QUEUE_MAX = 500;
+const DECODER_CALLBACK_TIMEOUT_MS = 5 * 60_000; // 5 minutes
 const _decoderPool = [];
 const _decoderQueue = [];
 let _decoderTaskId = 0;
@@ -585,14 +587,22 @@ function _spawnDecoderWorker() {
   w.on('message', ({ id, ...result }) => {
     w.busy = false;
     w.currentTaskId = null;
-    const cb = _decoderCallbacks.get(id);
-    if (cb) { _decoderCallbacks.delete(id); cb(result); }
+    const entry = _decoderCallbacks.get(id);
+    if (entry) {
+      _decoderCallbacks.delete(id);
+      clearTimeout(entry.timer);
+      entry.cb(result);
+    }
     _drainDecoderPool(w);
   });
   const _failInFlight = (reason) => {
     if (w.currentTaskId != null) {
-      const cb = _decoderCallbacks.get(w.currentTaskId);
-      if (cb) { _decoderCallbacks.delete(w.currentTaskId); cb({ success: false, error: reason }); }
+      const entry = _decoderCallbacks.get(w.currentTaskId);
+      if (entry) {
+        _decoderCallbacks.delete(w.currentTaskId);
+        clearTimeout(entry.timer);
+        entry.cb({ success: false, error: reason });
+      }
       w.currentTaskId = null;
     }
     w.busy = false;
@@ -626,8 +636,27 @@ function _drainDecoderPool(worker) {
 }
 
 function decodeAsync(hexData, channelKey, cb) {
+  // Reject immediately if the queue is overloaded to prevent memory buildup
+  if (_decoderQueue.length >= DECODER_QUEUE_MAX) {
+    console.warn(`[decoder-pool] queue full (${_decoderQueue.length}), rejecting decode task`);
+    cb({ success: false, error: 'decoder queue full' });
+    return;
+  }
+
   const id = _decoderTaskId++;
-  _decoderCallbacks.set(id, cb);
+
+  // Wrap callback with a timeout to prevent leaked entries in _decoderCallbacks
+  const timer = setTimeout(() => {
+    const entry = _decoderCallbacks.get(id);
+    if (entry) {
+      _decoderCallbacks.delete(id);
+      console.warn(`[decoder-pool] task ${id} timed out after ${DECODER_CALLBACK_TIMEOUT_MS / 1000}s (pending callbacks=${_decoderCallbacks.size} queue=${_decoderQueue.length})`);
+      entry.cb({ success: false, error: 'decode timeout' });
+    }
+  }, DECODER_CALLBACK_TIMEOUT_MS);
+
+  _decoderCallbacks.set(id, { cb, timer });
+
   const free = _decoderPool.find(w => !w.busy);
   if (free) {
     free.busy = true;
@@ -842,9 +871,11 @@ setInterval(() => {
   const workerDetails = [];
   for (const [id, w] of workers) {
     const assigned = stmts.countAssignedToWorker.get(id)?.cnt || 0;
-    workerDetails.push(`${workerIdToName(id)}:${formatHashRate(w.hashRate)}/a=${assigned}/d=${w.chunksCompleted}`);
+    const idle = w.registeredAt && !w.firstWorkRequestAt ? ` IDLE_${Math.round((Date.now() - w.registeredAt) / 1000)}s` : '';
+    workerDetails.push(`${workerIdToName(id)}:${formatHashRate(w.hashRate)}/a=${assigned}/d=${w.chunksCompleted}${idle}`);
   }
-  console.log(`[health] workers=${workers.size} pending=${s.pending} assigned=${s.assigned} completed=${s.completed} rate=${formatHashRate(getTotalHashRate())} rss=${Math.round(m.rss / 1024 / 1024)}MB`);
+  const decoderBusy = _decoderPool.filter(w => w.busy).length;
+  console.log(`[health] workers=${workers.size} pending=${s.pending} assigned=${s.assigned} completed=${s.completed} rate=${formatHashRate(getTotalHashRate())} rss=${Math.round(m.rss / 1024 / 1024)}MB heap=${Math.round(m.heapUsed / 1024 / 1024)}MB decoder_q=${_decoderQueue.length} decoder_cb=${_decoderCallbacks.size} decoder_busy=${decoderBusy}/${_decoderPool.length}`);
   if (workerDetails.length > 0) console.log(`[health] ${workerDetails.join(' | ')}`);
 }, 30_000);
 
@@ -944,7 +975,7 @@ wss.on('connection', (ws, req) => {
 
     workerId = nextWorkerId;
     ws.workerId = workerId;
-    workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0, desiredInFlight: 1, lastWorkerUpdateAt: 0, sentPacketRaw: new Set() });
+    workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0, desiredInFlight: 1, lastWorkerUpdateAt: 0, sentPacketRaw: new Set(), registeredAt: Date.now(), firstWorkRequestAt: 0 });
 
     console.log(`[ws] worker registered ${wName(workerId)} total=${workers.size}`);
     setServerStatus('worker_registered', `Worker ${workerIdToName(workerId)} is online (${workers.size} total).`);
@@ -975,6 +1006,12 @@ wss.on('connection', (ws, req) => {
 
       case 'request_work': {
         if (!workerId) registerWorker(msg.clientId);
+        const worker_ = workers.get(workerId);
+        if (worker_ && !worker_.firstWorkRequestAt) {
+          worker_.firstWorkRequestAt = Date.now();
+          const regDelay = worker_.registeredAt ? Date.now() - worker_.registeredAt : -1;
+          console.log(`[ws-diag] first work request from ${wName(workerId)} (${regDelay}ms after registration)`);
+        }
         const requestedCount = Math.max(1, Math.min(64, parseInt(msg.count, 10) || 1));
         const expired = recycleStaleChunks();
         if (expired > 0) console.log(`[stale] recycled ${expired} stale chunk(s) back to virtual pool`);
@@ -1259,6 +1296,10 @@ app.delete('/api/packets/:id', (req, res) => {
   db.prepare('DELETE FROM work_chunks WHERE packet_id = ?').run(id);
   db.prepare('DELETE FROM candidate_keys WHERE packet_id = ?').run(id);
   db.prepare('DELETE FROM packets WHERE id = ?').run(id);
+  // Clean up sentPacketRaw so deleted packet IDs don't accumulate
+  for (const [, w] of workers) {
+    if (w.sentPacketRaw) w.sentPacketRaw.delete(id);
+  }
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
   broadcastStats();
   res.json({ ok: true });
