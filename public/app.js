@@ -41,6 +41,8 @@ let persistedClientId = localStorage.getItem('mc-worker-client-id') || '';
 const pendingWorkResolvers = [];
 const queuedWorkMessages = [];
 let lastCrackingStatus = 'Idle.';
+let lastWsMessageAt = 0;
+let consecutiveWorkTimeouts = 0;
 
 const charsetByKey = {
   alnum: 'abcdefghijklmnopqrstuvwxyz0123456789',
@@ -68,6 +70,8 @@ function connectWebSocket() {
     clog(`websocket connected (stale resolvers: ${pendingWorkResolvers.length}, queued: ${queuedWorkMessages.length})`);
     workRequestsInFlight = 0;
     workRequestSentAt = 0;
+    lastWsMessageAt = Date.now();
+    consecutiveWorkTimeouts = 0;
     const staleResolvers = pendingWorkResolvers.splice(0);
     queuedWorkMessages.length = 0;
     for (const resolve of staleResolvers) {
@@ -109,6 +113,7 @@ function connectWebSocket() {
   }, 15000);
 
   ws.onmessage = (event) => {
+    lastWsMessageAt = Date.now();
     const msg = JSON.parse(event.data);
     switch (msg.type) {
       case 'worker_count':
@@ -159,6 +164,7 @@ function connectWebSocket() {
         }
 
         const chunkCount = msg.chunks?.length || 0;
+        if (chunkCount > 0) consecutiveWorkTimeouts = 0;
 
         // Empty replies are useful to satisfy a waiter, but should never be
         // queued as "available work" or they inflate queued batch/chunk counts.
@@ -227,7 +233,7 @@ function waitForWork(timeoutMs = 5000) {
     const timeout = setTimeout(() => {
       const idx = pendingWorkResolvers.indexOf(resolver);
       if (idx >= 0) pendingWorkResolvers.splice(idx, 1);
-      resolve({ chunks: [] });
+      resolve({ chunks: [], _timeout: true });
     }, timeoutMs);
 
     const resolver = (msg) => {
@@ -795,17 +801,31 @@ async function runCrackingLoop() {
 
       if (chunks.length === 0) {
         if (response._reconnected) {
+          consecutiveWorkTimeouts = 0;
           clog('woke from reconnect — re-requesting work');
         } else {
-          clog(`empty response after ${waitMs}ms (inFlight=${workRequestsInFlight} queued=${queuedWorkMessages.length})`);
+          if (response._timeout) consecutiveWorkTimeouts++;
+          clog(`empty response after ${waitMs}ms (timeout=${response._timeout ? 'yes' : 'no'} #${consecutiveWorkTimeouts} inFlight=${workRequestsInFlight} queued=${queuedWorkMessages.length})`);
           setCrackingStatus(`No work available — retrying (waited ${waitMs}ms)...`);
         }
         if (!cracking || !ws || ws.readyState !== WebSocket.OPEN) break;
-        if (workRequestsInFlight > 0 && queuedWorkMessages.length === 0 && (Date.now() - workRequestSentAt) > 10000) {
-          clog('stuck request detected — resetting in-flight counter');
+
+        const silentForMs = Date.now() - lastWsMessageAt;
+        if (response._timeout && workRequestsInFlight > 0 && queuedWorkMessages.length === 0 && (Date.now() - workRequestSentAt) > 5000) {
+          clog(`stuck request detected — resetting in-flight counter (silent=${silentForMs}ms)`);
           workRequestsInFlight = 0;
           workRequestSentAt = 0;
         }
+
+        // Half-open tunnel recovery: if we repeatedly time out while requests
+        // are in flight and have seen no inbound websocket traffic, force a
+        // reconnect so the loop can resume on a fresh socket.
+        if (response._timeout && consecutiveWorkTimeouts >= 3 && workRequestsInFlight > 0 && silentForMs > 15000) {
+          clog(`possible tunnel stall detected (silent=${silentForMs}ms, timeouts=${consecutiveWorkTimeouts}) — forcing websocket reconnect`);
+          try { ws.close(); } catch (_) {}
+          break;
+        }
+
         topUpWorkQueue();
         nextWork = waitForWork(5000);
         continue;
