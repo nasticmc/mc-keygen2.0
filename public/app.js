@@ -628,6 +628,7 @@ document.getElementById('btn-stop-cracking').addEventListener('click', () => {
   document.getElementById('btn-start-cracking').classList.remove('hidden');
   document.getElementById('btn-stop-cracking').classList.add('hidden');
   setCrackingStatus('Stopped.');
+  resetLocalProgress();
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'hashrate_update', hashRate: 0 }));
   }
@@ -693,13 +694,22 @@ async function runCrackingLoop() {
       const packetIds = [...new Set(chunks.map(c => c.packet_id))];
       setCrackingStatus(`Processing ${chunks.length} chunk(s) for packet ${packetIds.join(', ')}...`);
 
-      await cracker.processChunks(chunks, ws, (hashRate) => {
+      // Show chunk count label and reset local progress bar before processing starts.
+      document.getElementById('local-chunk-label').textContent =
+        `${chunks.length} chunk${chunks.length !== 1 ? 's' : ''}`;
+      setLocalProgress(0, 1);
+
+      await cracker.processChunks(chunks, ws, (hashRate, processed, total) => {
         document.getElementById('stat-hashrate').textContent = formatHashRate(hashRate);
         setCrackingStatus(`Crunching ${chunks.length} chunk(s) at ${formatHashRate(hashRate)}.`);
+        setLocalProgress(processed, total);
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'hashrate_update', hashRate }));
         }
       }, currentCharset);
+
+      // Fill bar to 100% once the batch finishes.
+      setLocalProgress(1, 1);
     }
   } finally {
     loopRunning = false;
@@ -735,6 +745,25 @@ function setCrackingStatus(text) {
   lastCrackingStatus = text;
   const el = document.getElementById('cracking-feedback');
   if (el) el.textContent = text;
+}
+
+function setLocalProgress(processed, total) {
+  const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
+  const bar = document.getElementById('local-progress-bar');
+  const text = document.getElementById('local-progress-text');
+  if (bar) bar.style.width = `${pct}%`;
+  if (text) text.textContent = total > 0
+    ? `${pct}% (${formatNumber(processed)} / ${formatNumber(total)})`
+    : '—';
+}
+
+function resetLocalProgress() {
+  const bar = document.getElementById('local-progress-bar');
+  const text = document.getElementById('local-progress-text');
+  const label = document.getElementById('local-chunk-label');
+  if (bar) bar.style.width = '0%';
+  if (text) text.textContent = '—';
+  if (label) label.textContent = '';
 }
 
 // ── Notifications ───────────────────────────────────────────────────────────

@@ -92,9 +92,21 @@
         </div>
       </div>
 
+      <div class="progress-label-row">
+        <span class="progress-label">Overall queue</span>
+      </div>
       <div class="progress-bar-container">
         <div class="progress-bar" id="progress-bar"></div>
         <span class="progress-text" id="progress-text">0%</span>
+      </div>
+
+      <div class="progress-label-row">
+        <span class="progress-label">This device</span>
+        <span class="progress-label-right" id="local-chunk-label"></span>
+      </div>
+      <div class="progress-bar-container">
+        <div class="progress-bar local-progress-bar" id="local-progress-bar"></div>
+        <span class="progress-text" id="local-progress-text">—</span>
       </div>
 
       <div id="cracking-feedback" class="cracking-feedback">Idle.</div>
