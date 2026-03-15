@@ -400,19 +400,6 @@ class GPUCracker {
       console.debug(`[gpu] processing ${chunks.length} chunk(s) as ${batches.length} GPU batch(es), batchSize=${batchSize}`);
     } catch (_) {}
 
-    // Pre-check packet type once per chunk to decide if client decrypt is worth trying.
-    // parseMeshCorePacket is synchronous so this costs nothing.
-    const _packetTypeCache = {};
-    const isGroupTextPacket = (packetId) => {
-      if (_packetTypeCache[packetId] !== undefined) return _packetTypeCache[packetId];
-      const rawData = packetRawData[packetId];
-      if (!rawData || typeof parseMeshCorePacket !== 'function') {
-        return (_packetTypeCache[packetId] = false);
-      }
-      const parsed = parseMeshCorePacket(rawData);
-      return (_packetTypeCache[packetId] = (parsed !== null && parsed.payloadType === 5 /* GROUP_TEXT */));
-    };
-
     const sendMatches = async (matches, chunk) => {
       if (matches.length === 0) return;
 
@@ -426,10 +413,6 @@ class GPUCracker {
         : matches;
 
       const prefixHex = chunk.target_prefix.toString(16).padStart(2, '0');
-      const rawData = packetRawData[chunk.packet_id];
-      const canClientDecrypt = rawData
-        && typeof clientTryDecrypt === 'function'
-        && isGroupTextPacket(chunk.packet_id);
 
       // Build base entries synchronously (no awaits in the loop)
       const entries = [];
@@ -443,10 +426,10 @@ class GPUCracker {
 
       if (entries.length === 0) return;
 
-      // For GroupText packets attempt client-side decrypt in parallel (not serially)
-      // so the event loop is only blocked for a single microtask batch per dispatch
-      // rather than 256+ sequential awaits.
-      if (canClientDecrypt) {
+      // All stored packets are GroupText — attempt client-side decrypt in parallel
+      // so the event loop is only blocked for a single microtask batch per dispatch.
+      const rawData = packetRawData[chunk.packet_id];
+      if (rawData && typeof clientTryDecrypt === 'function') {
         const decodeResults = await Promise.all(
           entries.map(e => clientTryDecrypt(rawData, e.keyHex).catch(() => null))
         );

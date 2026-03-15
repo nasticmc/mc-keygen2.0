@@ -1205,6 +1205,16 @@ app.post('/api/packets', (req, res) => {
     return res.status(400).json({ error: 'Could not extract channel hash from packet' });
   }
 
+  // Validate payload type from the packet header bits — only GroupText (type 5) is supported.
+  // Bit layout of first byte: [7:6]=unused [5:2]=payloadType [1:0]=routeType
+  const firstByte = parseInt(hexData.slice(0, 2), 16);
+  const packetPayloadType = (firstByte >> 2) & 0x0F;
+  if (packetPayloadType !== 5) {
+    return res.status(400).json({
+      error: `Only GroupText packets (payload type 5) are supported. This packet has payload type ${packetPayloadType}.`,
+    });
+  }
+
   const prefixHex = prefix.toString(16).padStart(2, '0');
 
   // Check against known channels with matching prefix
