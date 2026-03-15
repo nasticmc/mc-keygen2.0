@@ -318,7 +318,7 @@ const stmts = {
   // Stale chunks: find them for recycling back into the virtual pool
   getStaleChunks: db.prepare(`
     SELECT id, packet_id, range_start FROM work_chunks
-    WHERE status = 'assigned' AND assigned_at < datetime('now', '-5 minutes')
+    WHERE status = 'assigned' AND assigned_at < datetime('now', '-10 minutes')
   `),
   deleteChunkById: db.prepare('DELETE FROM work_chunks WHERE id = ?'),
   insertCandidate: db.prepare('INSERT OR IGNORE INTO candidate_keys (packet_id, channel_name, key, prefix, verified, decode_success) VALUES (?, ?, ?, ?, 1, 1)'),
@@ -884,13 +884,22 @@ wss.on('connection', (ws) => {
       case 'chunk_complete': {
         if (!workerId) registerWorker(msg.clientId);
         const result = stmts.completeChunk.run(msg.chunkId, workerId);
+        let completionNote = '';
+        if (result.changes === 0) {
+          // Chunk may have been recycled (stale) or reassigned to another worker.
+          // Delete it by ID so the work isn't repeated — it's already done.
+          const deleted = stmts.deleteChunkById.run(msg.chunkId);
+          completionNote = deleted.changes > 0
+            ? ' (chunk was recycled/reassigned — deleted to prevent re-work)'
+            : ' (chunk not found in DB — already cleaned up)';
+        }
         const worker = workers.get(workerId);
         if (worker) {
           worker.chunksCompleted++;
           worker.hashRate = msg.hashRate || 0;
         }
         const remainingAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
-        console.log(`[done] ${wName(workerId)} chunk=${msg.chunkId} total_done=${worker?.chunksCompleted || '?'} remaining=${remainingAssigned} rate=${formatHashRate(msg.hashRate || 0)}${result.changes === 0 ? ' (WARNING: chunk not found or not assigned to this worker)' : ''}`);
+        console.log(`[done] ${wName(workerId)} chunk=${msg.chunkId} total_done=${worker?.chunksCompleted || '?'} remaining=${remainingAssigned} rate=${formatHashRate(msg.hashRate || 0)}${completionNote}`);
         maybePushWork(workerId, 'chunk_complete');
         broadcastStats();
         broadcast({ type: 'worker_update', workerId, hashRate: msg.hashRate || 0 });
