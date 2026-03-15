@@ -826,8 +826,12 @@ wss.on('connection', (ws) => {
         const batchPacket = stmts.getPacketById.get(batchPacketId);
         if (!batchPacket || batchPacket.status === 'cracked') break;
 
-        // If a client already decoded a match, skip the decoder worker pool
-        const preDecoded = batchMatches.find(m => m.clientDecoded);
+        // If a client already decoded a match, validate it then skip the decoder pool
+        const preDecoded = batchMatches.find(m => {
+          if (!m.clientDecoded) return false;
+          const v = validateDecryptedContent(m.clientDecoded);
+          return v.valid;
+        });
         if (preDecoded) {
           persistWinningCandidate(batchPacketId, preDecoded.channelName, preDecoded.keyHex, preDecoded.prefixHex);
           broadcast({ type: 'candidate_found', packetId: batchPacketId, channelName: preDecoded.channelName, key: preDecoded.keyHex, prefix: preDecoded.prefixHex });
