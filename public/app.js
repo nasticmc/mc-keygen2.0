@@ -151,15 +151,19 @@ function connectWebSocket() {
         refreshWorkerDisplay();
         break;
       case 'work':
-        workRequestsInFlight = Math.max(0, workRequestsInFlight - 1);
-        if (workRequestsInFlight === 0) workRequestSentAt = 0;
+        // Only decrement inFlight for solicited responses (replies to request_work).
+        // Unsolicited pushes from maybePushWork should not affect the counter.
+        if (msg.solicited) {
+          workRequestsInFlight = Math.max(0, workRequestsInFlight - 1);
+          if (workRequestsInFlight === 0) workRequestSentAt = 0;
+        }
         if (pendingWorkResolvers.length > 0) {
           const resolve = pendingWorkResolvers.shift();
           resolve(msg);
         } else {
           queuedWorkMessages.push(msg);
         }
-        clog(`work received: ${msg.chunks?.length || 0} chunk(s) — queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight} waiting=${pendingWorkResolvers.length}`);
+        clog(`work received: ${msg.chunks?.length || 0} chunk(s) [${msg.solicited ? 'solicited' : 'push'}] — queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight} waiting=${pendingWorkResolvers.length}`);
         break;
     }
   };

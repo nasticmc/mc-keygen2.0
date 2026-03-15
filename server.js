@@ -700,10 +700,9 @@ function maybePushWork(workerId, reason = 'scheduler') {
   const desired = worker.desiredInFlight || 1;
   const assigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
 
-  // Only push when assigned drops below half of desired — this batches
-  // the push so we send a meaningful number of chunks at once instead
-  // of drip-feeding 1 per chunk_complete.
-  const pushThreshold = Math.max(1, Math.ceil(desired / 2));
+  // Push when assigned drops below 3/4 of desired — keeps the pipeline
+  // well-fed without pushing on every single chunk_complete.
+  const pushThreshold = Math.max(1, Math.ceil(desired * 3 / 4));
   if (assigned >= pushThreshold) return 0;
 
   const chunks = assignVirtualChunks(workerId, desired);
@@ -873,6 +872,7 @@ wss.on('connection', (ws) => {
         console.log(`[work] ${wName(workerId)} requested=${requestedCount} assigned=${alreadyAssigned} target=${newTarget} → sending ${chunks.length} chunk(s)`);
         ws.send(JSON.stringify({
           type: 'work',
+          solicited: true,
           chunks,
           charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
           packetRawData,
