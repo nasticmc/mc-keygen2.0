@@ -37,12 +37,18 @@ let workRequestSentAt = 0;
 let currentCharset = 'abcdefghijklmnopqrstuvwxyz';
 let serverChunkSize = 500000;
 let lastMeasuredHashRate = 0;
-let persistedClientId = localStorage.getItem('mc-worker-client-id') || '';
+let persistedClientId = '';
+try { persistedClientId = localStorage.getItem('mc-worker-client-id') || ''; }
+catch (e) { clog(`⚠ localStorage unavailable: ${e.message}`); }
 const pendingWorkResolvers = [];
 const queuedWorkMessages = [];
 let lastCrackingStatus = 'Idle.';
 let lastWsMessageAt = 0;
 let consecutiveWorkTimeouts = 0;
+let wsConnectCount = 0;
+let wsLastCloseCode = null;
+let wsLastCloseReason = '';
+let tabHiddenSince = 0;
 
 const charsetByKey = {
   alnum: 'abcdefghijklmnopqrstuvwxyz0123456789',
@@ -50,6 +56,57 @@ const charsetByKey = {
   numeric: '0123456789',
   full: 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.',
 };
+
+// ── Diagnostic: Visibility Change ────────────────────────────────────────────
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    tabHiddenSince = Date.now();
+    clog(`🔍 tab hidden (cracking=${cracking} loopRunning=${loopRunning} wsState=${ws?.readyState})`);
+  } else {
+    const hiddenMs = tabHiddenSince ? Date.now() - tabHiddenSince : 0;
+    clog(`🔍 tab visible after ${hiddenMs}ms (cracking=${cracking} loopRunning=${loopRunning} wsState=${ws?.readyState} queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight})`);
+    tabHiddenSince = 0;
+    // Force a keepalive after returning from background to detect stale sockets
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'keepalive', clientId: getClientId() }));
+    }
+  }
+});
+
+// ── Diagnostic: Environment Capabilities ─────────────────────────────────────
+function logEnvironmentDiagnostics() {
+  const diag = {
+    userAgent: navigator.userAgent,
+    platform: navigator.platform,
+    secureContext: window.isSecureContext,
+    protocol: location.protocol,
+    host: location.host,
+    hasWebGPU: !!navigator.gpu,
+    hasCryptoUUID: typeof crypto.randomUUID === 'function',
+    hasLocalStorage: false,
+    screenW: screen.width,
+    screenH: screen.height,
+    innerW: window.innerWidth,
+    innerH: window.innerHeight,
+    isMobile: isMobile(),
+    connection: null,
+  };
+  try { localStorage.setItem('_diag_test', '1'); localStorage.removeItem('_diag_test'); diag.hasLocalStorage = true; }
+  catch { diag.hasLocalStorage = false; }
+  if (navigator.connection) {
+    diag.connection = {
+      type: navigator.connection.type,
+      effectiveType: navigator.connection.effectiveType,
+      downlink: navigator.connection.downlink,
+      rtt: navigator.connection.rtt,
+    };
+  }
+  clog(`🔍 ENV: ${JSON.stringify(diag)}`);
+  if (!diag.secureContext) clog('⚠ NOT a secure context — crypto.randomUUID() will fail');
+  if (!diag.hasCryptoUUID) clog('⚠ crypto.randomUUID not available — client ID generation will fail');
+  if (!diag.hasLocalStorage) clog('⚠ localStorage not available — client ID will not persist across reloads');
+  if (!diag.hasWebGPU) clog('⚠ WebGPU not available — will use CPU fallback');
+}
 
 // ── Tab Navigation ──────────────────────────────────────────────────────────
 document.querySelectorAll('.tab').forEach(tab => {
@@ -67,7 +124,8 @@ function connectWebSocket() {
   ws = new WebSocket(`${protocol}//${location.host}`);
 
   ws.onopen = () => {
-    clog(`websocket connected (stale resolvers: ${pendingWorkResolvers.length}, queued: ${queuedWorkMessages.length})`);
+    wsConnectCount++;
+    clog(`🔍 websocket connected (#${wsConnectCount}, stale resolvers: ${pendingWorkResolvers.length}, queued: ${queuedWorkMessages.length}, prevClose: ${wsLastCloseCode}/${wsLastCloseReason || 'none'})`);
     workRequestsInFlight = 0;
     workRequestSentAt = 0;
     lastWsMessageAt = Date.now();
@@ -87,16 +145,23 @@ function connectWebSocket() {
     }
   };
 
-  ws.onclose = () => {
-    clog('websocket disconnected');
+  ws.onclose = (event) => {
+    wsLastCloseCode = event.code;
+    wsLastCloseReason = event.reason || '';
+    const silentMs = lastWsMessageAt ? Date.now() - lastWsMessageAt : -1;
+    clog(`🔍 websocket closed (code=${event.code} reason="${wsLastCloseReason}" wasClean=${event.wasClean} silentFor=${silentMs}ms cracking=${cracking} loopRunning=${loopRunning})`);
     document.getElementById('connection-status').textContent = 'Disconnected';
     document.getElementById('connection-status').className = 'disconnected';
     document.getElementById('worker-id').textContent = '';
-    setCrackingStatus('Socket disconnected. Reconnecting in 2s...');
+    setCrackingStatus(`Socket disconnected (code ${event.code}). Reconnecting in 2s...`);
     workRequestsInFlight = 0;
     workRequestSentAt = 0;
     clearInterval(ws._keepAliveTimer);
     setTimeout(connectWebSocket, 2000);
+  };
+
+  ws.onerror = (event) => {
+    clog(`🔍 websocket error (readyState=${ws.readyState} type=${event.type})`);
   };
 
   // Application-level keep-alive: send a lightweight ping every 15s so that
@@ -247,8 +312,15 @@ function waitForWork(timeoutMs = 5000) {
 
 function getClientId() {
   if (!persistedClientId) {
-    persistedClientId = `client-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
-    localStorage.setItem('mc-worker-client-id', persistedClientId);
+    try {
+      persistedClientId = `client-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+    } catch (e) {
+      // Fallback for non-secure contexts where crypto.randomUUID() is unavailable
+      persistedClientId = `client-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+      clog(`⚠ crypto.randomUUID() failed (${e.message}), using fallback ID: ${persistedClientId}`);
+    }
+    try { localStorage.setItem('mc-worker-client-id', persistedClientId); }
+    catch (e) { clog(`⚠ localStorage.setItem failed: ${e.message}`); }
   }
   return persistedClientId;
 }
@@ -256,7 +328,8 @@ function getClientId() {
 function setClientId(id) {
   if (!id) return;
   persistedClientId = id;
-  localStorage.setItem('mc-worker-client-id', id);
+  try { localStorage.setItem('mc-worker-client-id', id); }
+  catch (e) { clog(`⚠ localStorage.setItem failed: ${e.message}`); }
 }
 
 function updateServerStatus(status) {
@@ -1005,6 +1078,8 @@ function updateKeyspaceEstimate() {
 
 // ── Boot ────────────────────────────────────────────────────────────────────
 (async () => {
+  logEnvironmentDiagnostics();
+
   // Set work batch default based on device type
   const batchInput = document.getElementById('work-batch-count');
   if (batchInput) {

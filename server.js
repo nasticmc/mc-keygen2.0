@@ -814,6 +814,7 @@ function safeSend(ws, data, label = 'msg') {
   ws.backpressureSince = 0;
   try {
     ws.send(typeof data === 'string' ? data : JSON.stringify(data));
+    ws._diagMessagesSent = (ws._diagMessagesSent || 0) + 1;
     return true;
   } catch (err) {
     if (ws.workerId) console.warn(`[ws] send failed ${label} to ${wName(ws.workerId)}: ${err.message}`);
@@ -870,7 +871,8 @@ const heartbeatInterval = setInterval(() => {
           console.warn(`[ws] missed heartbeat ${wName(client.workerId)} miss=${client.missedPings}/${HEARTBEAT_MISS_LIMIT}`);
         }
         if (client.missedPings >= HEARTBEAT_MISS_LIMIT) {
-          if (client.workerId) console.warn(`[ws] terminating unresponsive worker ${wName(client.workerId)}`);
+          const uptimeSec = client._diagConnectedAt ? Math.round((Date.now() - client._diagConnectedAt) / 1000) : -1;
+          console.warn(`[ws-diag] terminating unresponsive worker=${wName(client.workerId)} from=${client._diagRemoteAddr} ua="${(client._diagUserAgent || '').substring(0, 80)}" uptime=${uptimeSec}s msgs_recv=${client._diagMessagesReceived || 0} msgs_sent=${client._diagMessagesSent || 0}`);
           client.terminate();
           return;
         }
@@ -910,8 +912,16 @@ setInterval(() => {
   if (wss.clients.size > 0) broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats(), totalHashRate: getTotalHashRate() });
 }, 2000);
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   let workerId = null;
+  const remoteAddr = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const connUserAgent = (req.headers['user-agent'] || 'unknown').substring(0, 120);
+  ws._diagRemoteAddr = remoteAddr;
+  ws._diagUserAgent = connUserAgent;
+  ws._diagConnectedAt = Date.now();
+  ws._diagMessagesReceived = 0;
+  ws._diagMessagesSent = 0;
+  console.log(`[ws-diag] new connection from=${remoteAddr} ua="${connUserAgent}" total_clients=${wss.clients.size}`);
   markConnectionAlive(ws);
   ws.on('pong', () => markConnectionAlive(ws));
   setServerStatus('connection', 'Worker socket connected. Waiting for registration...');
@@ -944,8 +954,12 @@ wss.on('connection', (ws) => {
   }
 
   ws.on('message', (raw) => {
+    ws._diagMessagesReceived = (ws._diagMessagesReceived || 0) + 1;
     let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
+    try { msg = JSON.parse(raw); } catch (e) {
+      console.warn(`[ws-diag] unparseable message from=${ws._diagRemoteAddr} worker=${wName(workerId)} len=${raw.length} err=${e.message}`);
+      return;
+    }
 
     // Any successfully parsed message proves the client is still responsive,
     // even if it skipped websocket pong frames while busy processing work.
@@ -1117,7 +1131,10 @@ wss.on('connection', (ws) => {
     if (_elapsed > 100) console.warn(`[ws-slow] ${msg.type} took ${_elapsed}ms (${wName(workerId)})`);
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code, reason) => {
+    const uptime = ws._diagConnectedAt ? Math.round((Date.now() - ws._diagConnectedAt) / 1000) : -1;
+    const reasonStr = reason?.toString() || '';
+    console.log(`[ws-diag] close code=${code} reason="${reasonStr}" worker=${wName(workerId)} from=${ws._diagRemoteAddr} uptime=${uptime}s msgs_recv=${ws._diagMessagesReceived || 0} msgs_sent=${ws._diagMessagesSent || 0}`);
     if (!workerId) return;
     const w = workers.get(workerId);
     releaseWorkerChunks(workerId);
@@ -1127,6 +1144,10 @@ wss.on('connection', (ws) => {
     broadcast({ type: 'worker_removed', workerId });
     broadcast({ type: 'worker_count', count: workers.size });
     broadcastStats();
+  });
+
+  ws.on('error', (err) => {
+    console.warn(`[ws-diag] error worker=${wName(workerId)} from=${ws._diagRemoteAddr} err=${err.message}`);
   });
 });
 
