@@ -466,6 +466,7 @@ class GPUCracker {
     // behind GPU compute time.
     let pending = null; // { promise, bufSetIdx, batch }
     let pingPong = 0;
+    let _lastYield = performance.now();
 
     for (let i = 0; i < batches.length; i++) {
       if (!this.running) break;
@@ -485,6 +486,15 @@ class GPUCracker {
         } catch (err) {
           console.error('GPU readback error:', err);
         }
+      }
+
+      // Yield to the macrotask queue periodically so WebSocket onmessage
+      // events can fire.  Without this, pushed work messages pile up in
+      // the network buffer and the client appears idle to the server.
+      const now = performance.now();
+      if (now - _lastYield > 500) {
+        _lastYield = now;
+        await new Promise(r => setTimeout(r, 0));
       }
 
       // Kick off async readback for the batch we just dispatched.

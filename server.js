@@ -852,13 +852,8 @@ wss.on('connection', (ws) => {
         if (!workerId) registerWorker(msg.clientId);
         const requestedCount = Math.max(1, parseInt(msg.count, 10) || 1);
         const alreadyAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
-        // Target = what they have + what they want. desiredInFlight stays at
-        // this level so maybePushWork knows how full to keep the pipeline.
+        // Assign requestedCount NEW chunks on top of whatever is already assigned.
         const newTarget = Math.min(256, alreadyAssigned + requestedCount);
-        // Keep desiredInFlight at the max we've seen — don't let it shrink
-        // as assigned drops, otherwise maybePushWork under-fills.
-        const worker = workers.get(workerId);
-        if (worker) worker.desiredInFlight = Math.max(worker.desiredInFlight || 1, newTarget);
         const expired = recycleStaleChunks();
         if (expired > 0) console.log(`[stale] recycled ${expired} stale chunk(s) back to virtual pool`);
         const chunks = assignVirtualChunks(workerId, newTarget);
@@ -900,7 +895,10 @@ wss.on('connection', (ws) => {
         }
         const remainingAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
         console.log(`[done] ${wName(workerId)} chunk=${msg.chunkId} total_done=${worker?.chunksCompleted || '?'} remaining=${remainingAssigned} rate=${formatHashRate(msg.hashRate || 0)}${completionNote}`);
-        maybePushWork(workerId, 'chunk_complete');
+        // Don't push work here — let the client pull via request_work.
+        // Server pushes caused assigned count to diverge from what the
+        // client actually had queued (push messages piled up in network
+        // buffer while the GPU loop starved the event loop).
         broadcastStats();
         broadcast({ type: 'worker_update', workerId, hashRate: msg.hashRate || 0 });
         break;
