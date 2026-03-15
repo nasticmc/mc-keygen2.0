@@ -225,6 +225,13 @@ db.exec(`
   );
 `);
 
+// Indexes to avoid full table scans on hot-path queries
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_wc_status          ON work_chunks(status);
+  CREATE INDEX IF NOT EXISTS idx_wc_packet_status   ON work_chunks(packet_id, status);
+  CREATE INDEX IF NOT EXISTS idx_wc_expire          ON work_chunks(status, assigned_at);
+`);
+
 // Migration: add decrypted_json column for storing decoded message content
 try { db.exec('ALTER TABLE packets ADD COLUMN decrypted_json TEXT'); } catch {}
 try { db.exec("ALTER TABLE packets ADD COLUMN charset TEXT DEFAULT 'alnum'"); } catch {}
@@ -233,6 +240,8 @@ try { db.exec('ALTER TABLE packets ADD COLUMN max_len INTEGER DEFAULT 5'); } cat
 // Fix rows that got the wrong default (6) from the old migration — only if user never explicitly set a higher value
 try { db.exec('UPDATE packets SET max_len = 5 WHERE max_len = 6 AND status = \'pending\''); } catch {}
 try { db.exec('ALTER TABLE candidate_keys ADD COLUMN ignored INTEGER DEFAULT 0'); } catch {}
+// Lazy chunk generation cursor: NULL = all chunks already inserted (or no work left)
+try { db.exec('ALTER TABLE packets ADD COLUMN chunk_gen_offset INTEGER'); } catch {}
 
 // ── Prepared Statements ─────────────────────────────────────────────────────
 const stmts = {
@@ -299,6 +308,9 @@ const assignPendingChunks = db.transaction((workerId, count) => {
 
 // ── Work Chunk Generation ───────────────────────────────────────────────────
 const CHUNK_SIZE = 4_000_000;
+const INITIAL_CHUNK_BATCH = 5000; // max chunks inserted upfront; rest generated lazily
+const REFILL_LOW_WATER    = 1000; // refill a packet when its pending queue drops below this
+const REFILL_BATCH        = 5000; // chunks added per refill cycle
 
 const CHARSETS = {
   alnum: 'abcdefghijklmnopqrstuvwxyz0123456789',
@@ -333,28 +345,82 @@ function indexRangeForLengths(base, minLen, maxLen) {
 }
 
 function createWorkChunks(packetId, targetPrefix, crackConfig = {}) {
+  const t0 = Date.now();
   const cfg = normalizeCrackConfig(crackConfig);
-  const charset = CHARSETS[cfg.charset];
-  const base = charset.length;
+  const base = CHARSETS[cfg.charset].length;
   const { start: totalStart, end: totalEnd } = indexRangeForLengths(base, cfg.minLen, cfg.maxLen);
 
-  // Fetch already-completed ranges for this charset so we don't re-queue finished work
-  const completedRanges = db.prepare(
-    "SELECT range_start, range_end FROM work_chunks WHERE packet_id = ? AND status = 'completed' AND charset = ?"
-  ).all(packetId, cfg.charset);
+  // Start past any already-completed work for this charset (handles retries that widen the range)
+  const completedMaxRow = db.prepare(
+    "SELECT MAX(range_end) as max_end FROM work_chunks WHERE packet_id = ? AND status = 'completed' AND charset = ?"
+  ).get(packetId, cfg.charset);
+  const genStart = (completedMaxRow?.max_end != null)
+    ? Math.max(totalStart, completedMaxRow.max_end)
+    : totalStart;
+
+  const totalChunks = Math.ceil((totalEnd - genStart) / CHUNK_SIZE);
+  const batchSize   = Math.min(totalChunks, INITIAL_CHUNK_BATCH);
+  const batchEnd    = genStart + batchSize * CHUNK_SIZE;
 
   const insert = db.transaction(() => {
-    for (let start = totalStart; start < totalEnd; start += CHUNK_SIZE) {
-      const end = Math.min(start + CHUNK_SIZE, totalEnd);
-      // Skip ranges already fully covered by a completed chunk
-      if (completedRanges.some(r => r.range_start <= start && r.range_end >= end)) continue;
-      stmts.insertChunk.run(packetId, targetPrefix, start, end, cfg.charset);
+    for (let start = genStart; start < batchEnd && start < totalEnd; start += CHUNK_SIZE) {
+      stmts.insertChunk.run(packetId, targetPrefix, start, Math.min(start + CHUNK_SIZE, totalEnd), cfg.charset);
     }
   });
   insert();
 
+  const hasMore    = totalChunks > INITIAL_CHUNK_BATCH;
+  const nextOffset = hasMore ? batchEnd : null;
+  db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(nextOffset, packetId);
+
+  const elapsed = Date.now() - t0;
+  console.log(`[chunks] packet ${packetId}: inserted ${batchSize} of ${totalChunks} chunks in ${elapsed}ms` +
+    (hasMore ? ` — ${totalChunks - batchSize} more will generate lazily` : ''));
+
   return cfg;
 }
+
+function refillWorkChunks(packetId) {
+  const packet = stmts.getPacketById.get(packetId);
+  if (!packet || packet.status === 'cracked' || packet.chunk_gen_offset == null) return 0;
+
+  const pendingCount = db.prepare(
+    "SELECT COUNT(*) as cnt FROM work_chunks WHERE packet_id = ? AND status IN ('pending','assigned')"
+  ).get(packetId)?.cnt || 0;
+  if (pendingCount >= REFILL_LOW_WATER) return 0;
+
+  const cfg  = normalizeCrackConfig({ charset: packet.charset, minLen: packet.min_len, maxLen: packet.max_len });
+  const base = CHARSETS[cfg.charset].length;
+  const { end: totalEnd } = indexRangeForLengths(base, cfg.minLen, cfg.maxLen);
+
+  const genStart = packet.chunk_gen_offset;
+  if (genStart >= totalEnd) {
+    db.prepare('UPDATE packets SET chunk_gen_offset = NULL WHERE id = ?').run(packetId);
+    return 0;
+  }
+
+  const batchEnd = Math.min(genStart + REFILL_BATCH * CHUNK_SIZE, totalEnd);
+  const insert = db.transaction(() => {
+    for (let start = genStart; start < batchEnd; start += CHUNK_SIZE) {
+      stmts.insertChunk.run(packetId, packet.prefix, start, Math.min(start + CHUNK_SIZE, totalEnd), cfg.charset);
+    }
+  });
+  insert();
+
+  const added      = Math.ceil((batchEnd - genStart) / CHUNK_SIZE);
+  const nextOffset = batchEnd < totalEnd ? batchEnd : null;
+  db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(nextOffset, packetId);
+  console.log(`[refill] packet ${packetId}: +${added} chunks${nextOffset == null ? ' (keyspace fully queued)' : ''}`);
+  return added;
+}
+
+// Background refill: top up lazy-generation packets every 5 seconds
+setInterval(() => {
+  const rows = db.prepare(
+    "SELECT id FROM packets WHERE status != 'cracked' AND chunk_gen_offset IS NOT NULL"
+  ).all();
+  for (const { id } of rows) refillWorkChunks(id);
+}, 5_000);
 
 // ── Connected Workers ───────────────────────────────────────────────────────
 const workers = new Map();
@@ -365,6 +431,22 @@ function broadcast(data) {
     if (ws.readyState === 1) ws.send(msg);
   }
 }
+
+// Throttled stats broadcast — avoids hammering COUNT(*) queries on every event
+let _lastStatsBroadcastMs = 0;
+function broadcastStats() {
+  const now = Date.now();
+  if (now - _lastStatsBroadcastMs < 500) return;
+  _lastStatsBroadcastMs = now;
+  broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get(), totalHashRate: getTotalHashRate() });
+}
+
+// Periodic health report — helps diagnose slowdowns over long runs
+setInterval(() => {
+  const m = process.memoryUsage();
+  const s = stmts.getQueueStats.get();
+  console.log(`[health] workers=${workers.size} pending=${s.pending} assigned=${s.assigned} completed=${s.completed} rss=${Math.round(m.rss / 1024 / 1024)}MB heap=${Math.round(m.heapUsed / 1024 / 1024)}MB`);
+}, 30_000);
 
 // ── WebSocket Handler ───────────────────────────────────────────────────────
 // ── WebSocket Keepalive ─────────────────────────────────────────────────────
@@ -393,22 +475,25 @@ wss.on('connection', (ws) => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
   workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0 });
+  console.log(`[ws] worker connected  id=${workerId.substring(0, 8)} total=${workers.size}`);
   broadcast({ type: 'worker_count', count: workers.size });
 
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
+    const _t0 = Date.now();
     switch (msg.type) {
       case 'request_work': {
-        stmts.expireStaleChunks.run();
+        const expired = stmts.expireStaleChunks.run().changes;
+        if (expired > 0) console.log(`[stale] re-queued ${expired} stale chunk(s)`);
         const chunks = assignPendingChunks(workerId, msg.count || 1);
         ws.send(JSON.stringify({
           type: 'work',
           chunks,
           charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
         }));
-        broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get(), totalHashRate: getTotalHashRate() });
+        broadcastStats();
         break;
       }
 
@@ -419,7 +504,7 @@ wss.on('connection', (ws) => {
           worker.chunksCompleted++;
           worker.hashRate = msg.hashRate || 0;
         }
-        broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get(), totalHashRate: getTotalHashRate() });
+        broadcastStats();
         broadcast({ type: 'worker_update', workerId, hashRate: msg.hashRate || 0 });
         break;
       }
@@ -453,6 +538,7 @@ wss.on('connection', (ws) => {
             }
 
             if (result.success) {
+              console.log(`[FOUND] packet ${packetId} cracked — channel="${channelName}" key=${key.substring(0, 8)}...`);
               stmts.updatePacketStatus.run('cracked', key, channelName, packetId);
               if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), packetId);
               db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
@@ -490,6 +576,7 @@ wss.on('connection', (ws) => {
                 .run(result.success ? 1 : 0, candidateRow.id);
             }
             if (result.success) {
+              console.log(`[FOUND] packet ${batchPacketId} cracked — channel="${cn}" key=${keyHex.substring(0, 8)}...`);
               stmts.updatePacketStatus.run('cracked', keyHex, cn, batchPacketId);
               if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), batchPacketId);
               db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
@@ -508,6 +595,7 @@ wss.on('connection', (ws) => {
       }
 
       case 'key_found': {
+        console.log(`[FOUND] packet ${msg.packetId} cracked — channel="${msg.channelName}" key=${msg.key?.substring(0, 8)}...`);
         stmts.updatePacketStatus.run('cracked', msg.key, msg.channelName || null, msg.packetId);
         db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
           .run(msg.packetId);
@@ -524,14 +612,18 @@ wss.on('connection', (ws) => {
         break;
       }
     }
+    const _elapsed = Date.now() - _t0;
+    if (_elapsed > 100) console.warn(`[ws-slow] ${msg.type} took ${_elapsed}ms (worker=${workerId.substring(0, 8)})`);
   });
 
   ws.on('close', () => {
+    const w = workers.get(workerId);
     stmts.unassignWorkerChunks.run(workerId);
     workers.delete(workerId);
+    console.log(`[ws] worker disconnected id=${workerId.substring(0, 8)} chunks=${w?.chunksCompleted ?? 0} total=${workers.size}`);
     broadcast({ type: 'worker_removed', workerId });
     broadcast({ type: 'worker_count', count: workers.size });
-    broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get(), totalHashRate: getTotalHashRate() });
+    broadcastStats();
   });
 });
 
@@ -630,7 +722,7 @@ app.post('/api/packets', (req, res) => {
   const packet = stmts.getPacketById.get(result.lastInsertRowid);
 
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
-  broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
+  broadcastStats();
 
   res.json({ packet, alreadyKnown: false, prefixByte: prefixHex, decoded });
 });
@@ -643,7 +735,7 @@ app.delete('/api/packets/:id', (req, res) => {
   db.prepare('DELETE FROM candidate_keys WHERE packet_id = ?').run(id);
   db.prepare('DELETE FROM packets WHERE id = ?').run(id);
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
-  broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
+  broadcastStats();
   res.json({ ok: true });
 });
 
@@ -702,7 +794,7 @@ app.post('/api/packets/:id/retry', (req, res) => {
 
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
   broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
-  broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
+  broadcastStats();
 
   res.json({ ok: true, ignoredChannel: channelName || null, crackConfig: cfg });
 });

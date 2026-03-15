@@ -219,7 +219,9 @@ function renderPackets(packets) {
       <td>${formatLocalTime(p.created_at)}</td>
       <td>
         <button class="btn-sm" onclick="deletePacket(${p.id})">Delete</button>
-        ${p.status !== 'cracked' ? `<button class="btn-sm" onclick="autoDecrypt(${p.id})">Try Decrypt</button>` : `<button class="btn-sm btn-warning" onclick="retryPacket(${p.id}, '${escapeAttr(p.channel_name || '')}')">Retry (Ignore Channel)</button>`}
+        ${p.status !== 'cracked'
+          ? `<button class="btn-sm" onclick="joinPacket(${p.id}, '${escapeAttr(p.charset || 'lower')}', ${p.min_len || 1}, ${p.max_len || 5})">Join</button> <button class="btn-sm" onclick="autoDecrypt(${p.id})">Try Decrypt</button> <button class="btn-sm" onclick="retryPacket(${p.id}, '')">Retry / Change Keyspace</button>`
+          : `<button class="btn-sm btn-warning" onclick="retryPacket(${p.id}, '${escapeAttr(p.channel_name || '')}')">Retry (Ignore Channel)</button>`}
       </td>
     `;
     tbody.appendChild(tr);
@@ -242,6 +244,18 @@ async function autoDecrypt(id) {
   } catch (err) {
     console.error('Auto-decrypt failed:', err);
   }
+}
+
+function joinPacket(id, charset, minLen, maxLen) {
+  const charsetEl = document.getElementById('keyspace-charset');
+  const minEl     = document.getElementById('keyspace-min-len');
+  const maxEl     = document.getElementById('keyspace-max-len');
+  if (charsetEl) charsetEl.value = charset || 'lower';
+  if (minEl)     minEl.value     = minLen  || 1;
+  if (maxEl)     maxEl.value     = maxLen  || 5;
+  updateKeyspaceEstimate();
+  showNotification(`Joined packet #${id} (${charset}, ${minLen}–${maxLen} chars). Starting worker…`);
+  if (!cracking) document.getElementById('btn-start-cracking').click();
 }
 
 async function retryPacket(id, channelName) {
