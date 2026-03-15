@@ -582,6 +582,29 @@ setInterval(() => {
 const workers = new Map();
 const PREFETCH_LOW_WATERMARK = 0.25;
 
+// ── Human-Readable Worker Names ─────────────────────────────────────────────
+// Mirrors the client-side workerIdToName() so server logs show the same names.
+const _workerNameAnimals = [
+  'Bear', 'Cat', 'Crow', 'Deer', 'Duck', 'Fox', 'Frog', 'Goat', 'Hawk',
+  'Hare', 'Lynx', 'Lion', 'Mole', 'Moose', 'Newt', 'Orca', 'Owl', 'Puma',
+  'Slug', 'Swan', 'Toad', 'Vole', 'Wolf', 'Wren', 'Yak',
+];
+const _workerNameEmotions = [
+  'Bold', 'Brave', 'Bright', 'Calm', 'Cozy', 'Dark', 'Eager', 'Faint',
+  'Fuzzy', 'Glad', 'Giddy', 'Happy', 'Jolly', 'Keen', 'Merry', 'Proud',
+  'Sharp', 'Snug', 'Sunny', 'Swift', 'Tense', 'Warm', 'Wild', 'Zesty', 'Cool',
+];
+
+function workerIdToName(id) {
+  let h = 5381;
+  for (let i = 0; i < id.length; i++) h = (h * 33 ^ id.charCodeAt(i)) >>> 0;
+  const emotion = _workerNameEmotions[h % _workerNameEmotions.length];
+  const animal  = _workerNameAnimals[Math.floor(h / _workerNameEmotions.length) % _workerNameAnimals.length];
+  return `${emotion} ${animal}`;
+}
+
+function wName(id) { return id ? `${workerIdToName(id)} (${id})` : 'unregistered'; }
+
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_MISS_LIMIT = 4;
 
@@ -617,8 +640,11 @@ function maybePushWork(workerId, reason = 'scheduler') {
 
   const desired = worker.desiredInFlight || 1;
   const assigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
-  const lowWater = Math.max(1, Math.ceil(desired * PREFETCH_LOW_WATERMARK));
-  if (assigned > lowWater) return 0;
+
+  // Push proactively whenever there's room, not just below low-water.
+  // This keeps the client's prefetch queue full so it never idles waiting
+  // for a round-trip after finishing its last chunk.
+  if (assigned >= desired) return 0;
 
   let chunks = assignWorkRespectingInFlight(workerId, desired);
   if (chunks.length === 0) {
@@ -632,12 +658,21 @@ function maybePushWork(workerId, reason = 'scheduler') {
   }
 
   if (chunks.length > 0) {
+    // Include raw packet data so clients can attempt decryption themselves
+    const packetRawData = {};
+    for (const chunk of chunks) {
+      if (!(chunk.packet_id in packetRawData)) {
+        const pkt = stmts.getPacketById.get(chunk.packet_id);
+        if (pkt) packetRawData[chunk.packet_id] = pkt.raw_data;
+      }
+    }
     worker.ws.send(JSON.stringify({
       type: 'work',
       chunks,
       charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
+      packetRawData,
     }));
-    console.log(`[sched] pushed ${chunks.length} chunk(s) to ${workerId} (${reason})`);
+    console.log(`[sched] pushed ${chunks.length} chunk(s) to ${wName(workerId)} (${reason})`);
     broadcastStats();
   }
 
@@ -676,10 +711,10 @@ const heartbeatInterval = setInterval(() => {
     if (client.isAlive === false) {
       client.missedPings = (client.missedPings || 0) + 1;
       if (client.workerId) {
-        console.warn(`[ws] missed heartbeat id=${client.workerId} miss=${client.missedPings}/${HEARTBEAT_MISS_LIMIT}`);
+        console.warn(`[ws] missed heartbeat ${wName(client.workerId)} miss=${client.missedPings}/${HEARTBEAT_MISS_LIMIT}`);
       }
       if (client.missedPings >= HEARTBEAT_MISS_LIMIT) {
-        if (client.workerId) console.warn(`[ws] terminating unresponsive worker id=${client.workerId}`);
+        if (client.workerId) console.warn(`[ws] terminating unresponsive worker ${wName(client.workerId)}`);
         client.terminate();
         return;
       }
@@ -734,8 +769,8 @@ wss.on('connection', (ws) => {
     ws.workerId = workerId;
     workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0, desiredInFlight: 1, lastWorkerUpdateAt: 0 });
 
-    console.log(`[ws] worker registered id=${workerId} total=${workers.size}`);
-    setServerStatus('worker_registered', `Worker ${workerId} is online (${workers.size} total).`);
+    console.log(`[ws] worker registered ${wName(workerId)} total=${workers.size}`);
+    setServerStatus('worker_registered', `Worker ${workerIdToName(workerId)} is online (${workers.size} total).`);
     ws.send(JSON.stringify({ type: 'worker_hello', workerId }));
     ws.send(JSON.stringify({ type: 'server_status', ...serverStatus }));
     broadcast({ type: 'worker_count', count: workers.size });
@@ -881,10 +916,10 @@ wss.on('connection', (ws) => {
       }
     }
     } catch (err) {
-      console.error(`[ws-error] unhandled error in ${msg.type} handler (worker=${workerId || 'unregistered'}):`, err.message);
+      console.error(`[ws-error] unhandled error in ${msg.type} handler (${wName(workerId)}):`, err.message);
     }
     const _elapsed = Date.now() - _t0;
-    if (_elapsed > 100) console.warn(`[ws-slow] ${msg.type} took ${_elapsed}ms (worker=${workerId || 'unregistered'})`);
+    if (_elapsed > 100) console.warn(`[ws-slow] ${msg.type} took ${_elapsed}ms (${wName(workerId)})`);
   });
 
   ws.on('close', () => {
@@ -892,8 +927,8 @@ wss.on('connection', (ws) => {
     const w = workers.get(workerId);
     stmts.unassignWorkerChunks.run(workerId);
     workers.delete(workerId);
-    console.log(`[ws] worker disconnected id=${workerId} chunks=${w?.chunksCompleted ?? 0} total=${workers.size}`);
-    setServerStatus('worker_disconnected', `Worker ${workerId} disconnected. ${workers.size} workers online.`);
+    console.log(`[ws] worker disconnected ${wName(workerId)} chunks=${w?.chunksCompleted ?? 0} total=${workers.size}`);
+    setServerStatus('worker_disconnected', `Worker ${workerIdToName(workerId)} disconnected. ${workers.size} workers online.`);
     broadcast({ type: 'worker_removed', workerId });
     broadcast({ type: 'worker_count', count: workers.size });
     broadcastStats();
