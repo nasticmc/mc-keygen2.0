@@ -314,6 +314,7 @@ const stmts = {
     WHERE id = ? AND status = 'pending'
   `),
   completePacketChunks: db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'"),
+  countAssignedToWorker: db.prepare("SELECT COUNT(*) AS cnt FROM work_chunks WHERE status = 'assigned' AND assigned_to = ?"),
 };
 
 function persistWinningCandidate(packetId, channelName, key, prefix) {
@@ -379,6 +380,14 @@ const assignPendingChunks = db.transaction((workerId, count) => {
     if (result.changes > 0) assigned.push(chunk);
   }
   return assigned;
+});
+
+const assignWorkRespectingInFlight = db.transaction((workerId, requestedCount) => {
+  const target = Math.max(1, requestedCount || 1);
+  const alreadyAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
+  const capacity = Math.max(0, target - alreadyAssigned);
+  if (capacity === 0) return [];
+  return assignPendingChunks(workerId, capacity);
 });
 
 // ── Decoder Worker Pool ──────────────────────────────────────────────────────
@@ -686,7 +695,7 @@ wss.on('connection', (ws) => {
         const expired = stmts.expireStaleChunks.run().changes;
         if (expired > 0) console.log(`[stale] re-queued ${expired} stale chunk(s)`);
         setServerStatus('assigning_work', `Assigning work to ${workerId}...`);
-        let chunks = assignPendingChunks(workerId, msg.count || 1);
+        let chunks = assignWorkRespectingInFlight(workerId, msg.count || 1);
         // If the queue is empty, synchronously trigger lazy refill so workers
         // never stall waiting for the 5-second background interval to fire.
         if (chunks.length === 0) {
@@ -695,7 +704,7 @@ wss.on('connection', (ws) => {
           ).all();
           if (refillable.length > 0) {
             for (const { id } of refillable) refillWorkChunks(id);
-            chunks = assignPendingChunks(workerId, msg.count || 1);
+            chunks = assignWorkRespectingInFlight(workerId, msg.count || 1);
           }
         }
         ws.send(JSON.stringify({
