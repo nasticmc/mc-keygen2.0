@@ -30,6 +30,7 @@ let workRequestsInFlight = 0;
 let workRequestSentAt = 0;
 let currentCharset = 'abcdefghijklmnopqrstuvwxyz';
 let serverChunkSize = 500000;
+let lastMeasuredHashRate = 0;
 let persistedClientId = localStorage.getItem('mc-worker-client-id') || '';
 const pendingWorkResolvers = [];
 const queuedWorkMessages = [];
@@ -158,7 +159,16 @@ function batchCount() {
 }
 
 function getMinAhead() {
-  return parseInt(document.getElementById('work-min-ahead')?.value, 10) || 2;
+  // Auto-scale to keep ~2 seconds of work buffered in the pipeline.
+  // Fast GPUs (300 MH/s) will get minAhead≈16; phones (3 MH/s) stay at 2.
+  if (lastMeasuredHashRate > 0 && serverChunkSize > 0) {
+    const msPerBatch = (serverChunkSize * batchCount()) / lastMeasuredHashRate * 1000;
+    const auto = Math.max(2, Math.min(16, Math.ceil(2000 / msPerBatch)));
+    const el = document.getElementById('work-min-ahead');
+    if (el) el.value = auto;
+    return auto;
+  }
+  return parseInt(document.getElementById('work-min-ahead')?.value, 10) || (isMobile() ? 2 : 4);
 }
 
 // Fire enough work requests to keep at least getMinAhead() batches queued or
@@ -770,6 +780,7 @@ async function runCrackingLoop() {
       setLocalProgress(0, 1);
 
       await cracker.processChunks(chunks, ws, (hashRate, processed, total) => {
+        lastMeasuredHashRate = hashRate;
         document.getElementById('stat-hashrate').textContent = formatHashRate(hashRate);
         setCrackingStatus(`Crunching ${chunks.length} chunk(s) at ${formatHashRate(hashRate)}.`);
         setLocalProgress(processed, total);

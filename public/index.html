@@ -64,8 +64,8 @@
         <label>Work Request Size
           <input id="work-batch-count" type="number" min="1" max="64" value="4">
         </label>
-        <label>Min Ahead
-          <input id="work-min-ahead" type="number" min="1" max="8" value="2">
+        <label>Min Ahead <span class="label-auto">[auto]</span>
+          <input id="work-min-ahead" type="number" min="1" max="16" value="2" readonly title="Auto-scaled from measured hash rate — fast GPUs get more lookahead">
         </label>
       </div>
 
