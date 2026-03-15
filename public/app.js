@@ -838,7 +838,7 @@ async function runCrackingLoop() {
       // Top up before processing so next batch is ready when this one finishes
       topUpWorkQueue();
       clog(`pipeline: inFlight=${workRequestsInFlight} queued=${queuedWorkMessages.length}`);
-      nextWork = waitForWork(30000);
+      nextWork = waitForWork(10000);
 
       setCrackingStatus(`Starting batch: ${chunks.length} chunk(s), ${formatNumber(totalCandidates)} candidates for packet ${packetIds.join(', ')}...`);
 

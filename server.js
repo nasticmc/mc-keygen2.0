@@ -982,13 +982,30 @@ wss.on('connection', (ws) => {
         const dbAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
         const rawPacketCount = Object.keys(packetRawData).length;
         console.log(`[work] ${wName(workerId)} requested=${requestedCount} → sending ${chunks.length} chunk(s) (db_assigned=${dbAssigned}, raw_packets=${rawPacketCount})`);
-        safeSend(ws, {
+        const sent = safeSend(ws, {
           type: 'work',
           solicited: true,
           chunks,
           charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
           packetRawData,
         }, 'work_reply');
+        if (!sent && chunks.length > 0) {
+          // Send failed (backpressure / closed socket) — release the chunks we
+          // just assigned so they go back into the pool for reassignment.
+          const chunkIds = chunks.map(c => c.id);
+          const placeholders = chunkIds.map(() => '?').join(',');
+          const minStarts = db.prepare(
+            `SELECT packet_id, MIN(range_start) AS min_start FROM work_chunks WHERE id IN (${placeholders}) GROUP BY packet_id`
+          ).all(...chunkIds);
+          db.prepare(`DELETE FROM work_chunks WHERE id IN (${placeholders})`).run(...chunkIds);
+          for (const { packet_id, min_start } of minStarts) {
+            const pkt = stmts.getPacketById.get(packet_id);
+            if (pkt && pkt.chunk_gen_offset > min_start) {
+              db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(min_start, packet_id);
+            }
+          }
+          console.warn(`[work] send failed to ${wName(workerId)} — released ${chunkIds.length} chunk(s) back to pool`);
+        }
         broadcastStats();
         break;
       }
