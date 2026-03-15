@@ -227,9 +227,15 @@ class GPUCracker {
         return false;
       }
 
+      // Request the adapter's actual workgroup dispatch limit so we can
+      // size GPU batches as large as the hardware supports.
+      const maxDispatch = adapter.limits.maxComputeWorkgroupsPerDimension || 65535;
+      this._maxDispatch = maxDispatch;
+
       this.device = await adapter.requestDevice({
         requiredLimits: {
           maxComputeWorkgroupSizeX: 256,
+          maxComputeWorkgroupsPerDimension: maxDispatch,
           maxStorageBufferBindingSize: 128 * 1024 * 1024,
         }
       });
@@ -241,7 +247,7 @@ class GPUCracker {
       });
 
       this.supported = true;
-      console.log('WebGPU initialized successfully');
+      console.log(`WebGPU initialized: maxDispatch=${maxDispatch} → batchSize=${(maxDispatch * 256 / 1e6).toFixed(1)}M candidates/dispatch`);
       return true;
     } catch (err) {
       console.error('WebGPU init failed:', err);
@@ -367,16 +373,21 @@ class GPUCracker {
 
   async processChunks(chunks, ws, onProgress, charset, packetRawData = {}) {
     this.running = true;
-    this._lastTime = performance.now();
-    this._lastCount = 0;
     this.ensureBuffers();
 
     const totalCandidates = chunks.reduce((sum, c) => sum + (c.range_end - c.range_start), 0);
     let processedCandidates = 0;
+    // Track total candidates and wall-clock time for accurate hash rate.
+    // The ping-pong pipeline means finishBatch runs while the GPU is already
+    // computing the next batch, so we must measure over a longer window.
+    let _rateWindowStart = performance.now();
+    let _rateWindowCount = 0;
 
-    // 8 M candidates per dispatch — larger batches amortise the fixed overhead
-    // of mapAsync and buffer copies; GPU timeout risk is negligible at this size.
-    const batchSize = 8388608;
+    // Size each dispatch to the maximum the GPU supports.
+    // workgroup_size(256), so max candidates = maxDispatch * 256.
+    // Default limit is 65535 workgroups = ~16.7M candidates.
+    const maxDispatch = this._maxDispatch || 65535;
+    const batchSize = maxDispatch * 256;
 
     // Flatten all work into a single batch list so the ping-pong pipeline can
     // span chunk boundaries without extra complexity.
@@ -421,17 +432,28 @@ class GPUCracker {
       }
     };
 
+    let _lastProgressTime = 0;
     const finishBatch = async (matches, batch) => {
-      this._lastCount += batch.size;
       processedCandidates += batch.size;
-      const elapsed = (performance.now() - this._lastTime) / 1000;
-      if (elapsed > 0.5) {
-        this.hashRate = Math.round(this._lastCount / elapsed);
-        this._lastCount = 0;
-        this._lastTime = performance.now();
+      _rateWindowCount += batch.size;
+      // Compute hash rate over a rolling window of at least 2 seconds so the
+      // ping-pong pipeline doesn't skew the measurement (finishBatch runs
+      // while the next batch is already on the GPU).
+      const elapsed = (performance.now() - _rateWindowStart) / 1000;
+      if (elapsed >= 2.0) {
+        this.hashRate = Math.round(_rateWindowCount / elapsed);
+        _rateWindowCount = 0;
+        _rateWindowStart = performance.now();
       }
-      if (onProgress) onProgress(this.hashRate, processedCandidates, totalCandidates);
-      await sendMatches(matches, batch.chunk);
+      // Throttle progress callbacks to ~1/sec to avoid DOM/WebSocket overhead
+      // between GPU dispatches starving the pipeline.
+      const now = performance.now();
+      if (onProgress && (now - _lastProgressTime > 1000 || processedCandidates >= totalCandidates)) {
+        _lastProgressTime = now;
+        onProgress(this.hashRate, processedCandidates, totalCandidates);
+      }
+      // Send matches without blocking the pipeline — fire and forget
+      if (matches.length > 0) sendMatches(matches, batch.chunk);
       if (batch.isLastInChunk) {
         try {
           ws.send(JSON.stringify({ type: 'chunk_complete', chunkId: batch.chunk.id, hashRate: this.hashRate }));
@@ -444,6 +466,7 @@ class GPUCracker {
     // behind GPU compute time.
     let pending = null; // { promise, bufSetIdx, batch }
     let pingPong = 0;
+    let _lastYield = performance.now();
 
     for (let i = 0; i < batches.length; i++) {
       if (!this.running) break;
@@ -463,6 +486,15 @@ class GPUCracker {
         } catch (err) {
           console.error('GPU readback error:', err);
         }
+      }
+
+      // Yield to the macrotask queue periodically so WebSocket onmessage
+      // events can fire.  Without this, pushed work messages pile up in
+      // the network buffer and the client appears idle to the server.
+      const now = performance.now();
+      if (now - _lastYield > 500) {
+        _lastYield = now;
+        await new Promise(r => setTimeout(r, 0));
       }
 
       // Kick off async readback for the batch we just dispatched.

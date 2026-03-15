@@ -156,10 +156,10 @@ function autoDecryptCandidates(packetId) {
       if (result.success) {
         stmts.updatePacketStatus.run('cracked', candidate.key, candidate.channel_name, packetId);
         if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), packetId);
-        db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
-          .run(packetId);
+        db.prepare('UPDATE packets SET chunk_gen_offset = keyspace_end WHERE id = ?').run(packetId);
+        stmts.deletePacketAssigned.run(packetId);
         broadcast({ type: 'key_found', packetId, key: candidate.key, channelName: candidate.channel_name, decoded: result.decoded });
-        broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
+        broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats() });
         broadcast({ type: 'packets', packets: stmts.getPackets.all() });
         return result;
       }
@@ -243,8 +243,46 @@ try { db.exec('ALTER TABLE packets ADD COLUMN max_len INTEGER DEFAULT 5'); } cat
 // Fix rows that got the wrong default (6) from the old migration — only if user never explicitly set a higher value
 try { db.exec('UPDATE packets SET max_len = 5 WHERE max_len = 6 AND status = \'pending\''); } catch {}
 try { db.exec('ALTER TABLE candidate_keys ADD COLUMN ignored INTEGER DEFAULT 0'); } catch {}
-// Lazy chunk generation cursor: NULL = all chunks already inserted (or no work left)
+// Virtual chunk generation: chunk_gen_offset tracks the next unassigned index,
+// keyspace_end tracks the total keyspace size. No pending rows are pre-generated.
 try { db.exec('ALTER TABLE packets ADD COLUMN chunk_gen_offset INTEGER'); } catch {}
+try { db.exec('ALTER TABLE packets ADD COLUMN keyspace_end INTEGER'); } catch {}
+
+// Migration: delete old "pending" rows (virtual chunk system no longer uses them)
+// and reset assigned rows on startup (workers are not connected yet).
+// Also rewind packet cursors so orphaned keyspace ranges get re-assigned.
+{
+  const deleted = db.prepare("DELETE FROM work_chunks WHERE status = 'pending'").run().changes;
+  // Rewind cursors for any assigned chunks before deleting them
+  const orphanedAssigned = db.prepare(
+    "SELECT packet_id, MIN(range_start) as min_start FROM work_chunks WHERE status = 'assigned' GROUP BY packet_id"
+  ).all();
+  for (const { packet_id, min_start } of orphanedAssigned) {
+    const pkt = db.prepare('SELECT chunk_gen_offset FROM packets WHERE id = ?').get(packet_id);
+    if (pkt && pkt.chunk_gen_offset > min_start) {
+      db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(min_start, packet_id);
+      console.log(`[startup] rewound packet ${packet_id} cursor from ${pkt.chunk_gen_offset} to ${min_start}`);
+    }
+  }
+  const reset = db.prepare("DELETE FROM work_chunks WHERE status = 'assigned'").run().changes;
+  if (deleted + reset > 0) console.log(`[startup] cleaned up ${deleted} pending + ${reset} assigned chunk rows`);
+  // Ensure all active packets have keyspace_end set
+  const needInit = db.prepare("SELECT * FROM packets WHERE status != 'cracked' AND keyspace_end IS NULL").all();
+  for (const p of needInit) {
+    const cfg = { charset: p.charset || 'lower', minLen: p.min_len || 1, maxLen: p.max_len || 5 };
+    const charsetKey = cfg.charset;
+    const base = (charsetKey === 'alnum' ? 36 : charsetKey === 'lower' ? 26 : charsetKey === 'numeric' ? 10 : charsetKey === 'full' ? 65 : 26);
+    let start = 0;
+    for (let len = 1; len < cfg.minLen; len++) start += Math.pow(base, len);
+    let end = start;
+    for (let len = cfg.minLen; len <= cfg.maxLen; len++) end += Math.pow(base, len);
+    // Start past completed work
+    const completedMax = db.prepare("SELECT MAX(range_end) as max_end FROM work_chunks WHERE packet_id = ? AND status = 'completed'").get(p.id);
+    const offset = (completedMax?.max_end != null) ? Math.max(start, completedMax.max_end) : start;
+    db.prepare('UPDATE packets SET chunk_gen_offset = ?, keyspace_end = ? WHERE id = ?').run(offset, end, p.id);
+    console.log(`[migration] initialized packet ${p.id} keyspace: offset=${offset} end=${end}`);
+  }
+}
 
 // Candidate dedupe + uniqueness guard so high-volume prefix-match batches don't
 // spend most of their time doing per-row existence checks.
@@ -273,50 +311,67 @@ const stmts = {
   insertKnownChannel: db.prepare('INSERT OR REPLACE INTO known_channels (channel_name, key, prefix) VALUES (?, ?, ?)'),
   deleteKnownChannel: db.prepare('DELETE FROM known_channels WHERE id = ?'),
   findByPrefix: db.prepare('SELECT * FROM known_channels WHERE prefix = ?'),
-  insertChunk: db.prepare('INSERT INTO work_chunks (packet_id, target_prefix, range_start, range_end, charset) VALUES (?, ?, ?, ?, ?)'),
-  getPendingChunks: db.prepare("SELECT * FROM work_chunks WHERE status = 'pending' LIMIT ?"),
-  assignChunk: db.prepare("UPDATE work_chunks SET status = 'assigned', assigned_to = ?, assigned_at = CURRENT_TIMESTAMP WHERE id = ?"),
-  completeChunk: db.prepare("UPDATE work_chunks SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ? AND assigned_to = ?"),
+  insertAssignedChunk: db.prepare('INSERT INTO work_chunks (packet_id, target_prefix, range_start, range_end, charset, status, assigned_to, assigned_at) VALUES (?, ?, ?, ?, ?, \'assigned\', ?, CURRENT_TIMESTAMP)'),
+  completeChunk: db.prepare("UPDATE work_chunks SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?"),
   getChunksByPacket: db.prepare('SELECT * FROM work_chunks WHERE packet_id = ?'),
-  getQueueStats: db.prepare(`
-    SELECT
-      (SELECT COUNT(*) FROM work_chunks WHERE status = 'pending') as pending,
-      (SELECT COUNT(*) FROM work_chunks WHERE status = 'assigned') as assigned,
-      (SELECT COUNT(*) FROM work_chunks WHERE status = 'completed') as completed,
-      (SELECT COUNT(*) FROM work_chunks) as total
-  `),
-  getActiveJobStats: db.prepare(`
-    SELECT
-      COALESCE(SUM(CASE WHEN w.status = 'pending' THEN 1 ELSE 0 END), 0) as pending,
-      COALESCE(SUM(CASE WHEN w.status = 'assigned' THEN 1 ELSE 0 END), 0) as assigned,
-      COALESCE(SUM(CASE WHEN w.status = 'completed' THEN 1 ELSE 0 END), 0) as completed,
-      COALESCE(COUNT(*), 0) as total
-    FROM work_chunks w
+  // Stats now compute pending virtually from packet keyspace offsets
+  getAssignedCount: db.prepare("SELECT COUNT(*) as assigned FROM work_chunks WHERE status = 'assigned'"),
+  getCompletedCount: db.prepare("SELECT COUNT(*) as completed FROM work_chunks WHERE status = 'completed'"),
+  getActiveAssigned: db.prepare(`
+    SELECT COUNT(*) as assigned FROM work_chunks w
     JOIN packets p ON p.id = w.packet_id
-    WHERE p.status != 'cracked'
+    WHERE w.status = 'assigned' AND p.status != 'cracked'
   `),
-  expireStaleChunks: db.prepare(`
-    UPDATE work_chunks SET status = 'pending', assigned_to = NULL, assigned_at = NULL
-    WHERE status = 'assigned' AND assigned_at < datetime('now', '-5 minutes')
+  getActiveCompleted: db.prepare(`
+    SELECT COUNT(*) as completed FROM work_chunks w
+    JOIN packets p ON p.id = w.packet_id
+    WHERE w.status = 'completed' AND p.status != 'cracked'
   `),
+  // Stale chunks: find them for recycling back into the virtual pool
+  getStaleChunks: db.prepare(`
+    SELECT id, packet_id, range_start FROM work_chunks
+    WHERE status = 'assigned' AND assigned_at < datetime('now', '-10 minutes')
+  `),
+  deleteChunkById: db.prepare('DELETE FROM work_chunks WHERE id = ?'),
   insertCandidate: db.prepare('INSERT OR IGNORE INTO candidate_keys (packet_id, channel_name, key, prefix, verified, decode_success) VALUES (?, ?, ?, ?, 1, 1)'),
   getCandidates: db.prepare('SELECT * FROM candidate_keys WHERE packet_id = ? ORDER BY created_at DESC'),
   getAllCandidates: db.prepare('SELECT * FROM candidate_keys ORDER BY created_at DESC LIMIT 100'),
   updatePacketDecrypted: db.prepare('UPDATE packets SET decrypted_json = ? WHERE id = ?'),
   getDecodedPackets: db.prepare("SELECT * FROM packets WHERE status = 'cracked' ORDER BY cracked_at DESC"),
+  // When a worker disconnects, delete its assigned chunks (virtual system will reassign the ranges)
   unassignWorkerChunks: db.prepare(`
-    UPDATE work_chunks
-    SET status = 'pending', assigned_to = NULL, assigned_at = NULL
+    DELETE FROM work_chunks
     WHERE status = 'assigned' AND assigned_to = ?
   `),
-  tryAssignChunk: db.prepare(`
-    UPDATE work_chunks
-    SET status = 'assigned', assigned_to = ?, assigned_at = CURRENT_TIMESTAMP
-    WHERE id = ? AND status = 'pending'
-  `),
-  completePacketChunks: db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'"),
+  deletePacketAssigned: db.prepare("DELETE FROM work_chunks WHERE packet_id = ? AND status = 'assigned'"),
   countAssignedToWorker: db.prepare("SELECT COUNT(*) AS cnt FROM work_chunks WHERE status = 'assigned' AND assigned_to = ?"),
+  getActivePackets: db.prepare("SELECT * FROM packets WHERE status != 'cracked' AND chunk_gen_offset IS NOT NULL AND keyspace_end IS NOT NULL"),
 };
+
+// ── Virtual Stats ────────────────────────────────────────────────────────────
+// Pending chunks are computed from keyspace math, not DB rows.
+function getQueueStats() {
+  const assigned = stmts.getAssignedCount.get().assigned;
+  const completed = stmts.getCompletedCount.get().completed;
+  // Count virtual pending across all active packets
+  let virtualPending = 0;
+  for (const p of stmts.getActivePackets.all()) {
+    virtualPending += Math.ceil(Math.max(0, p.keyspace_end - p.chunk_gen_offset) / CHUNK_SIZE);
+  }
+  const total = virtualPending + assigned + completed;
+  return { pending: virtualPending, assigned, completed, total };
+}
+
+function getActiveJobStats() {
+  const assigned = stmts.getActiveAssigned.get().assigned;
+  const completed = stmts.getActiveCompleted.get().completed;
+  let virtualPending = 0;
+  for (const p of stmts.getActivePackets.all()) {
+    virtualPending += Math.ceil(Math.max(0, p.keyspace_end - p.chunk_gen_offset) / CHUNK_SIZE);
+  }
+  const total = virtualPending + assigned + completed;
+  return { pending: virtualPending, assigned, completed, total };
+}
 
 function persistWinningCandidate(packetId, channelName, key, prefix) {
   stmts.insertCandidate.run(packetId, channelName, key, prefix);
@@ -329,9 +384,11 @@ function markPacketCracked(packetId, channelName, key, decoded) {
   console.log(`[FOUND] packet ${packetId} cracked — channel="${channelName}" key=${key.substring(0, 8)}...`);
   stmts.updatePacketStatus.run('cracked', key, channelName, packetId);
   if (decoded) stmts.updatePacketDecrypted.run(JSON.stringify(decoded), packetId);
-  stmts.completePacketChunks.run(packetId);
+  // Stop virtual generation and clean up assigned chunks for this packet
+  db.prepare('UPDATE packets SET chunk_gen_offset = keyspace_end WHERE id = ?').run(packetId);
+  stmts.deletePacketAssigned.run(packetId);
   broadcast({ type: 'key_found', packetId, key, channelName, decoded });
-  broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
+  broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats() });
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
   broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
   return true;
@@ -373,22 +430,125 @@ function findWinningCandidate(packet, matches, onDone) {
   schedule();
 }
 
-const assignPendingChunks = db.transaction((workerId, count) => {
-  const available = stmts.getPendingChunks.all(count);
-  const assigned = [];
-  for (const chunk of available) {
-    const result = stmts.tryAssignChunk.run(workerId, chunk.id);
-    if (result.changes > 0) assigned.push(chunk);
+// Recycle stale assigned chunks: delete the rows and rewind the packet's
+// virtual cursor so those ranges will be reassigned to other workers.
+// Release all assigned chunks for a worker back to the virtual pool.
+function releaseWorkerChunks(workerId) {
+  // Find the minimum range_start per packet to rewind cursors
+  const rows = db.prepare(
+    "SELECT packet_id, MIN(range_start) as min_start FROM work_chunks WHERE status = 'assigned' AND assigned_to = ? GROUP BY packet_id"
+  ).all(workerId);
+
+  // Delete the assigned rows — virtual system will regenerate the ranges
+  stmts.unassignWorkerChunks.run(workerId);
+
+  for (const { packet_id, min_start } of rows) {
+    const packet = stmts.getPacketById.get(packet_id);
+    if (packet && packet.chunk_gen_offset > min_start) {
+      db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(min_start, packet_id);
+    }
   }
+}
+
+function recycleStaleChunks() {
+  const stale = stmts.getStaleChunks.all();
+  if (stale.length === 0) return 0;
+
+  // Group by packet and find the minimum range_start per packet
+  const rewindTo = new Map();
+  for (const row of stale) {
+    const current = rewindTo.get(row.packet_id);
+    if (current === undefined || row.range_start < current) {
+      rewindTo.set(row.packet_id, row.range_start);
+    }
+    stmts.deleteChunkById.run(row.id);
+  }
+
+  // Rewind each affected packet's cursor so the ranges get regenerated
+  for (const [packetId, minStart] of rewindTo) {
+    const packet = stmts.getPacketById.get(packetId);
+    if (packet && packet.chunk_gen_offset > minStart) {
+      db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(minStart, packetId);
+      console.log(`[stale] rewound packet ${packetId} cursor from ${packet.chunk_gen_offset} to ${minStart}`);
+    }
+  }
+
+  return stale.length;
+}
+
+// Assign virtual chunks: compute ranges from packet keyspace on-the-fly,
+// insert directly as "assigned" rows. No "pending" rows ever exist.
+const assignVirtualChunks = db.transaction((workerId, count) => {
+  const alreadyAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
+  const capacity = Math.max(0, count - alreadyAssigned);
+  if (capacity === 0) return [];
+
+  const packets = stmts.getActivePackets.all();
+  const assigned = [];
+
+  for (const packet of packets) {
+    if (assigned.length >= capacity) break;
+    let offset = packet.chunk_gen_offset;
+    const end = packet.keyspace_end;
+    if (offset >= end) continue;
+
+    while (assigned.length < capacity && offset < end) {
+      const rangeEnd = Math.min(offset + CHUNK_SIZE, end);
+      const result = stmts.insertAssignedChunk.run(
+        packet.id, packet.prefix, offset, rangeEnd, packet.charset || 'lower', workerId
+      );
+      assigned.push({
+        id: Number(result.lastInsertRowid),
+        packet_id: packet.id,
+        target_prefix: packet.prefix,
+        range_start: offset,
+        range_end: rangeEnd,
+        charset: packet.charset || 'lower',
+        status: 'assigned',
+        assigned_to: workerId,
+      });
+      offset = rangeEnd;
+    }
+    // Advance the packet's cursor
+    db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(offset, packet.id);
+  }
+
   return assigned;
 });
 
-const assignWorkRespectingInFlight = db.transaction((workerId, requestedCount) => {
-  const target = Math.max(1, requestedCount || 1);
-  const alreadyAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
-  const capacity = Math.max(0, target - alreadyAssigned);
-  if (capacity === 0) return [];
-  return assignPendingChunks(workerId, capacity);
+// Assign exactly N chunks without checking alreadyAssigned.
+// Used by request_work so the client always gets what it asked for.
+const assignExactChunks = db.transaction((workerId, count) => {
+  const packets = stmts.getActivePackets.all();
+  const assigned = [];
+
+  for (const packet of packets) {
+    if (assigned.length >= count) break;
+    let offset = packet.chunk_gen_offset;
+    const end = packet.keyspace_end;
+    if (offset >= end) continue;
+
+    while (assigned.length < count && offset < end) {
+      const rangeEnd = Math.min(offset + CHUNK_SIZE, end);
+      const result = stmts.insertAssignedChunk.run(
+        packet.id, packet.prefix, offset, rangeEnd, packet.charset || 'lower', workerId
+      );
+      assigned.push({
+        id: Number(result.lastInsertRowid),
+        packet_id: packet.id,
+        target_prefix: packet.prefix,
+        range_start: offset,
+        range_end: rangeEnd,
+        charset: packet.charset || 'lower',
+        status: 'assigned',
+        assigned_to: workerId,
+      });
+      offset = rangeEnd;
+    }
+    db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(offset, packet.id);
+  }
+
+  return assigned;
 });
 
 // ── Decoder Worker Pool ──────────────────────────────────────────────────────
@@ -463,10 +623,7 @@ function decodeAsync(hexData, channelKey, cb) {
 for (let i = 0; i < DECODER_POOL_SIZE; i++) _decoderPool.push(_spawnDecoderWorker());
 
 // ── Work Chunk Generation ───────────────────────────────────────────────────
-const CHUNK_SIZE = 4_000_000;
-const INITIAL_CHUNK_BATCH = 5000; // max chunks inserted upfront; rest generated lazily
-const REFILL_LOW_WATER    = 1000; // refill a packet when its pending queue drops below this
-const REFILL_BATCH        = 5000; // chunks added per refill cycle
+const CHUNK_SIZE = 64_000_000;
 
 const CHARSETS = {
   alnum: 'abcdefghijklmnopqrstuvwxyz0123456789',
@@ -500,13 +657,17 @@ function indexRangeForLengths(base, minLen, maxLen) {
   return { start, end: start + span };
 }
 
-function createWorkChunks(packetId, targetPrefix, crackConfig = {}) {
-  const t0 = Date.now();
+// ── Virtual Chunk System ────────────────────────────────────────────────────
+// Instead of pre-inserting thousands of "pending" rows, we store
+// chunk_gen_offset (next unassigned index) and keyspace_end on each packet.
+// Chunks are computed on-the-fly and inserted directly as "assigned".
+
+function initWorkForPacket(packetId, targetPrefix, crackConfig = {}) {
   const cfg = normalizeCrackConfig(crackConfig);
   const base = CHARSETS[cfg.charset].length;
   const { start: totalStart, end: totalEnd } = indexRangeForLengths(base, cfg.minLen, cfg.maxLen);
 
-  // Start past any already-completed work for this charset (handles retries that widen the range)
+  // Start past any already-completed work for this charset (handles retries)
   const completedMaxRow = db.prepare(
     "SELECT MAX(range_end) as max_end FROM work_chunks WHERE packet_id = ? AND status = 'completed' AND charset = ?"
   ).get(packetId, cfg.charset);
@@ -515,75 +676,49 @@ function createWorkChunks(packetId, targetPrefix, crackConfig = {}) {
     : totalStart;
 
   const totalChunks = Math.ceil((totalEnd - genStart) / CHUNK_SIZE);
-  const batchSize   = Math.min(totalChunks, INITIAL_CHUNK_BATCH);
-  const batchEnd    = genStart + batchSize * CHUNK_SIZE;
+  db.prepare('UPDATE packets SET chunk_gen_offset = ?, keyspace_end = ? WHERE id = ?')
+    .run(genStart, totalEnd, packetId);
 
-  const insert = db.transaction(() => {
-    for (let start = genStart; start < batchEnd && start < totalEnd; start += CHUNK_SIZE) {
-      stmts.insertChunk.run(packetId, targetPrefix, start, Math.min(start + CHUNK_SIZE, totalEnd), cfg.charset);
-    }
-  });
-  insert();
-
-  const hasMore    = totalChunks > INITIAL_CHUNK_BATCH;
-  const nextOffset = hasMore ? batchEnd : null;
-  db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(nextOffset, packetId);
-
-  const elapsed = Date.now() - t0;
-  console.log(`[chunks] packet ${packetId}: inserted ${batchSize} of ${totalChunks} chunks in ${elapsed}ms` +
-    (hasMore ? ` — ${totalChunks - batchSize} more will generate lazily` : ''));
-
+  console.log(`[chunks] packet ${packetId}: keyspace ready — ${totalChunks} virtual chunks (${genStart}→${totalEnd})`);
   return cfg;
 }
 
-function refillWorkChunks(packetId) {
-  const packet = stmts.getPacketById.get(packetId);
-  if (!packet || packet.status === 'cracked' || packet.chunk_gen_offset == null) return 0;
-
-  const pendingCount = db.prepare(
-    "SELECT COUNT(*) as cnt FROM work_chunks WHERE packet_id = ? AND status IN ('pending','assigned')"
-  ).get(packetId)?.cnt || 0;
-  if (pendingCount >= REFILL_LOW_WATER) return 0;
-
-  const cfg  = normalizeCrackConfig({ charset: packet.charset, minLen: packet.min_len, maxLen: packet.max_len });
-  const base = CHARSETS[cfg.charset].length;
-  const { end: totalEnd } = indexRangeForLengths(base, cfg.minLen, cfg.maxLen);
-
-  const genStart = packet.chunk_gen_offset;
-  if (genStart >= totalEnd) {
-    db.prepare('UPDATE packets SET chunk_gen_offset = NULL WHERE id = ?').run(packetId);
-    return 0;
-  }
-
-  const batchEnd = Math.min(genStart + REFILL_BATCH * CHUNK_SIZE, totalEnd);
-  const insert = db.transaction(() => {
-    for (let start = genStart; start < batchEnd; start += CHUNK_SIZE) {
-      stmts.insertChunk.run(packetId, packet.prefix, start, Math.min(start + CHUNK_SIZE, totalEnd), cfg.charset);
-    }
-  });
-  insert();
-
-  const added      = Math.ceil((batchEnd - genStart) / CHUNK_SIZE);
-  const nextOffset = batchEnd < totalEnd ? batchEnd : null;
-  db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(nextOffset, packetId);
-  console.log(`[refill] packet ${packetId}: +${added} chunks${nextOffset == null ? ' (keyspace fully queued)' : ''}`);
-  return added;
-}
-
-// Background refill: top up lazy-generation packets every 5 seconds
-setInterval(() => {
-  const rows = db.prepare(
-    "SELECT id FROM packets WHERE status != 'cracked' AND chunk_gen_offset IS NOT NULL"
-  ).all();
-  for (const { id } of rows) refillWorkChunks(id);
-}, 5_000);
-
 // ── Connected Workers ───────────────────────────────────────────────────────
 const workers = new Map();
-const PREFETCH_LOW_WATERMARK = 0.4;
+const PREFETCH_LOW_WATERMARK = 0.25;
+
+// ── Human-Readable Worker Names ─────────────────────────────────────────────
+// Mirrors the client-side workerIdToName() so server logs show the same names.
+const _workerNameAnimals = [
+  'Bear', 'Cat', 'Crow', 'Deer', 'Duck', 'Fox', 'Frog', 'Goat', 'Hawk',
+  'Hare', 'Lynx', 'Lion', 'Mole', 'Moose', 'Newt', 'Orca', 'Owl', 'Puma',
+  'Slug', 'Swan', 'Toad', 'Vole', 'Wolf', 'Wren', 'Yak',
+];
+const _workerNameEmotions = [
+  'Bold', 'Brave', 'Bright', 'Calm', 'Cozy', 'Dark', 'Eager', 'Faint',
+  'Fuzzy', 'Glad', 'Giddy', 'Happy', 'Jolly', 'Keen', 'Merry', 'Proud',
+  'Sharp', 'Snug', 'Sunny', 'Swift', 'Tense', 'Warm', 'Wild', 'Zesty', 'Cool',
+];
+
+function workerIdToName(id) {
+  let h = 5381;
+  for (let i = 0; i < id.length; i++) h = (h * 33 ^ id.charCodeAt(i)) >>> 0;
+  const emotion = _workerNameEmotions[h % _workerNameEmotions.length];
+  const animal  = _workerNameAnimals[Math.floor(h / _workerNameEmotions.length) % _workerNameAnimals.length];
+  return `${emotion} ${animal}`;
+}
+
+function wName(id) { return id ? `${workerIdToName(id)} (${id})` : 'unregistered'; }
 
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_MISS_LIMIT = 4;
+
+function formatHashRate(n) {
+  if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + ' GH/s';
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + ' MH/s';
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + ' KH/s';
+  return n + ' H/s';
+}
 
 const serverStatus = {
   phase: 'idle',
@@ -604,12 +739,6 @@ function makeWorkerId(inputId) {
   return normalized || crypto.randomUUID().replace(/-/g, '').slice(0, 12);
 }
 
-function updateWorkerDesiredInFlight(workerId, requestedCount) {
-  const worker = workers.get(workerId);
-  if (!worker) return;
-  const nextDesired = Math.max(1, Math.min(64, parseInt(requestedCount, 10) || 1));
-  worker.desiredInFlight = nextDesired;
-}
 
 function maybePushWork(workerId, reason = 'scheduler') {
   const worker = workers.get(workerId);
@@ -617,27 +746,30 @@ function maybePushWork(workerId, reason = 'scheduler') {
 
   const desired = worker.desiredInFlight || 1;
   const assigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
-  const lowWater = Math.max(1, Math.ceil(desired * PREFETCH_LOW_WATERMARK));
-  if (assigned > lowWater) return 0;
 
-  let chunks = assignWorkRespectingInFlight(workerId, desired);
-  if (chunks.length === 0) {
-    const refillable = db.prepare(
-      "SELECT id FROM packets WHERE status != 'cracked' AND chunk_gen_offset IS NOT NULL"
-    ).all();
-    if (refillable.length > 0) {
-      for (const { id } of refillable) refillWorkChunks(id);
-      chunks = assignWorkRespectingInFlight(workerId, desired);
-    }
-  }
+  // Push when assigned drops below 3/4 of desired — keeps the pipeline
+  // well-fed without pushing on every single chunk_complete.
+  const pushThreshold = Math.max(1, Math.ceil(desired * 3 / 4));
+  if (assigned >= pushThreshold) return 0;
+
+  const chunks = assignVirtualChunks(workerId, desired);
 
   if (chunks.length > 0) {
+    // Include raw packet data so clients can attempt decryption themselves
+    const packetRawData = {};
+    for (const chunk of chunks) {
+      if (!(chunk.packet_id in packetRawData)) {
+        const pkt = stmts.getPacketById.get(chunk.packet_id);
+        if (pkt) packetRawData[chunk.packet_id] = pkt.raw_data;
+      }
+    }
     worker.ws.send(JSON.stringify({
       type: 'work',
       chunks,
       charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
+      packetRawData,
     }));
-    console.log(`[sched] pushed ${chunks.length} chunk(s) to ${workerId} (${reason})`);
+    console.log(`[sched] pushed ${chunks.length} chunk(s) to ${wName(workerId)} (${reason})`);
     broadcastStats();
   }
 
@@ -657,14 +789,20 @@ function broadcastStats() {
   const now = Date.now();
   if (now - _lastStatsBroadcastMs < 500) return;
   _lastStatsBroadcastMs = now;
-  broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get(), totalHashRate: getTotalHashRate() });
+  broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats(), totalHashRate: getTotalHashRate() });
 }
 
 // Periodic health report — helps diagnose slowdowns over long runs
 setInterval(() => {
   const m = process.memoryUsage();
-  const s = stmts.getQueueStats.get();
-  console.log(`[health] workers=${workers.size} pending=${s.pending} assigned=${s.assigned} completed=${s.completed} rss=${Math.round(m.rss / 1024 / 1024)}MB heap=${Math.round(m.heapUsed / 1024 / 1024)}MB`);
+  const s = getQueueStats();
+  const workerDetails = [];
+  for (const [id, w] of workers) {
+    const assigned = stmts.countAssignedToWorker.get(id)?.cnt || 0;
+    workerDetails.push(`${workerIdToName(id)}:${formatHashRate(w.hashRate)}/a=${assigned}/d=${w.chunksCompleted}`);
+  }
+  console.log(`[health] workers=${workers.size} pending=${s.pending} assigned=${s.assigned} completed=${s.completed} rate=${formatHashRate(getTotalHashRate())} rss=${Math.round(m.rss / 1024 / 1024)}MB`);
+  if (workerDetails.length > 0) console.log(`[health] ${workerDetails.join(' | ')}`);
 }, 30_000);
 
 // ── WebSocket Handler ───────────────────────────────────────────────────────
@@ -676,10 +814,10 @@ const heartbeatInterval = setInterval(() => {
     if (client.isAlive === false) {
       client.missedPings = (client.missedPings || 0) + 1;
       if (client.workerId) {
-        console.warn(`[ws] missed heartbeat id=${client.workerId} miss=${client.missedPings}/${HEARTBEAT_MISS_LIMIT}`);
+        console.warn(`[ws] missed heartbeat ${wName(client.workerId)} miss=${client.missedPings}/${HEARTBEAT_MISS_LIMIT}`);
       }
       if (client.missedPings >= HEARTBEAT_MISS_LIMIT) {
-        if (client.workerId) console.warn(`[ws] terminating unresponsive worker id=${client.workerId}`);
+        if (client.workerId) console.warn(`[ws] terminating unresponsive worker ${wName(client.workerId)}`);
         client.terminate();
         return;
       }
@@ -705,7 +843,7 @@ function getTotalHashRate() {
 }
 
 setInterval(() => {
-  if (wss.clients.size > 0) broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get(), totalHashRate: getTotalHashRate() });
+  if (wss.clients.size > 0) broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats(), totalHashRate: getTotalHashRate() });
 }, 2000);
 
 wss.on('connection', (ws) => {
@@ -722,20 +860,20 @@ wss.on('connection', (ws) => {
     if (existing && existing.ws !== ws) {
       try { existing.ws.terminate(); } catch {}
       workers.delete(nextWorkerId);
-      stmts.unassignWorkerChunks.run(nextWorkerId);
+      releaseWorkerChunks(nextWorkerId);
     }
 
     if (workerId && workerId !== nextWorkerId) {
       workers.delete(workerId);
-      stmts.unassignWorkerChunks.run(workerId);
+      releaseWorkerChunks(workerId);
     }
 
     workerId = nextWorkerId;
     ws.workerId = workerId;
     workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0, desiredInFlight: 1, lastWorkerUpdateAt: 0 });
 
-    console.log(`[ws] worker registered id=${workerId} total=${workers.size}`);
-    setServerStatus('worker_registered', `Worker ${workerId} is online (${workers.size} total).`);
+    console.log(`[ws] worker registered ${wName(workerId)} total=${workers.size}`);
+    setServerStatus('worker_registered', `Worker ${workerIdToName(workerId)} is online (${workers.size} total).`);
     ws.send(JSON.stringify({ type: 'worker_hello', workerId }));
     ws.send(JSON.stringify({ type: 'server_status', ...serverStatus }));
     broadcast({ type: 'worker_count', count: workers.size });
@@ -759,29 +897,14 @@ wss.on('connection', (ws) => {
 
       case 'request_work': {
         if (!workerId) registerWorker(msg.clientId);
-        // Treat msg.count as "give me this many MORE chunks", not "I want this
-        // many total".  The old behaviour (capping at msg.count total) meant that
-        // fast workers starved: their second lookahead request always came back
-        // empty because the first had already filled the cap.
-        const requestedCount = Math.max(1, parseInt(msg.count, 10) || 1);
-        const alreadyAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
-        const newTarget = Math.min(64, alreadyAssigned + requestedCount);
-        updateWorkerDesiredInFlight(workerId, newTarget);
-        const expired = stmts.expireStaleChunks.run().changes;
-        if (expired > 0) console.log(`[stale] re-queued ${expired} stale chunk(s)`);
-        let chunks = assignWorkRespectingInFlight(workerId, newTarget);
-        // If the queue is empty, synchronously trigger lazy refill so workers
-        // never stall waiting for the 5-second background interval to fire.
-        if (chunks.length === 0) {
-          const refillable = db.prepare(
-            "SELECT id FROM packets WHERE status != 'cracked' AND chunk_gen_offset IS NOT NULL"
-          ).all();
-          if (refillable.length > 0) {
-            for (const { id } of refillable) refillWorkChunks(id);
-            chunks = assignWorkRespectingInFlight(workerId, newTarget);
-          }
-        }
-        // Include raw packet data so clients can attempt decryption themselves
+        const requestedCount = Math.max(1, Math.min(64, parseInt(msg.count, 10) || 1));
+        const expired = recycleStaleChunks();
+        if (expired > 0) console.log(`[stale] recycled ${expired} stale chunk(s) back to virtual pool`);
+        // Assign exactly what the client asked for — client manages its own
+        // pipeline depth via topUpWorkQueue / minAhead.  Don't factor in
+        // alreadyAssigned; that count can drift from reality and cause
+        // under-assignment.
+        const chunks = assignExactChunks(workerId, requestedCount);
         const packetRawData = {};
         for (const chunk of chunks) {
           if (!(chunk.packet_id in packetRawData)) {
@@ -789,8 +912,11 @@ wss.on('connection', (ws) => {
             if (pkt) packetRawData[chunk.packet_id] = pkt.raw_data;
           }
         }
+        const dbAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
+        console.log(`[work] ${wName(workerId)} requested=${requestedCount} → sending ${chunks.length} chunk(s) (db_assigned=${dbAssigned})`);
         ws.send(JSON.stringify({
           type: 'work',
+          solicited: true,
           chunks,
           charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
           packetRawData,
@@ -801,13 +927,25 @@ wss.on('connection', (ws) => {
 
       case 'chunk_complete': {
         if (!workerId) registerWorker(msg.clientId);
-        stmts.completeChunk.run(msg.chunkId, workerId);
+        const result = stmts.completeChunk.run(msg.chunkId);
+        let completionNote = '';
+        if (result.changes === 0) {
+          // Chunk was already completed or deleted (stale recycler).
+          // Delete by ID as a fallback to prevent re-assignment.
+          stmts.deleteChunkById.run(msg.chunkId);
+          completionNote = ' (chunk already completed or recycled)';
+        }
         const worker = workers.get(workerId);
         if (worker) {
           worker.chunksCompleted++;
           worker.hashRate = msg.hashRate || 0;
         }
-        maybePushWork(workerId, 'chunk_complete');
+        const remainingAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
+        console.log(`[done] ${wName(workerId)} chunk=${msg.chunkId} total_done=${worker?.chunksCompleted || '?'} remaining=${remainingAssigned} rate=${formatHashRate(msg.hashRate || 0)}${completionNote}`);
+        // Don't push work here — let the client pull via request_work.
+        // Server pushes caused assigned count to diverge from what the
+        // client actually had queued (push messages piled up in network
+        // buffer while the GPU loop starved the event loop).
         broadcastStats();
         broadcast({ type: 'worker_update', workerId, hashRate: msg.hashRate || 0 });
         break;
@@ -882,19 +1020,19 @@ wss.on('connection', (ws) => {
       }
     }
     } catch (err) {
-      console.error(`[ws-error] unhandled error in ${msg.type} handler (worker=${workerId || 'unregistered'}):`, err.message);
+      console.error(`[ws-error] unhandled error in ${msg.type} handler (${wName(workerId)}):`, err.message);
     }
     const _elapsed = Date.now() - _t0;
-    if (_elapsed > 100) console.warn(`[ws-slow] ${msg.type} took ${_elapsed}ms (worker=${workerId || 'unregistered'})`);
+    if (_elapsed > 100) console.warn(`[ws-slow] ${msg.type} took ${_elapsed}ms (${wName(workerId)})`);
   });
 
   ws.on('close', () => {
     if (!workerId) return;
     const w = workers.get(workerId);
-    stmts.unassignWorkerChunks.run(workerId);
+    releaseWorkerChunks(workerId);
     workers.delete(workerId);
-    console.log(`[ws] worker disconnected id=${workerId} chunks=${w?.chunksCompleted ?? 0} total=${workers.size}`);
-    setServerStatus('worker_disconnected', `Worker ${workerId} disconnected. ${workers.size} workers online.`);
+    console.log(`[ws] worker disconnected ${wName(workerId)} chunks=${w?.chunksCompleted ?? 0} total=${workers.size}`);
+    setServerStatus('worker_disconnected', `Worker ${workerIdToName(workerId)} disconnected. ${workers.size} workers online.`);
     broadcast({ type: 'worker_removed', workerId });
     broadcast({ type: 'worker_count', count: workers.size });
     broadcastStats();
@@ -993,7 +1131,7 @@ app.post('/api/packets', (req, res) => {
   }
 
   const result = stmts.insertPacket.run(hexData, prefix, channelHash, decoded ? JSON.stringify(decoded) : null, cfg.charset, cfg.minLen, cfg.maxLen);
-  createWorkChunks(result.lastInsertRowid, prefix, cfg);
+  initWorkForPacket(result.lastInsertRowid, prefix, cfg);
   const packet = stmts.getPacketById.get(result.lastInsertRowid);
 
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
@@ -1065,7 +1203,7 @@ app.post('/api/packets/:id/retry', (req, res) => {
   // Only delete unfinished chunks — preserve completed ranges so we don't re-crack them
   db.prepare("DELETE FROM work_chunks WHERE packet_id = ? AND status != 'completed'")
     .run(packetId);
-  createWorkChunks(packetId, packet.prefix, cfg);
+  initWorkForPacket(packetId, packet.prefix, cfg);
 
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
   broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
@@ -1106,9 +1244,9 @@ app.get('/api/candidates', (req, res) => {
 });
 
 app.get('/api/stats', (req, res) => {
-  stmts.expireStaleChunks.run();
-  const stats = stmts.getQueueStats.get();
-  const activeStats = stmts.getActiveJobStats.get();
+  recycleStaleChunks();
+  const stats = getQueueStats();
+  const activeStats = getActiveJobStats();
   const workerList = [];
   for (const [id, w] of workers) {
     workerList.push({ id: id.substring(0, 8), hashRate: w.hashRate, chunksCompleted: w.chunksCompleted });
