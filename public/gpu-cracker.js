@@ -374,9 +374,10 @@ class GPUCracker {
     const totalCandidates = chunks.reduce((sum, c) => sum + (c.range_end - c.range_start), 0);
     let processedCandidates = 0;
 
-    // 8 M candidates per dispatch — larger batches amortise the fixed overhead
-    // of mapAsync and buffer copies; GPU timeout risk is negligible at this size.
-    const batchSize = 8388608;
+    // 32M candidates per dispatch — saturates the GPU with enough work to
+    // amortise mapAsync and buffer copy overhead.  At workgroup_size(256) this
+    // is 131,072 workgroups which keeps even high-end GPUs busy.
+    const batchSize = 33554432;
 
     // Flatten all work into a single batch list so the ping-pong pipeline can
     // span chunk boundaries without extra complexity.
@@ -421,6 +422,7 @@ class GPUCracker {
       }
     };
 
+    let _lastProgressTime = 0;
     const finishBatch = async (matches, batch) => {
       this._lastCount += batch.size;
       processedCandidates += batch.size;
@@ -430,8 +432,15 @@ class GPUCracker {
         this._lastCount = 0;
         this._lastTime = performance.now();
       }
-      if (onProgress) onProgress(this.hashRate, processedCandidates, totalCandidates);
-      await sendMatches(matches, batch.chunk);
+      // Throttle progress callbacks to ~1/sec to avoid DOM/WebSocket overhead
+      // between GPU dispatches starving the pipeline.
+      const now = performance.now();
+      if (onProgress && (now - _lastProgressTime > 1000 || processedCandidates >= totalCandidates)) {
+        _lastProgressTime = now;
+        onProgress(this.hashRate, processedCandidates, totalCandidates);
+      }
+      // Send matches without blocking the pipeline — fire and forget
+      if (matches.length > 0) sendMatches(matches, batch.chunk);
       if (batch.isLastInChunk) {
         try {
           ws.send(JSON.stringify({ type: 'chunk_complete', chunkId: batch.chunk.id, hashRate: this.hashRate }));
