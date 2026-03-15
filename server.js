@@ -774,10 +774,19 @@ wss.on('connection', (ws) => {
             chunks = assignWorkRespectingInFlight(workerId, msg.count || 1);
           }
         }
+        // Include raw packet data so clients can attempt decryption themselves
+        const packetRawData = {};
+        for (const chunk of chunks) {
+          if (!(chunk.packet_id in packetRawData)) {
+            const pkt = stmts.getPacketById.get(chunk.packet_id);
+            if (pkt) packetRawData[chunk.packet_id] = pkt.raw_data;
+          }
+        }
         ws.send(JSON.stringify({
           type: 'work',
           chunks,
           charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
+          packetRawData,
         }));
         broadcastStats();
         break;
@@ -816,6 +825,15 @@ wss.on('connection', (ws) => {
         const { packetId: batchPacketId, matches: batchMatches } = msg;
         const batchPacket = stmts.getPacketById.get(batchPacketId);
         if (!batchPacket || batchPacket.status === 'cracked') break;
+
+        // If a client already decoded a match, skip the decoder worker pool
+        const preDecoded = batchMatches.find(m => m.clientDecoded);
+        if (preDecoded) {
+          persistWinningCandidate(batchPacketId, preDecoded.channelName, preDecoded.keyHex, preDecoded.prefixHex);
+          broadcast({ type: 'candidate_found', packetId: batchPacketId, channelName: preDecoded.channelName, key: preDecoded.keyHex, prefix: preDecoded.prefixHex });
+          markPacketCracked(batchPacketId, preDecoded.channelName, preDecoded.keyHex, preDecoded.clientDecoded);
+          break;
+        }
 
         findWinningCandidate(batchPacket, batchMatches, (winner) => {
           if (!winner) return;

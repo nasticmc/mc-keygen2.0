@@ -701,6 +701,7 @@ async function runCrackingLoop() {
       setCrackingStatus('Waiting for work from server...');
       const response = await nextWork;
       const chunks = response.chunks;
+      const packetRawData = response.packetRawData || {};
       if (response.charset) currentCharset = response.charset;
 
       if (chunks.length === 0) {
@@ -751,7 +752,7 @@ async function runCrackingLoop() {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'hashrate_update', hashRate, clientId: getClientId() }));
         }
-      }, currentCharset);
+      }, currentCharset, packetRawData);
 
       // Fill bar to 100% once the batch finishes.
       setLocalProgress(1, 1);
