@@ -1,13 +1,36 @@
 // ── MC-Keygen 2.0 Frontend ──────────────────────────────────────────────────
 
+// ── Worker Name Generator ────────────────────────────────────────────────────
+// Maps a raw worker ID to a deterministic two-word "Animal Emotion" display name.
+const _workerNameAnimals = [
+  'Bear', 'Cat', 'Crow', 'Deer', 'Duck', 'Fox', 'Frog', 'Goat', 'Hawk',
+  'Hare', 'Lynx', 'Lion', 'Mole', 'Moose', 'Newt', 'Orca', 'Owl', 'Puma',
+  'Slug', 'Swan', 'Toad', 'Vole', 'Wolf', 'Wren', 'Yak',
+];
+const _workerNameEmotions = [
+  'Bold', 'Brave', 'Bright', 'Calm', 'Cozy', 'Dark', 'Eager', 'Faint',
+  'Fuzzy', 'Glad', 'Giddy', 'Happy', 'Jolly', 'Keen', 'Merry', 'Proud',
+  'Sharp', 'Snug', 'Sunny', 'Swift', 'Tense', 'Warm', 'Wild', 'Zesty', 'Cool',
+];
+
+function workerIdToName(id) {
+  // djb2 hash for stable, well-distributed index
+  let h = 5381;
+  for (let i = 0; i < id.length; i++) h = (h * 33 ^ id.charCodeAt(i)) >>> 0;
+  const emotion = _workerNameEmotions[h % _workerNameEmotions.length];
+  const animal  = _workerNameAnimals[Math.floor(h / _workerNameEmotions.length) % _workerNameAnimals.length];
+  return `${emotion} ${animal}`;
+}
+
 let ws = null;
 let cracker = null;
 let cracking = false;
 let loopRunning = false;
-let workRequestPending = false;
+let workRequestsInFlight = 0;
 let workRequestSentAt = 0;
 let currentCharset = 'abcdefghijklmnopqrstuvwxyz';
 let serverChunkSize = 500000;
+let lastMeasuredHashRate = 0;
 let persistedClientId = localStorage.getItem('mc-worker-client-id') || '';
 const pendingWorkResolvers = [];
 const queuedWorkMessages = [];
@@ -38,7 +61,7 @@ function connectWebSocket() {
   ws.onopen = () => {
     // Resolve any stale waitForWork promises immediately so the loop wakes up
     // rather than waiting up to 30s for the old timeout to fire.
-    workRequestPending = false;
+    workRequestsInFlight = 0;
     workRequestSentAt = 0;
     const staleResolvers = pendingWorkResolvers.splice(0);
     queuedWorkMessages.length = 0;
@@ -57,7 +80,7 @@ function connectWebSocket() {
     document.getElementById('connection-status').className = 'disconnected';
     document.getElementById('worker-id').textContent = '';
     setCrackingStatus('Socket disconnected. Reconnecting in 2s...');
-    workRequestPending = false;
+    workRequestsInFlight = 0;
     workRequestSentAt = 0;
     clearInterval(ws._keepAliveTimer);
     setTimeout(connectWebSocket, 2000);
@@ -103,8 +126,8 @@ function connectWebSocket() {
         break;
       case 'worker_hello':
         setClientId(msg.workerId);
-        document.getElementById('worker-id').textContent = `ID: ${msg.workerId}`;
-        setCrackingStatus(`Worker registered as ${msg.workerId}. Ready.`);
+        document.getElementById('worker-id').textContent = `ID: ${workerIdToName(msg.workerId)}`;
+        setCrackingStatus(`Worker registered as ${workerIdToName(msg.workerId)}. Ready.`);
         break;
       case 'server_status':
         updateServerStatus(msg);
@@ -114,8 +137,8 @@ function connectWebSocket() {
         refreshWorkerDisplay();
         break;
       case 'work':
-        workRequestPending = false;
-        workRequestSentAt = 0;
+        workRequestsInFlight = Math.max(0, workRequestsInFlight - 1);
+        if (workRequestsInFlight === 0) workRequestSentAt = 0;
         if (pendingWorkResolvers.length > 0) {
           const resolve = pendingWorkResolvers.shift();
           resolve(msg);
@@ -125,6 +148,39 @@ function connectWebSocket() {
         break;
     }
   };
+}
+
+function isMobile() {
+  return /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
+}
+
+function batchCount() {
+  return parseInt(document.getElementById('work-batch-count')?.value, 10) || (isMobile() ? 2 : 16);
+}
+
+function getMinAhead() {
+  // Auto-scale to keep ~2 seconds of work buffered in the pipeline.
+  // Fast GPUs (300 MH/s) will get minAhead≈16; phones (3 MH/s) stay at 2.
+  if (lastMeasuredHashRate > 0 && serverChunkSize > 0) {
+    const msPerBatch = (serverChunkSize * batchCount()) / lastMeasuredHashRate * 1000;
+    const auto = Math.max(2, Math.min(16, Math.ceil(2000 / msPerBatch)));
+    const el = document.getElementById('work-min-ahead');
+    if (el) el.value = auto;
+    return auto;
+  }
+  return parseInt(document.getElementById('work-min-ahead')?.value, 10) || (isMobile() ? 2 : 4);
+}
+
+// Fire enough work requests to keep at least getMinAhead() batches queued or
+// in-flight at all times.  Called on loop start and after each batch finishes.
+function topUpWorkQueue() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const need = getMinAhead() - (queuedWorkMessages.length + workRequestsInFlight);
+  for (let i = 0; i < need; i++) {
+    if (workRequestsInFlight === 0) workRequestSentAt = Date.now();
+    workRequestsInFlight++;
+    ws.send(JSON.stringify({ type: 'request_work', count: batchCount(), clientId: getClientId() }));
+  }
 }
 
 function waitForWork(timeoutMs = 5000) {
@@ -242,7 +298,7 @@ function refreshWorkerDisplay() {
     const card = document.createElement('div');
     card.className = 'worker-card';
     card.innerHTML = `
-      <div class="worker-id">${id.substring(0, 8)}</div>
+      <div class="worker-id">${workerIdToName(id)}</div>
       <div class="worker-rate">${formatHashRate(rate)}</div>
     `;
     container.appendChild(card);
@@ -675,14 +731,6 @@ async function runCrackingLoop() {
   if (loopRunning) return;
   loopRunning = true;
 
-  function isMobile() {
-    return /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
-  }
-
-  function batchCount() {
-    return parseInt(document.getElementById('work-batch-count')?.value, 10) || (isMobile() ? 2 : 16);
-  }
-
   try {
     // If the socket isn't open yet, exit cleanly — ws.onopen will restart us
     // once the connection is established.  This prevents ws.send() throwing a
@@ -690,17 +738,16 @@ async function runCrackingLoop() {
     // permanently strand loopRunning === true and kill the cracking loop.
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-    // Kick off the first work request before entering the loop so there's no
-    // idle time between starting and actually receiving work.
-    workRequestPending = true;
-    workRequestSentAt = Date.now();
-    ws.send(JSON.stringify({ type: 'request_work', count: batchCount(), clientId: getClientId() }));
+    // Fill the lookahead queue before entering the loop so the GPU never idles
+    // waiting on the first round-trip to the server.
+    topUpWorkQueue();
     let nextWork = waitForWork(25000);
 
     while (cracking && ws && ws.readyState === WebSocket.OPEN) {
       setCrackingStatus('Waiting for work from server...');
       const response = await nextWork;
       const chunks = response.chunks;
+      const packetRawData = response.packetRawData || {};
       if (response.charset) currentCharset = response.charset;
 
       if (chunks.length === 0) {
@@ -708,32 +755,20 @@ async function runCrackingLoop() {
           setCrackingStatus('No work available. Requesting more work...');
         }
         if (!cracking || !ws || ws.readyState !== WebSocket.OPEN) break;
-        // Only send a new request if one isn't already in-flight (avoids
-        // duplicate requests when the timeout fires while a response is pending).
-        // If the request has been stuck for >30s, assume it was dropped and
-        // allow a retry so the worker doesn't stall forever.
-        if (workRequestPending && queuedWorkMessages.length === 0 && (Date.now() - workRequestSentAt) > 30000) {
-          workRequestPending = false;
+        // If all in-flight requests have been stuck for >30s with nothing queued,
+        // assume they were dropped and reset the counter so topUpWorkQueue will retry.
+        if (workRequestsInFlight > 0 && queuedWorkMessages.length === 0 && (Date.now() - workRequestSentAt) > 30000) {
+          workRequestsInFlight = 0;
           workRequestSentAt = 0;
         }
-        if (!workRequestPending) {
-          workRequestPending = true;
-          workRequestSentAt = Date.now();
-          ws.send(JSON.stringify({ type: 'request_work', count: batchCount(), clientId: getClientId() }));
-        }
+        topUpWorkQueue();
         nextWork = waitForWork(15000);
         continue;
       }
 
-      // Request the next batch immediately while we process this one so the
-      // GPU never idles waiting on a round-trip to the server.
-      // Guard against sending a duplicate if the previous pre-fetch response
-      // hasn't arrived yet (e.g. after a waitForWork timeout).
-      if (!workRequestPending) {
-        workRequestPending = true;
-        workRequestSentAt = Date.now();
-        ws.send(JSON.stringify({ type: 'request_work', count: batchCount(), clientId: getClientId() }));
-      }
+      // Top up the lookahead queue while we process this batch so the GPU
+      // never idles waiting on a round-trip to the server.
+      topUpWorkQueue();
       nextWork = waitForWork(90000);
 
       const packetIds = [...new Set(chunks.map(c => c.packet_id))];
@@ -745,13 +780,14 @@ async function runCrackingLoop() {
       setLocalProgress(0, 1);
 
       await cracker.processChunks(chunks, ws, (hashRate, processed, total) => {
+        lastMeasuredHashRate = hashRate;
         document.getElementById('stat-hashrate').textContent = formatHashRate(hashRate);
         setCrackingStatus(`Crunching ${chunks.length} chunk(s) at ${formatHashRate(hashRate)}.`);
         setLocalProgress(processed, total);
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'hashrate_update', hashRate, clientId: getClientId() }));
         }
-      }, currentCharset);
+      }, currentCharset, packetRawData);
 
       // Fill bar to 100% once the batch finishes.
       setLocalProgress(1, 1);

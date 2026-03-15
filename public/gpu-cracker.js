@@ -365,7 +365,7 @@ class GPUCracker {
     return matches;
   }
 
-  async processChunks(chunks, ws, onProgress, charset) {
+  async processChunks(chunks, ws, onProgress, charset, packetRawData = {}) {
     this.running = true;
     this._lastTime = performance.now();
     this._lastCount = 0;
@@ -393,7 +393,7 @@ class GPUCracker {
       }
     }
 
-    const sendMatches = (matches, chunk) => {
+    const sendMatches = async (matches, chunk) => {
       if (matches.length === 0) return;
       const batchMatches = [];
       for (const m of matches) {
@@ -401,11 +401,18 @@ class GPUCracker {
         if (!channelName) continue;
         const keyHex = [m.key0, m.key1, m.key2, m.key3]
           .map(w => w.toString(16).padStart(8, '0')).join('');
-        batchMatches.push({
+        const entry = {
           channelName,
           keyHex,
           prefixHex: chunk.target_prefix.toString(16).padStart(2, '0'),
-        });
+        };
+        // Attempt client-side decryption to skip a server round-trip
+        const rawData = packetRawData[chunk.packet_id];
+        if (rawData && typeof clientTryDecrypt === 'function') {
+          const decoded = await clientTryDecrypt(rawData, keyHex);
+          if (decoded) entry.clientDecoded = decoded;
+        }
+        batchMatches.push(entry);
       }
       if (batchMatches.length > 0) {
         try {
@@ -414,7 +421,7 @@ class GPUCracker {
       }
     };
 
-    const finishBatch = (matches, batch) => {
+    const finishBatch = async (matches, batch) => {
       this._lastCount += batch.size;
       processedCandidates += batch.size;
       const elapsed = (performance.now() - this._lastTime) / 1000;
@@ -424,7 +431,7 @@ class GPUCracker {
         this._lastTime = performance.now();
       }
       if (onProgress) onProgress(this.hashRate, processedCandidates, totalCandidates);
-      sendMatches(matches, batch.chunk);
+      await sendMatches(matches, batch.chunk);
       if (batch.isLastInChunk) {
         try {
           ws.send(JSON.stringify({ type: 'chunk_complete', chunkId: batch.chunk.id, hashRate: this.hashRate }));
@@ -452,7 +459,7 @@ class GPUCracker {
       if (pending) {
         try {
           const matches = await pending.promise;
-          finishBatch(matches, pending.batch);
+          await finishBatch(matches, pending.batch);
         } catch (err) {
           console.error('GPU readback error:', err);
         }
@@ -466,7 +473,7 @@ class GPUCracker {
     if (pending) {
       try {
         const matches = await pending.promise;
-        if (this.running) finishBatch(matches, pending.batch);
+        if (this.running) await finishBatch(matches, pending.batch);
       } catch (err) {
         console.error('GPU readback error:', err);
       }
@@ -532,7 +539,7 @@ class CPUCracker {
     return '#' + name;
   }
 
-  async processChunks(chunks, ws, onProgress, charset) {
+  async processChunks(chunks, ws, onProgress, charset, packetRawData = {}) {
     this.running = true;
     let totalHashed = 0;
     let lastTime = performance.now();
@@ -551,13 +558,19 @@ class CPUCracker {
         const prefix = await derivePrefixJS(key);
 
         if (prefix === chunk.target_prefix) {
+          const keyHex = bufToHex(key);
+          const prefixHex = prefix.toString(16).padStart(2, '0');
+          const entry = { channelName, keyHex, prefixHex };
+          const rawData = packetRawData[chunk.packet_id];
+          if (rawData && typeof clientTryDecrypt === 'function') {
+            const decoded = await clientTryDecrypt(rawData, keyHex);
+            if (decoded) entry.clientDecoded = decoded;
+          }
           try {
             ws.send(JSON.stringify({
-              type: 'prefix_match',
+              type: 'prefix_match_batch',
               packetId: chunk.packet_id,
-              channelName,
-              key: bufToHex(key),
-              prefix: prefix.toString(16).padStart(2, '0'),
+              matches: [entry],
             }));
           } catch (_) { /* ws closed; loop will detect and recover */ }
         }

@@ -759,10 +759,17 @@ wss.on('connection', (ws) => {
 
       case 'request_work': {
         if (!workerId) registerWorker(msg.clientId);
-        updateWorkerDesiredInFlight(workerId, msg.count);
+        // Treat msg.count as "give me this many MORE chunks", not "I want this
+        // many total".  The old behaviour (capping at msg.count total) meant that
+        // fast workers starved: their second lookahead request always came back
+        // empty because the first had already filled the cap.
+        const requestedCount = Math.max(1, parseInt(msg.count, 10) || 1);
+        const alreadyAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
+        const newTarget = Math.min(64, alreadyAssigned + requestedCount);
+        updateWorkerDesiredInFlight(workerId, newTarget);
         const expired = stmts.expireStaleChunks.run().changes;
         if (expired > 0) console.log(`[stale] re-queued ${expired} stale chunk(s)`);
-        let chunks = assignWorkRespectingInFlight(workerId, msg.count || 1);
+        let chunks = assignWorkRespectingInFlight(workerId, newTarget);
         // If the queue is empty, synchronously trigger lazy refill so workers
         // never stall waiting for the 5-second background interval to fire.
         if (chunks.length === 0) {
@@ -771,13 +778,22 @@ wss.on('connection', (ws) => {
           ).all();
           if (refillable.length > 0) {
             for (const { id } of refillable) refillWorkChunks(id);
-            chunks = assignWorkRespectingInFlight(workerId, msg.count || 1);
+            chunks = assignWorkRespectingInFlight(workerId, newTarget);
+          }
+        }
+        // Include raw packet data so clients can attempt decryption themselves
+        const packetRawData = {};
+        for (const chunk of chunks) {
+          if (!(chunk.packet_id in packetRawData)) {
+            const pkt = stmts.getPacketById.get(chunk.packet_id);
+            if (pkt) packetRawData[chunk.packet_id] = pkt.raw_data;
           }
         }
         ws.send(JSON.stringify({
           type: 'work',
           chunks,
           charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
+          packetRawData,
         }));
         broadcastStats();
         break;
@@ -816,6 +832,19 @@ wss.on('connection', (ws) => {
         const { packetId: batchPacketId, matches: batchMatches } = msg;
         const batchPacket = stmts.getPacketById.get(batchPacketId);
         if (!batchPacket || batchPacket.status === 'cracked') break;
+
+        // If a client already decoded a match, validate it then skip the decoder pool
+        const preDecoded = batchMatches.find(m => {
+          if (!m.clientDecoded) return false;
+          const v = validateDecryptedContent(m.clientDecoded);
+          return v.valid;
+        });
+        if (preDecoded) {
+          persistWinningCandidate(batchPacketId, preDecoded.channelName, preDecoded.keyHex, preDecoded.prefixHex);
+          broadcast({ type: 'candidate_found', packetId: batchPacketId, channelName: preDecoded.channelName, key: preDecoded.keyHex, prefix: preDecoded.prefixHex });
+          markPacketCracked(batchPacketId, preDecoded.channelName, preDecoded.keyHex, preDecoded.clientDecoded);
+          break;
+        }
 
         findWinningCandidate(batchPacket, batchMatches, (winner) => {
           if (!winner) return;
