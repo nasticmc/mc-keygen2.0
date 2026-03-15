@@ -1,6 +1,8 @@
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
+const { Worker } = require('worker_threads');
+const os = require('os');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
 const path = require('path');
@@ -294,6 +296,10 @@ const stmts = {
     SET status = 'assigned', assigned_to = ?, assigned_at = CURRENT_TIMESTAMP
     WHERE id = ? AND status = 'pending'
   `),
+  checkCandidateExists: db.prepare('SELECT 1 FROM candidate_keys WHERE packet_id = ? AND key = ? LIMIT 1'),
+  getCandidateByKey: db.prepare('SELECT id FROM candidate_keys WHERE packet_id = ? AND key = ? ORDER BY id DESC LIMIT 1'),
+  setCandidateVerified: db.prepare('UPDATE candidate_keys SET verified = 1, decode_success = ? WHERE id = ?'),
+  completePacketChunks: db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'"),
 };
 
 const assignPendingChunks = db.transaction((workerId, count) => {
@@ -305,6 +311,60 @@ const assignPendingChunks = db.transaction((workerId, count) => {
   }
   return assigned;
 });
+
+// ── Decoder Worker Pool ──────────────────────────────────────────────────────
+// Runs MeshCorePacketDecoder in worker threads so the main event loop is never
+// blocked while verifying prefix-match candidates.  Pool size = min(cpus-1, 4).
+const DECODER_POOL_SIZE = Math.max(1, Math.min(os.cpus().length - 1, 4));
+const _decoderPool = [];
+const _decoderQueue = [];
+let _decoderTaskId = 0;
+const _decoderCallbacks = new Map();
+
+function _spawnDecoderWorker() {
+  const w = new Worker(path.join(__dirname, 'decoder-worker.js'));
+  w.busy = false;
+  w.on('message', ({ id, ...result }) => {
+    w.busy = false;
+    const cb = _decoderCallbacks.get(id);
+    if (cb) { _decoderCallbacks.delete(id); cb(result); }
+    _drainDecoderPool(w);
+  });
+  w.on('error', (err) => {
+    console.error('[decoder-pool] worker error:', err.message);
+    w.busy = false;
+    const idx = _decoderPool.indexOf(w);
+    if (idx >= 0) _decoderPool.splice(idx, 1);
+    const replacement = _spawnDecoderWorker();
+    _decoderPool.push(replacement);
+    _drainDecoderPool(replacement);
+  });
+  w.on('exit', (code) => {
+    if (code === 0) return;
+    console.error(`[decoder-pool] worker exited with code ${code}, restarting`);
+    const idx = _decoderPool.indexOf(w);
+    if (idx >= 0) { _decoderPool.splice(idx, 1); _decoderPool.push(_spawnDecoderWorker()); }
+  });
+  return w;
+}
+
+function _drainDecoderPool(worker) {
+  if (!worker.busy && _decoderQueue.length > 0) {
+    const task = _decoderQueue.shift();
+    worker.busy = true;
+    worker.postMessage(task);
+  }
+}
+
+function decodeAsync(hexData, channelKey, cb) {
+  const id = _decoderTaskId++;
+  _decoderCallbacks.set(id, cb);
+  const free = _decoderPool.find(w => !w.busy);
+  if (free) { free.busy = true; free.postMessage({ id, hexData, channelKey }); }
+  else _decoderQueue.push({ id, hexData, channelKey });
+}
+
+for (let i = 0; i < DECODER_POOL_SIZE; i++) _decoderPool.push(_spawnDecoderWorker());
 
 // ── Work Chunk Generation ───────────────────────────────────────────────────
 const CHUNK_SIZE = 4_000_000;
@@ -485,6 +545,7 @@ wss.on('connection', (ws) => {
   ws.on('pong', () => { ws.isAlive = true; ws.missedPings = 0; });
   workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0 });
   console.log(`[ws] worker connected  id=${workerId.substring(0, 8)} total=${workers.size}`);
+  ws.send(JSON.stringify({ type: 'worker_hello', workerId: workerId.substring(0, 8) }));
   broadcast({ type: 'worker_count', count: workers.size });
 
   ws.on('message', (raw) => {
@@ -532,46 +593,31 @@ wss.on('connection', (ws) => {
 
       case 'prefix_match': {
         const { packetId, channelName, key, prefix } = msg;
-        const exists = db.prepare('SELECT 1 FROM candidate_keys WHERE packet_id = ? AND key = ? LIMIT 1')
-          .get(packetId, key);
-        if (!exists) {
+        if (!stmts.checkCandidateExists.get(packetId, key)) {
           stmts.insertCandidate.run(packetId, channelName, key, prefix);
         }
-        broadcast({
-          type: 'candidate_found',
-          packetId,
-          channelName,
-          key,
-          prefix,
-        });
+        broadcast({ type: 'candidate_found', packetId, channelName, key, prefix });
         broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
 
-        // Auto-try decryption with this candidate
         const packet = stmts.getPacketById.get(packetId);
         if (packet && packet.status !== 'cracked') {
-          try {
-            const result = tryDecrypt(packet.raw_data, key);
-            const candidateRow = db.prepare('SELECT id FROM candidate_keys WHERE packet_id = ? AND key = ? ORDER BY id DESC LIMIT 1')
-              .get(packetId, key);
-            if (candidateRow) {
-              db.prepare('UPDATE candidate_keys SET verified = 1, decode_success = ? WHERE id = ?')
-                .run(result.success ? 1 : 0, candidateRow.id);
-            }
-
+          decodeAsync(packet.raw_data, key, (result) => {
+            const row = stmts.getCandidateByKey.get(packetId, key);
+            if (row) stmts.setCandidateVerified.run(result.success ? 1 : 0, row.id);
             if (result.success) {
-              console.log(`[FOUND] packet ${packetId} cracked — channel="${channelName}" key=${key.substring(0, 8)}...`);
-              stmts.updatePacketStatus.run('cracked', key, channelName, packetId);
-              if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), packetId);
-              db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
-                .run(packetId);
-              broadcast({ type: 'key_found', packetId, key, channelName, decoded: result.decoded });
-              broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
-              broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+              const current = stmts.getPacketById.get(packetId);
+              if (current && current.status !== 'cracked') {
+                console.log(`[FOUND] packet ${packetId} cracked — channel="${channelName}" key=${key.substring(0, 8)}...`);
+                stmts.updatePacketStatus.run('cracked', key, channelName, packetId);
+                if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), packetId);
+                stmts.completePacketChunks.run(packetId);
+                broadcast({ type: 'key_found', packetId, key, channelName, decoded: result.decoded });
+                broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
+                broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+              }
             }
             broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
-          } catch (err) {
-            console.error('Auto-decrypt error:', err.message);
-          }
+          });
         }
         break;
       }
@@ -581,37 +627,45 @@ wss.on('connection', (ws) => {
         const batchPacket = stmts.getPacketById.get(batchPacketId);
         if (!batchPacket || batchPacket.status === 'cracked') break;
 
-        let foundKey = false;
+        // Insert all candidates synchronously (fast) then return immediately.
+        // Decode verification is handed off to the worker pool so this handler
+        // never blocks the event loop regardless of batch size.
+        const toVerify = [];
         for (const { channelName: cn, keyHex, prefixHex: ph } of batchMatches) {
-          if (foundKey) break;
-          const exists = db.prepare('SELECT 1 FROM candidate_keys WHERE packet_id = ? AND key = ? LIMIT 1')
-            .get(batchPacketId, keyHex);
-          if (!exists) stmts.insertCandidate.run(batchPacketId, cn, keyHex, ph);
-
-          try {
-            const result = tryDecrypt(batchPacket.raw_data, keyHex);
-            const candidateRow = db.prepare('SELECT id FROM candidate_keys WHERE packet_id = ? AND key = ? ORDER BY id DESC LIMIT 1')
-              .get(batchPacketId, keyHex);
-            if (candidateRow) {
-              db.prepare('UPDATE candidate_keys SET verified = 1, decode_success = ? WHERE id = ?')
-                .run(result.success ? 1 : 0, candidateRow.id);
-            }
-            if (result.success) {
-              console.log(`[FOUND] packet ${batchPacketId} cracked — channel="${cn}" key=${keyHex.substring(0, 8)}...`);
-              stmts.updatePacketStatus.run('cracked', keyHex, cn, batchPacketId);
-              if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), batchPacketId);
-              db.prepare("UPDATE work_chunks SET status = 'completed' WHERE packet_id = ? AND status != 'completed'")
-                .run(batchPacketId);
-              broadcast({ type: 'key_found', packetId: batchPacketId, key: keyHex, channelName: cn, decoded: result.decoded });
-              broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
-              broadcast({ type: 'packets', packets: stmts.getPackets.all() });
-              foundKey = true;
-            }
-          } catch (err) {
-            console.error('Batch auto-decrypt error:', err.message);
+          if (!stmts.checkCandidateExists.get(batchPacketId, keyHex)) {
+            stmts.insertCandidate.run(batchPacketId, cn, keyHex, ph);
           }
+          toVerify.push({ cn, keyHex });
         }
         broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
+
+        let pending = toVerify.length;
+        let found = false;
+        for (const { cn, keyHex } of toVerify) {
+          decodeAsync(batchPacket.raw_data, keyHex, (result) => {
+            pending--;
+            if (found) {
+              if (pending === 0) broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
+              return;
+            }
+            const row = stmts.getCandidateByKey.get(batchPacketId, keyHex);
+            if (row) stmts.setCandidateVerified.run(result.success ? 1 : 0, row.id);
+            if (result.success) {
+              const current = stmts.getPacketById.get(batchPacketId);
+              if (current && current.status !== 'cracked') {
+                found = true;
+                console.log(`[FOUND] packet ${batchPacketId} cracked — channel="${cn}" key=${keyHex.substring(0, 8)}...`);
+                stmts.updatePacketStatus.run('cracked', keyHex, cn, batchPacketId);
+                if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), batchPacketId);
+                stmts.completePacketChunks.run(batchPacketId);
+                broadcast({ type: 'key_found', packetId: batchPacketId, key: keyHex, channelName: cn, decoded: result.decoded });
+                broadcast({ type: 'stats', ...stmts.getQueueStats.get(), activeStats: stmts.getActiveJobStats.get() });
+                broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+              }
+            }
+            if (pending === 0) broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
+          });
+        }
         break;
       }
 
@@ -891,4 +945,6 @@ server.listen(PORT, () => {
   console.log(`MC-Keygen 2.0 running on http://localhost:${PORT}`);
   const decoderVersion = require('@michaelhart/meshcore-decoder/package.json').version;
   console.log(`meshcoredecoder: available (v${decoderVersion})`);
+  console.log(`decoder pool: ${DECODER_POOL_SIZE} worker thread${DECODER_POOL_SIZE > 1 ? 's' : ''} (${os.cpus().length} CPU cores)`);
+
 });
