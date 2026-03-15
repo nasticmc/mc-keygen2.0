@@ -617,8 +617,12 @@ async function runCrackingLoop() {
   if (loopRunning) return;
   loopRunning = true;
 
+  function isMobile() {
+    return /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
+  }
+
   function batchCount() {
-    return parseInt(document.getElementById('work-batch-count')?.value, 10) || 4;
+    return parseInt(document.getElementById('work-batch-count')?.value, 10) || (isMobile() ? 1 : 4);
   }
 
   // Kick off the first work request before entering the loop so there's no
@@ -771,6 +775,13 @@ function updateKeyspaceEstimate() {
 
 // ── Boot ────────────────────────────────────────────────────────────────────
 (async () => {
+  // Set work batch default based on device type
+  const batchInput = document.getElementById('work-batch-count');
+  if (batchInput) {
+    const mobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
+    batchInput.value = mobile ? 1 : 4;
+  }
+
   connectWebSocket();
   await loadData();
   await initCracker();
