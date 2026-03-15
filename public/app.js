@@ -589,6 +589,11 @@ document.getElementById('btn-decode').addEventListener('click', async () => {
 // ── Cracking Controls ───────────────────────────────────────────────────────
 async function initCracker() {
   const gpuStatus = document.getElementById('gpu-status');
+  const startBtn = document.getElementById('btn-start-cracking');
+
+  // Disable start button until the cracker is ready — clicking before init
+  // completes would leave cracker as null and crash processChunks.
+  startBtn.disabled = true;
 
   cracker = new GPUCracker();
   const gpuOk = await cracker.init();
@@ -602,6 +607,8 @@ async function initCracker() {
     gpuStatus.textContent = 'WebGPU: N/A (CPU fallback)';
     gpuStatus.classList.add('unsupported');
   }
+
+  startBtn.disabled = false;
 }
 
 document.getElementById('btn-start-cracking').addEventListener('click', async () => {
@@ -638,13 +645,19 @@ async function runCrackingLoop() {
     return parseInt(document.getElementById('work-batch-count')?.value, 10) || (isMobile() ? 1 : 4);
   }
 
-  // Kick off the first work request before entering the loop so there's no
-  // idle time between starting and actually receiving work.
-  workRequestPending = true;
-  ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
-  let nextWork = waitForWork(25000);
-
   try {
+    // If the socket isn't open yet, exit cleanly — ws.onopen will restart us
+    // once the connection is established.  This prevents ws.send() throwing a
+    // DOMException (INVALID_STATE_ERR) outside the try/finally, which would
+    // permanently strand loopRunning === true and kill the cracking loop.
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    // Kick off the first work request before entering the loop so there's no
+    // idle time between starting and actually receiving work.
+    workRequestPending = true;
+    ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
+    let nextWork = waitForWork(25000);
+
     while (cracking && ws && ws.readyState === WebSocket.OPEN) {
       setCrackingStatus('Waiting for work from server...');
       const response = await nextWork;
