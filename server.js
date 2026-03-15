@@ -492,11 +492,23 @@ wss.on('connection', (ws) => {
     try { msg = JSON.parse(raw); } catch { return; }
 
     const _t0 = Date.now();
+    try {
     switch (msg.type) {
       case 'request_work': {
         const expired = stmts.expireStaleChunks.run().changes;
         if (expired > 0) console.log(`[stale] re-queued ${expired} stale chunk(s)`);
-        const chunks = assignPendingChunks(workerId, msg.count || 1);
+        let chunks = assignPendingChunks(workerId, msg.count || 1);
+        // If the queue is empty, synchronously trigger lazy refill so workers
+        // never stall waiting for the 5-second background interval to fire.
+        if (chunks.length === 0) {
+          const refillable = db.prepare(
+            "SELECT id FROM packets WHERE status != 'cracked' AND chunk_gen_offset IS NOT NULL"
+          ).all();
+          if (refillable.length > 0) {
+            for (const { id } of refillable) refillWorkChunks(id);
+            chunks = assignPendingChunks(workerId, msg.count || 1);
+          }
+        }
         ws.send(JSON.stringify({
           type: 'work',
           chunks,
@@ -629,6 +641,9 @@ wss.on('connection', (ws) => {
         ws.missedPings = 0;
         break;
       }
+    }
+    } catch (err) {
+      console.error(`[ws-error] unhandled error in ${msg.type} handler (worker=${workerId.substring(0, 8)}):`, err.message);
     }
     const _elapsed = Date.now() - _t0;
     if (_elapsed > 100) console.warn(`[ws-slow] ${msg.type} took ${_elapsed}ms (worker=${workerId.substring(0, 8)})`);

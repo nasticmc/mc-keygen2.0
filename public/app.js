@@ -673,6 +673,12 @@ async function runCrackingLoop() {
         if (!cracking || !ws || ws.readyState !== WebSocket.OPEN) break;
         // Only send a new request if one isn't already in-flight (avoids
         // duplicate requests when the timeout fires while a response is pending).
+        // However, if the in-flight request has been pending longer than two
+        // retry cycles (i.e. the server never responded), force-reset the flag
+        // so we don't silently stall forever.
+        if (workRequestPending && queuedWorkMessages.length === 0) {
+          workRequestPending = false;
+        }
         if (!workRequestPending) {
           workRequestPending = true;
           ws.send(JSON.stringify({ type: 'request_work', count: batchCount() }));
