@@ -315,7 +315,7 @@ const assignPendingChunks = db.transaction((workerId, count) => {
 // ── Decoder Worker Pool ──────────────────────────────────────────────────────
 // Runs MeshCorePacketDecoder in worker threads so the main event loop is never
 // blocked while verifying prefix-match candidates.  Pool size = min(cpus-1, 4).
-const DECODER_POOL_SIZE = Math.max(1, Math.min(os.cpus().length - 1, 4));
+const DECODER_POOL_SIZE = Math.max(1, os.cpus().length - 1);
 const _decoderPool = [];
 const _decoderQueue = [];
 let _decoderTaskId = 0;
@@ -627,16 +627,20 @@ wss.on('connection', (ws) => {
         const batchPacket = stmts.getPacketById.get(batchPacketId);
         if (!batchPacket || batchPacket.status === 'cracked') break;
 
-        // Insert all candidates synchronously (fast) then return immediately.
-        // Decode verification is handed off to the worker pool so this handler
-        // never blocks the event loop regardless of batch size.
-        const toVerify = [];
-        for (const { channelName: cn, keyHex, prefixHex: ph } of batchMatches) {
-          if (!stmts.checkCandidateExists.get(batchPacketId, keyHex)) {
-            stmts.insertCandidate.run(batchPacketId, cn, keyHex, ph);
+        // Insert all new candidates in a single transaction.  Without an
+        // explicit transaction every INSERT auto-commits, which in WAL mode
+        // serialises each write through the journal and can block the event
+        // loop for several seconds when a batch carries thousands of matches.
+        db.transaction(() => {
+          for (const { channelName: cn, keyHex, prefixHex: ph } of batchMatches) {
+            if (!stmts.checkCandidateExists.get(batchPacketId, keyHex)) {
+              stmts.insertCandidate.run(batchPacketId, cn, keyHex, ph);
+            }
           }
-          toVerify.push({ cn, keyHex });
-        }
+        })();
+
+        // Build the verify list after the transaction so reads see committed data.
+        const toVerify = batchMatches.map(({ channelName: cn, keyHex }) => ({ cn, keyHex }));
         broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
 
         let pending = toVerify.length;

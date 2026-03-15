@@ -90,7 +90,7 @@ struct MatchEntry {
 
 struct Results {
   match_count: atomic<u32>,
-  matches: array<MatchEntry, 4096>,  // larger pool for bigger batches
+  matches: array<MatchEntry, 8192>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -184,7 +184,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   if (prefix_byte == params.target_prefix) {
     let slot = atomicAdd(&results.match_count, 1u);
-    if (slot < 4096u) {
+    if (slot < 8192u) {
       results.matches[slot].index = candidate_idx;
       results.matches[slot].key0  = hash1[0];
       results.matches[slot].key1  = hash1[1];
@@ -273,49 +273,85 @@ class GPUCracker {
     return '#' + name;
   }
 
-  async crackChunk(targetPrefix, rangeStart, rangeSize, charset) {
-    if (!this.supported || !this.device) {
-      throw new Error('WebGPU not initialized');
-    }
+  ensureBuffers() {
+    if (this.bufferSets) return;
 
-    this.ensureBuffers();
+    // 4-byte atomic count + 8192 entries × 5 u32s × 4 bytes = 163,844 bytes
+    const MATCH_SLOTS = 8192;
+    const resultSize = 4 + MATCH_SLOTS * 5 * 4;
+    this._matchSlots = MATCH_SLOTS;
+    this._resultSize = resultSize;
 
-    // Params: target_prefix, range_start, range_size, charset_len
-    const paramsData = new Uint32Array([targetPrefix, rangeStart, rangeSize, charset.length]);
-    this.device.queue.writeBuffer(this.paramsBuffer, 0, paramsData);
+    // Params and charset are shared across both buffer sets — the GPU queue
+    // serialises writeBuffer calls, so params for batch N are always written
+    // before batch N's compute pass executes.
+    this.paramsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.charsetBuffer = this.device.createBuffer({
+      size: 64 * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
 
+    // Two buffer sets for ping-pong double-buffering.  While the GPU computes
+    // batch N on one set, the CPU reads back batch N-1 from the other set.
+    this.bufferSets = [0, 1].map(() => {
+      const resultBuffer = this.device.createBuffer({
+        size: resultSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+      const readBuffer = this.device.createBuffer({
+        size: resultSize,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      const bindGroup = this.device.createBindGroup({
+        layout: this.pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.paramsBuffer } },
+          { binding: 1, resource: { buffer: resultBuffer } },
+          { binding: 2, resource: { buffer: this.charsetBuffer } },
+        ],
+      });
+      return { resultBuffer, readBuffer, bindGroup };
+    });
+  }
+
+  // Submit a compute dispatch to the GPU (non-blocking — does not await completion).
+  _dispatchBatch(bufSetIdx, targetPrefix, rangeStart, rangeSize, charset) {
     if (this.cachedCharset !== charset) {
       const charsetData = new Uint32Array(64);
-      for (let i = 0; i < charset.length; i++) {
-        charsetData[i] = charset.charCodeAt(i);
-      }
+      for (let i = 0; i < charset.length; i++) charsetData[i] = charset.charCodeAt(i);
       this.device.queue.writeBuffer(this.charsetBuffer, 0, charsetData);
       this.cachedCharset = charset;
     }
 
-    // Reset match count for this dispatch.
-    this.device.queue.writeBuffer(this.resultBuffer, 0, new Uint32Array([0]));
+    const { resultBuffer, readBuffer, bindGroup } = this.bufferSets[bufSetIdx];
 
-    const workgroupSize = 256;
-    const numWorkgroups = Math.ceil(rangeSize / workgroupSize);
+    // Reset match count then write params for this batch.
+    this.device.queue.writeBuffer(resultBuffer, 0, new Uint32Array([0]));
+    this.device.queue.writeBuffer(this.paramsBuffer, 0,
+      new Uint32Array([targetPrefix, rangeStart, rangeSize, charset.length]));
 
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginComputePass();
     pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, this.bindGroup);
-    pass.dispatchWorkgroups(numWorkgroups);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(rangeSize / 256));
     pass.end();
-
-    const resultSize = this._resultSize;
-    encoder.copyBufferToBuffer(this.resultBuffer, 0, this.readBuffer, 0, resultSize);
+    encoder.copyBufferToBuffer(resultBuffer, 0, readBuffer, 0, this._resultSize);
     this.device.queue.submit([encoder.finish()]);
+  }
 
-    await this.readBuffer.mapAsync(GPUMapMode.READ);
-    const resultData = new Uint32Array(this.readBuffer.getMappedRange());
+  // Map the read buffer for bufSetIdx and extract matches.  Returns a promise
+  // that resolves once the GPU has finished writing to that buffer.
+  async _readResults(bufSetIdx) {
+    const { readBuffer } = this.bufferSets[bufSetIdx];
+    await readBuffer.mapAsync(GPUMapMode.READ);
+    const resultData = new Uint32Array(readBuffer.getMappedRange());
     const matchCount = resultData[0];
-    const MATCH_SLOTS = this._matchSlots;
     const matches = [];
-    for (let i = 0; i < Math.min(matchCount, MATCH_SLOTS); i++) {
+    for (let i = 0; i < Math.min(matchCount, this._matchSlots); i++) {
       const base = 1 + i * 5;
       matches.push({
         index: resultData[base],
@@ -325,110 +361,115 @@ class GPUCracker {
         key3:  resultData[base + 4],
       });
     }
-    this.readBuffer.unmap();
-
+    readBuffer.unmap();
     return matches;
-  }
-
-  ensureBuffers() {
-    if (this.bindGroup) return;
-
-    // 4-byte atomic count + 4096 entries × 5 u32s × 4 bytes = 81,924 bytes
-    const MATCH_SLOTS = 4096;
-    const resultSize = 4 + MATCH_SLOTS * 5 * 4;
-    this._matchSlots = MATCH_SLOTS;
-    this._resultSize = resultSize;
-    this.paramsBuffer = this.device.createBuffer({
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.resultBuffer = this.device.createBuffer({
-      size: resultSize,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-    this.readBuffer = this.device.createBuffer({
-      size: resultSize,
-      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-    });
-    this.charsetBuffer = this.device.createBuffer({
-      size: 64 * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-
-    this.bindGroup = this.device.createBindGroup({
-      layout: this.pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.paramsBuffer } },
-        { binding: 1, resource: { buffer: this.resultBuffer } },
-        { binding: 2, resource: { buffer: this.charsetBuffer } },
-      ],
-    });
   }
 
   async processChunks(chunks, ws, onProgress, charset) {
     this.running = true;
     this._lastTime = performance.now();
     this._lastCount = 0;
+    this.ensureBuffers();
 
     const totalCandidates = chunks.reduce((sum, c) => sum + (c.range_end - c.range_start), 0);
     let processedCandidates = 0;
 
+    // 8 M candidates per dispatch — larger batches amortise the fixed overhead
+    // of mapAsync and buffer copies; GPU timeout risk is negligible at this size.
+    const batchSize = 8388608;
+
+    // Flatten all work into a single batch list so the ping-pong pipeline can
+    // span chunk boundaries without extra complexity.
+    const batches = [];
     for (const chunk of chunks) {
+      const rangeSize = chunk.range_end - chunk.range_start;
+      for (let offset = 0; offset < rangeSize; offset += batchSize) {
+        batches.push({
+          chunk,
+          start: chunk.range_start + offset,
+          size: Math.min(batchSize, rangeSize - offset),
+          isLastInChunk: offset + batchSize >= rangeSize,
+        });
+      }
+    }
+
+    const sendMatches = (matches, chunk) => {
+      if (matches.length === 0) return;
+      const batchMatches = [];
+      for (const m of matches) {
+        const channelName = this.indexToChannelName(m.index, charset);
+        if (!channelName) continue;
+        const keyHex = [m.key0, m.key1, m.key2, m.key3]
+          .map(w => w.toString(16).padStart(8, '0')).join('');
+        batchMatches.push({
+          channelName,
+          keyHex,
+          prefixHex: chunk.target_prefix.toString(16).padStart(2, '0'),
+        });
+      }
+      if (batchMatches.length > 0) {
+        try {
+          ws.send(JSON.stringify({ type: 'prefix_match_batch', packetId: chunk.packet_id, matches: batchMatches }));
+        } catch (_) { /* ws closed mid-batch; loop will detect on next iteration */ }
+      }
+    };
+
+    const finishBatch = (matches, batch) => {
+      this._lastCount += batch.size;
+      processedCandidates += batch.size;
+      const elapsed = (performance.now() - this._lastTime) / 1000;
+      if (elapsed > 0.5) {
+        this.hashRate = Math.round(this._lastCount / elapsed);
+        this._lastCount = 0;
+        this._lastTime = performance.now();
+      }
+      if (onProgress) onProgress(this.hashRate, processedCandidates, totalCandidates);
+      sendMatches(matches, batch.chunk);
+      if (batch.isLastInChunk) {
+        try {
+          ws.send(JSON.stringify({ type: 'chunk_complete', chunkId: batch.chunk.id, hashRate: this.hashRate }));
+        } catch (_) { /* ws closed; server will re-queue via stale-chunk expiry */ }
+      }
+    };
+
+    // Ping-pong pipeline: dispatch batch i, then await batch i-1's readback
+    // while the GPU is already computing batch i.  This hides mapAsync latency
+    // behind GPU compute time.
+    let pending = null; // { promise, bufSetIdx, batch }
+    let pingPong = 0;
+
+    for (let i = 0; i < batches.length; i++) {
       if (!this.running) break;
 
-      const rangeSize = chunk.range_end - chunk.range_start;
-      const batchSize = 4194304; // 4M — matches server chunk size, halves mapAsync round-trips
+      const batch = batches[i];
+      const currentPP = pingPong;
+      pingPong = 1 - pingPong;
 
-      for (let offset = 0; offset < rangeSize && this.running; offset += batchSize) {
-        const size = Math.min(batchSize, rangeSize - offset);
-        const start = chunk.range_start + offset;
+      // Submit this batch to the GPU (returns immediately).
+      this._dispatchBatch(currentPP, batch.chunk.target_prefix, batch.start, batch.size, charset);
 
+      // Await the previous batch's GPU results while this batch computes.
+      if (pending) {
         try {
-          const matches = await this.crackChunk(chunk.target_prefix, start, size, charset);
-
-          this._lastCount += size;
-          processedCandidates += size;
-          const elapsed = (performance.now() - this._lastTime) / 1000;
-          if (elapsed > 0.5) {
-            this.hashRate = Math.round(this._lastCount / elapsed);
-            this._lastCount = 0;
-            this._lastTime = performance.now();
-          }
-          if (onProgress) onProgress(this.hashRate, processedCandidates, totalCandidates);
-
-          // Build key hex directly from GPU result buffer — no async crypto needed
-          if (matches.length > 0) {
-            const batchMatches = [];
-            for (const m of matches) {
-              const channelName = this.indexToChannelName(m.index, charset);
-              if (!channelName) continue;
-              const keyHex = [m.key0, m.key1, m.key2, m.key3]
-                .map(w => w.toString(16).padStart(8, '0')).join('');
-              const prefixHex = chunk.target_prefix.toString(16).padStart(2, '0');
-              batchMatches.push({ channelName, keyHex, prefixHex });
-            }
-            if (batchMatches.length > 0) {
-              try {
-                ws.send(JSON.stringify({
-                  type: 'prefix_match_batch',
-                  packetId: chunk.packet_id,
-                  matches: batchMatches,
-                }));
-              } catch (_) { /* ws closed mid-batch; loop will detect on next iteration */ }
-            }
-          }
+          const matches = await pending.promise;
+          finishBatch(matches, pending.batch);
         } catch (err) {
-          console.error('GPU batch error:', err);
+          console.error('GPU readback error:', err);
         }
       }
 
+      // Kick off async readback for the batch we just dispatched.
+      pending = { promise: this._readResults(currentPP), batch };
+    }
+
+    // Drain the final in-flight batch.
+    if (pending) {
       try {
-        ws.send(JSON.stringify({
-          type: 'chunk_complete',
-          chunkId: chunk.id,
-          hashRate: this.hashRate
-        }));
-      } catch (_) { /* ws closed; server will re-queue this chunk via stale-chunk expiry */ }
+        const matches = await pending.promise;
+        if (this.running) finishBatch(matches, pending.batch);
+      } catch (err) {
+        console.error('GPU readback error:', err);
+      }
     }
 
     return { found: false };
