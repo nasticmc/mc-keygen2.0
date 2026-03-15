@@ -692,12 +692,6 @@ function makeWorkerId(inputId) {
   return normalized || crypto.randomUUID().replace(/-/g, '').slice(0, 12);
 }
 
-function updateWorkerDesiredInFlight(workerId, requestedCount) {
-  const worker = workers.get(workerId);
-  if (!worker) return;
-  const nextDesired = Math.max(1, Math.min(256, parseInt(requestedCount, 10) || 1));
-  worker.desiredInFlight = nextDesired;
-}
 
 function maybePushWork(workerId, reason = 'scheduler') {
   const worker = workers.get(workerId);
@@ -706,10 +700,11 @@ function maybePushWork(workerId, reason = 'scheduler') {
   const desired = worker.desiredInFlight || 1;
   const assigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
 
-  // Push proactively whenever there's room, not just below low-water.
-  // This keeps the client's prefetch queue full so it never idles waiting
-  // for a round-trip after finishing its last chunk.
-  if (assigned >= desired) return 0;
+  // Only push when assigned drops below half of desired — this batches
+  // the push so we send a meaningful number of chunks at once instead
+  // of drip-feeding 1 per chunk_complete.
+  const pushThreshold = Math.max(1, Math.ceil(desired / 2));
+  if (assigned >= pushThreshold) return 0;
 
   const chunks = assignVirtualChunks(workerId, desired);
 
@@ -858,8 +853,13 @@ wss.on('connection', (ws) => {
         if (!workerId) registerWorker(msg.clientId);
         const requestedCount = Math.max(1, parseInt(msg.count, 10) || 1);
         const alreadyAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
+        // Target = what they have + what they want. desiredInFlight stays at
+        // this level so maybePushWork knows how full to keep the pipeline.
         const newTarget = Math.min(256, alreadyAssigned + requestedCount);
-        updateWorkerDesiredInFlight(workerId, newTarget);
+        // Keep desiredInFlight at the max we've seen — don't let it shrink
+        // as assigned drops, otherwise maybePushWork under-fills.
+        const worker = workers.get(workerId);
+        if (worker) worker.desiredInFlight = Math.max(worker.desiredInFlight || 1, newTarget);
         const expired = recycleStaleChunks();
         if (expired > 0) console.log(`[stale] recycled ${expired} stale chunk(s) back to virtual pool`);
         const chunks = assignVirtualChunks(workerId, newTarget);

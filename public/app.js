@@ -174,11 +174,11 @@ function batchCount() {
 }
 
 function getMinAhead() {
-  // Auto-scale to keep ~2 seconds of work buffered in the pipeline.
-  // Fast GPUs (300 MH/s) will get minAhead≈16; phones (3 MH/s) stay at 2.
+  // Auto-scale to keep ~5 seconds of work buffered in the pipeline.
+  // Floor of 4 ensures we always have enough to survive a slow round-trip.
   if (lastMeasuredHashRate > 0 && serverChunkSize > 0) {
     const msPerBatch = (serverChunkSize * batchCount()) / lastMeasuredHashRate * 1000;
-    const auto = Math.max(2, Math.min(16, Math.ceil(2000 / msPerBatch)));
+    const auto = Math.max(4, Math.min(16, Math.ceil(5000 / msPerBatch)));
     const el = document.getElementById('work-min-ahead');
     if (el) el.value = auto;
     return auto;
