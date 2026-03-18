@@ -1009,7 +1009,7 @@ function updateKeyspaceEstimate() {
   const batchInput = document.getElementById('work-batch-count');
   if (batchInput) {
     const mobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
-    batchInput.value = mobile ? 2 : 8;
+    batchInput.value = mobile ? 1 : 4;
   }
 
   connectWebSocket();
