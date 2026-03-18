@@ -330,7 +330,11 @@ function formatHashRate(n) {
 // ── Workers Display ─────────────────────────────────────────────────────────
 const workerData = new Map();
 
+let _lastWorkerJson = '';
 function refreshWorkerDisplay() {
+  const json = JSON.stringify([...workerData]);
+  if (json === _lastWorkerJson) return;
+  _lastWorkerJson = json;
   const container = document.getElementById('workers-list');
   container.innerHTML = '';
 
@@ -351,7 +355,11 @@ function updateWorkerDisplay(workerId, hashRate) {
 }
 
 // ── Packets Table ───────────────────────────────────────────────────────────
+let _lastPacketsJson = '';
 function renderPackets(packets) {
+  const json = JSON.stringify(packets);
+  if (json === _lastPacketsJson) return;
+  _lastPacketsJson = json;
   const tbody = document.getElementById('packets-table');
   tbody.innerHTML = '';
 
@@ -431,7 +439,11 @@ async function retryPacket(id, channelName) {
 }
 
 // ── Candidates Table ────────────────────────────────────────────────────────
+let _lastCandidatesJson = '';
 function renderCandidates(candidates) {
+  const json = JSON.stringify(candidates);
+  if (json === _lastCandidatesJson) return;
+  _lastCandidatesJson = json;
   const tbody = document.getElementById('candidates-table');
   tbody.innerHTML = '';
 
@@ -1018,3 +1030,8 @@ function updateKeyspaceEstimate() {
     updateKeyspaceEstimate();
   }).catch(() => updateKeyspaceEstimate());
 })();
+
+// Clean up GPU buffers when the page unloads to prevent VRAM leaks
+window.addEventListener('beforeunload', () => {
+  if (cracker && typeof cracker.destroy === 'function') cracker.destroy();
+});
