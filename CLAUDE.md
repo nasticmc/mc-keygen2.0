@@ -35,7 +35,7 @@ No test suite yet. No build step — frontend is plain JS served statically.
 - **Single-page app with no build tooling** — keeps it simple, no bundler needed
 - **SQLite over Postgres/Redis** — single-file database, zero config, good enough for this use case
 - **WebSocket for work distribution** — server pushes work chunks, clients report results in real-time; 15s ping/pong heartbeat (4 misses = disconnect) detects dead connections
-- **Chunk-based work distribution** — keyspace split into 128M-candidate chunks. Stale chunks (assigned >10 min) get recycled and reassigned automatically
+- **Chunk-based work distribution** — keyspace split into 128M-candidate chunks. Stale chunks (assigned >5 min) get recycled every 30 s via a background interval and reassigned automatically
 - **WebGPU with CPU fallback** — `GPUCracker` class uses WGSL compute shader; `CPUCracker` class provides pure JS SHA-256 for browsers without WebGPU
 - **~16.7M candidates per GPU dispatch** — each kernel launch covers up to `maxComputeWorkgroupsPerDimension × 256` candidates (typically 65535 × 256); result buffer holds 8192 match slots; ping-pong double buffering hides GPU read-back latency
 - **Periodic stats broadcast** — server broadcasts queue stats to all clients every 2 seconds so the UI stays live during long GPU batches
@@ -84,37 +84,29 @@ Four tables:
 | Setting | Value | Location |
 |---------|-------|----------|
 | `CHUNK_SIZE` | 128 000 000 candidates | `server.js:644` |
-| Default work request (desktop) | 4 chunks | `app.js:1012` |
+| Default work request (desktop) | 4 chunks | `index.html` (HTML value) |
 | Default work request (mobile) | 1 chunk | `app.js:1012` |
 | Work request max (UI) | 64 chunks | `index.html` |
 | Min-ahead floor | 4 chunks | `app.js:203` |
 | Min-ahead ceiling | 16 chunks | `app.js:203` |
-| Stale chunk timeout | 10 minutes | `server.js:333` |
+| Stale chunk timeout | 5 minutes | `server.js:333` |
 | Heartbeat interval | 15 s | `server.js:731` |
 | Stats broadcast interval | 2 s | `server.js:910` |
-| App-level keepalive | 15 s | `app.js:106` |
+| Safety-net top-up interval | 30 s | `app.js:106` |
 
-## Known Bugs
+## Architecture Notes
 
-1. **Stale-chunk timeout mismatch** (`server.js:333`) — recycling threshold is `'-10 minutes'` but was documented as 5 min. Creates a 10-minute orphan window for chunks from dead workers. Fix: change to `'-5 minutes'` if faster recycling is needed.
+- **`_totalHashRate` running sum** (`server.js`) — total hash rate is maintained as a live variable, updated on `chunk_complete` and worker disconnect. `getTotalHashRate()` returns it directly — no per-broadcast worker iteration.
 
-2. **`desiredInFlight` never updated** (`server.js:937`) — hardcoded to `1` and never recalculated, so `maybePushWork()` never scales proactive pushes to fast workers. Fix: update it dynamically on each `chunk_complete` based on measured hash rate.
+- **Virtual-pending cache** (`server.js`) — `getVirtualPending()` caches the active-packet scan for 1 second and is shared by both `getQueueStats()` and `getActiveJobStats()`. Call `invalidateVirtualPending()` after any packet state change (crack, delete, retry).
 
-3. **Race in `markPacketCracked()`** (`server.js:385-400`) — sets `chunk_gen_offset = keyspace_end` then deletes assigned chunks in two separate statements. A concurrent `request_work` arriving between those two operations could generate work for an already-cracked packet. Fix: wrap both statements in a single transaction.
+- **Stale chunk recycling** (`server.js`) — runs on a 30-second `setInterval`, not on every `request_work`. `recycleStaleChunks()` is still called directly from `GET /api/stats` for accurate one-off reads.
 
-4. **Mobile default set imperatively** (`app.js:1008-1013`) — mobile/desktop batch default is written in JS at boot time rather than declared as the HTML `value` attribute, which makes it fragile if the init order changes.
+- **`desiredInFlight` scaling** (`server.js`) — updated on every `chunk_complete` to keep ~10 seconds of work buffered per worker: `Math.max(1, Math.min(16, Math.ceil(hashRate * 10 / CHUNK_SIZE)))`.
 
-## Optimisation Opportunities
+- **`markPacketCracked()` atomicity** (`server.js`) — the status update, cursor advance, and assigned-chunk delete are wrapped in a single `db.transaction()` to prevent a concurrent `request_work` from assigning already-cracked work.
 
-1. **`getTotalHashRate()` hot path** (`server.js:903-911`) — iterates all workers on every 2-second stats broadcast. Maintain a running `totalHashRate` variable; update it only when a `chunk_complete` message arrives with a new `hashRate`.
-
-2. **`getQueueStats()` full scan** (`server.js:358-368`) — counts virtual-pending chunks by scanning all active packets every 2 seconds. Cache the sum; invalidate on chunk generation and packet state changes.
-
-3. **`recycleStaleChunks()` per request** (`server.js:965`) — runs a full DB scan on *every* `request_work` message. Move to a dedicated `setInterval` every 30 seconds.
-
-4. **`sentPacketRaw` grows unbounded** (`server.js:782-789`) — tracks which packets have had raw data sent to a worker but is never pruned. On long-lived connections this leaks memory. Prune on packet deletion or cap at a reasonable size.
-
-5. **Duplicate keepalive overhead** (`app.js:106-113`, `server.js:731`) — both server-side WS ping/pong (15 s) and an app-level JSON keepalive (15 s) run simultaneously, doubling keepalive traffic. The native ping/pong is sufficient for most deployments; the app keepalive can be removed or its interval raised.
+- **`sentPacketRaw` pruning** (`server.js`) — pruned for all connected workers when a packet is deleted via `DELETE /api/packets/:id`.
 
 ## Gotchas
 

@@ -330,7 +330,7 @@ const stmts = {
   // Stale chunks: find them for recycling back into the virtual pool
   getStaleChunks: db.prepare(`
     SELECT id, packet_id, range_start FROM work_chunks
-    WHERE status = 'assigned' AND assigned_at < datetime('now', '-10 minutes')
+    WHERE status = 'assigned' AND assigned_at < datetime('now', '-5 minutes')
   `),
   deleteChunkById: db.prepare('DELETE FROM work_chunks WHERE id = ?'),
   insertCandidate: db.prepare('INSERT OR IGNORE INTO candidate_keys (packet_id, channel_name, key, prefix, verified, decode_success) VALUES (?, ?, ?, ?, 1, 1)'),
@@ -355,27 +355,33 @@ const stmts = {
 
 // ── Virtual Stats ────────────────────────────────────────────────────────────
 // Pending chunks are computed from keyspace math, not DB rows.
+// Cache the virtual-pending scan (runs every 2s broadcast + health check).
+// Both getQueueStats and getActiveJobStats share the same scan result.
+let _vpCache = { value: 0, at: 0 };
+function getVirtualPending() {
+  const now = Date.now();
+  if (now - _vpCache.at < 1000) return _vpCache.value;
+  let total = 0;
+  for (const p of stmts.getActivePackets.all()) {
+    total += Math.ceil(Math.max(0, p.keyspace_end - p.chunk_gen_offset) / CHUNK_SIZE);
+  }
+  _vpCache = { value: total, at: now };
+  return total;
+}
+function invalidateVirtualPending() { _vpCache.at = 0; }
+
 function getQueueStats() {
   const assigned = stmts.getAssignedCount.get().assigned;
   const completed = stmts.getCompletedCount.get().completed;
-  // Count virtual pending across all active packets
-  let virtualPending = 0;
-  for (const p of stmts.getActivePackets.all()) {
-    virtualPending += Math.ceil(Math.max(0, p.keyspace_end - p.chunk_gen_offset) / CHUNK_SIZE);
-  }
-  const total = virtualPending + assigned + completed;
-  return { pending: virtualPending, assigned, completed, total };
+  const virtualPending = getVirtualPending();
+  return { pending: virtualPending, assigned, completed, total: virtualPending + assigned + completed };
 }
 
 function getActiveJobStats() {
   const assigned = stmts.getActiveAssigned.get().assigned;
   const completed = stmts.getActiveCompleted.get().completed;
-  let virtualPending = 0;
-  for (const p of stmts.getActivePackets.all()) {
-    virtualPending += Math.ceil(Math.max(0, p.keyspace_end - p.chunk_gen_offset) / CHUNK_SIZE);
-  }
-  const total = virtualPending + assigned + completed;
-  return { pending: virtualPending, assigned, completed, total };
+  const virtualPending = getVirtualPending();
+  return { pending: virtualPending, assigned, completed, total: virtualPending + assigned + completed };
 }
 
 function persistWinningCandidate(packetId, channelName, key, prefix) {
@@ -387,11 +393,15 @@ function markPacketCracked(packetId, channelName, key, decoded) {
   if (!current || current.status === 'cracked') return false;
 
   console.log(`[FOUND] packet ${packetId} cracked — channel="${channelName}" key=${key.substring(0, 8)}...`);
-  stmts.updatePacketStatus.run('cracked', key, channelName, packetId);
-  if (decoded) stmts.updatePacketDecrypted.run(JSON.stringify(decoded), packetId);
-  // Stop virtual generation and clean up assigned chunks for this packet
-  db.prepare('UPDATE packets SET chunk_gen_offset = keyspace_end WHERE id = ?').run(packetId);
-  stmts.deletePacketAssigned.run(packetId);
+  // Run status update + cursor advance + chunk cleanup atomically to prevent
+  // a concurrent request_work from assigning chunks for an already-cracked packet.
+  db.transaction(() => {
+    stmts.updatePacketStatus.run('cracked', key, channelName, packetId);
+    if (decoded) stmts.updatePacketDecrypted.run(JSON.stringify(decoded), packetId);
+    db.prepare('UPDATE packets SET chunk_gen_offset = keyspace_end WHERE id = ?').run(packetId);
+    stmts.deletePacketAssigned.run(packetId);
+  })();
+  invalidateVirtualPending();
   broadcast({ type: 'key_found', packetId, key, channelName, decoded });
   broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats() });
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
@@ -703,6 +713,7 @@ function initWorkForPacket(packetId, targetPrefix, crackConfig = {}) {
 
 // ── Connected Workers ───────────────────────────────────────────────────────
 const workers = new Map();
+let _totalHashRate = 0; // maintained as running sum — updated on chunk_complete and worker disconnect
 const PREFETCH_LOW_WATERMARK = 0.25;
 
 // ── Human-Readable Worker Names ─────────────────────────────────────────────
@@ -900,15 +911,22 @@ function markConnectionAlive(ws) {
 }
 
 // ── Periodic Stats Broadcast ────────────────────────────────────────────────
-function getTotalHashRate() {
-  let total = 0;
-  for (const w of workers.values()) total += w.hashRate;
-  return total;
-}
+// _totalHashRate is maintained as a running sum; no per-broadcast iteration needed.
+function getTotalHashRate() { return _totalHashRate; }
 
 setInterval(() => {
-  if (wss.clients.size > 0) broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats(), totalHashRate: getTotalHashRate() });
+  if (wss.clients.size > 0) broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats(), totalHashRate: _totalHashRate });
 }, 2000);
+
+// ── Stale Chunk Recycler ─────────────────────────────────────────────────────
+// Run on a fixed 30-second schedule instead of on every request_work message.
+setInterval(() => {
+  const expired = recycleStaleChunks();
+  if (expired > 0) {
+    console.log(`[stale] recycled ${expired} stale chunk(s) back to virtual pool`);
+    invalidateVirtualPending();
+  }
+}, 30_000);
 
 wss.on('connection', (ws) => {
   let workerId = null;
@@ -923,11 +941,14 @@ wss.on('connection', (ws) => {
     const existing = workers.get(nextWorkerId);
     if (existing && existing.ws !== ws) {
       try { existing.ws.terminate(); } catch {}
+      _totalHashRate = Math.max(0, _totalHashRate - (existing.hashRate || 0));
       workers.delete(nextWorkerId);
       releaseWorkerChunks(nextWorkerId);
     }
 
     if (workerId && workerId !== nextWorkerId) {
+      const old = workers.get(workerId);
+      _totalHashRate = Math.max(0, _totalHashRate - (old?.hashRate || 0));
       workers.delete(workerId);
       releaseWorkerChunks(workerId);
     }
@@ -962,8 +983,7 @@ wss.on('connection', (ws) => {
       case 'request_work': {
         if (!workerId) registerWorker(msg.clientId);
         const requestedCount = Math.max(1, Math.min(64, parseInt(msg.count, 10) || 1));
-        const expired = recycleStaleChunks();
-        if (expired > 0) console.log(`[stale] recycled ${expired} stale chunk(s) back to virtual pool`);
+        // Stale chunk recycling now runs on a 30-second setInterval, not per-request.
         // Treat each request as additive demand from the client's local
         // prefetch pipeline (topUpWorkQueue/minAhead). This keeps queued
         // batches available client-side instead of starving on deficit math.
@@ -1025,7 +1045,13 @@ wss.on('connection', (ws) => {
         const worker = workers.get(workerId);
         if (worker) {
           worker.chunksCompleted += completedNow;
-          worker.hashRate = msg.hashRate || 0;
+          const newRate = msg.hashRate || 0;
+          _totalHashRate = Math.max(0, _totalHashRate + newRate - worker.hashRate);
+          worker.hashRate = newRate;
+          // Scale desired in-flight to keep ~10 seconds of work buffered for this worker.
+          worker.desiredInFlight = newRate > 0
+            ? Math.max(1, Math.min(16, Math.ceil(newRate * 10 / CHUNK_SIZE)))
+            : worker.desiredInFlight;
         }
         const remainingAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
         console.log(`[done] ${wName(workerId)} chunks=${chunkIds.length} completed_now=${completedNow} total_done=${worker?.chunksCompleted || '?'} remaining=${remainingAssigned} rate=${formatHashRate(msg.hashRate || 0)}${completionNote}`);
@@ -1120,6 +1146,7 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     if (!workerId) return;
     const w = workers.get(workerId);
+    _totalHashRate = Math.max(0, _totalHashRate - (w?.hashRate || 0));
     releaseWorkerChunks(workerId);
     workers.delete(workerId);
     console.log(`[ws] worker disconnected ${wName(workerId)} chunks=${w?.chunksCompleted ?? 0} total=${workers.size}`);
@@ -1238,6 +1265,10 @@ app.delete('/api/packets/:id', (req, res) => {
   db.prepare('DELETE FROM work_chunks WHERE packet_id = ?').run(id);
   db.prepare('DELETE FROM candidate_keys WHERE packet_id = ?').run(id);
   db.prepare('DELETE FROM packets WHERE id = ?').run(id);
+  // Prune the deleted packet from each worker's sentPacketRaw set so
+  // raw data will be re-sent if the packet is re-uploaded with the same id.
+  for (const w of workers.values()) w.sentPacketRaw?.delete(id);
+  invalidateVirtualPending();
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
   broadcastStats();
   res.json({ ok: true });
