@@ -520,6 +520,20 @@ class GPUCracker {
   stop() {
     this.running = false;
   }
+
+  destroy() {
+    this.stop();
+    if (this.bufferSets) {
+      for (const set of this.bufferSets) {
+        set.resultBuffer.destroy();
+        set.readBuffer.destroy();
+      }
+      this.bufferSets = null;
+    }
+    if (this.paramsBuffer) { this.paramsBuffer.destroy(); this.paramsBuffer = null; }
+    if (this.charsetBuffer) { this.charsetBuffer.destroy(); this.charsetBuffer = null; }
+    this.cachedCharset = null;
+  }
 }
 
 // ── JS SHA-256 helpers (for deriving key/prefix on CPU after GPU match) ─────

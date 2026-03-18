@@ -154,13 +154,7 @@ function autoDecryptCandidates(packetId) {
         .run(result.success ? 1 : 0, candidate.id);
 
       if (result.success) {
-        stmts.updatePacketStatus.run('cracked', candidate.key, candidate.channel_name, packetId);
-        if (result.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(result.decoded), packetId);
-        db.prepare('UPDATE packets SET chunk_gen_offset = keyspace_end WHERE id = ?').run(packetId);
-        stmts.deletePacketAssigned.run(packetId);
-        broadcast({ type: 'key_found', packetId, key: candidate.key, channelName: candidate.channel_name, decoded: result.decoded });
-        broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats() });
-        broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+        markPacketCracked(packetId, candidate.channel_name, candidate.key, result.decoded);
         return result;
       }
     } catch (err) {
@@ -233,6 +227,7 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_wc_packet_status   ON work_chunks(packet_id, status);
   CREATE INDEX IF NOT EXISTS idx_wc_expire          ON work_chunks(status, assigned_at);
   CREATE INDEX IF NOT EXISTS idx_wc_assigned_to     ON work_chunks(status, assigned_to);
+  CREATE INDEX IF NOT EXISTS idx_ck_packet_id       ON candidate_keys(packet_id);
 `);
 
 // Migration: add decrypted_json column for storing decoded message content
@@ -458,10 +453,14 @@ function releaseWorkerChunks(workerId) {
   stmts.unassignWorkerChunks.run(workerId);
 
   for (const { packet_id, min_start } of rows) {
-    const packet = stmts.getPacketById.get(packet_id);
-    if (packet && packet.chunk_gen_offset > min_start) {
-      db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(min_start, packet_id);
-    }
+    // Never rewind below the completed work watermark
+    const completedMax = db.prepare(
+      "SELECT MAX(range_end) as max_end FROM work_chunks WHERE packet_id = ? AND status = 'completed'"
+    ).get(packet_id);
+    const safeStart = Math.max(min_start, completedMax?.max_end || 0);
+    // Conditional update: only rewind if offset hasn't been advanced by a concurrent assignment
+    db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ? AND chunk_gen_offset > ?')
+      .run(safeStart, packet_id, safeStart);
   }
 }
 
@@ -494,10 +493,17 @@ function recycleStaleChunks() {
 
   // Rewind each affected packet's cursor so the ranges get regenerated
   for (const [packetId, minStart] of rewindTo) {
+    // Never rewind below the completed work watermark
+    const completedMax = db.prepare(
+      "SELECT MAX(range_end) as max_end FROM work_chunks WHERE packet_id = ? AND status = 'completed'"
+    ).get(packetId);
+    const safeStart = Math.max(minStart, completedMax?.max_end || 0);
     const packet = stmts.getPacketById.get(packetId);
-    if (packet && packet.chunk_gen_offset > minStart) {
-      db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(minStart, packetId);
-      console.log(`[stale] rewound packet ${packetId} cursor from ${packet.chunk_gen_offset} to ${minStart}`);
+    // Conditional update: only rewind if offset hasn't been advanced by a concurrent assignment
+    if (packet && packet.chunk_gen_offset > safeStart) {
+      db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ? AND chunk_gen_offset > ?')
+        .run(safeStart, packetId, safeStart);
+      console.log(`[stale] rewound packet ${packetId} cursor from ${packet.chunk_gen_offset} to ${safeStart}`);
     }
   }
 
@@ -822,9 +828,9 @@ function safeSend(ws, data, label = 'msg') {
     return false;
   }
 
-  ws.backpressureSince = 0;
   try {
     ws.send(typeof data === 'string' ? data : JSON.stringify(data));
+    ws.backpressureSince = 0;
     return true;
   } catch (err) {
     if (ws.workerId) console.warn(`[ws] send failed ${label} to ${wName(ws.workerId)}: ${err.message}`);
@@ -847,15 +853,21 @@ function broadcastStats() {
 
 // Periodic health report — helps diagnose slowdowns over long runs
 setInterval(() => {
-  const m = process.memoryUsage();
-  const s = getQueueStats();
-  const workerDetails = [];
-  for (const [id, w] of workers) {
-    const assigned = stmts.countAssignedToWorker.get(id)?.cnt || 0;
-    workerDetails.push(`${workerIdToName(id)}:${formatHashRate(w.hashRate)}/a=${assigned}/d=${w.chunksCompleted}`);
-  }
-  console.log(`[health] workers=${workers.size} pending=${s.pending} assigned=${s.assigned} completed=${s.completed} rate=${formatHashRate(getTotalHashRate())} rss=${Math.round(m.rss / 1024 / 1024)}MB`);
-  if (workerDetails.length > 0) console.log(`[health] ${workerDetails.join(' | ')}`);
+  try {
+    const m = process.memoryUsage();
+    const s = getQueueStats();
+    const assignedCounts = new Map(
+      db.prepare("SELECT assigned_to, COUNT(*) as cnt FROM work_chunks WHERE status = 'assigned' GROUP BY assigned_to")
+        .all().map(r => [r.assigned_to, r.cnt])
+    );
+    const workerDetails = [];
+    for (const [id, w] of workers) {
+      const assigned = assignedCounts.get(id) || 0;
+      workerDetails.push(`${workerIdToName(id)}:${formatHashRate(w.hashRate)}/a=${assigned}/d=${w.chunksCompleted}`);
+    }
+    console.log(`[health] workers=${workers.size} pending=${s.pending} assigned=${s.assigned} completed=${s.completed} rate=${formatHashRate(getTotalHashRate())} rss=${Math.round(m.rss / 1024 / 1024)}MB`);
+    if (workerDetails.length > 0) console.log(`[health] ${workerDetails.join(' | ')}`);
+  } catch (err) { console.error('[health] uncaught:', err); }
 }, 30_000);
 
 // ── WebSocket Handler ───────────────────────────────────────────────────────
@@ -863,6 +875,7 @@ setInterval(() => {
 // Heartbeat runs every 15s and allows 4 misses before termination. This keeps
 // idle proxies alive while being tolerant of transient network jitter.
 const heartbeatInterval = setInterval(() => {
+  try {
   wss.clients.forEach(client => {
     const lastSeenAt = client.lastSeenAt || 0;
     const recentlyActive = (Date.now() - lastSeenAt) < HEARTBEAT_ACTIVITY_GRACE_MS;
@@ -901,6 +914,7 @@ const heartbeatInterval = setInterval(() => {
     client.isAlive = false;
     client.ping();
   });
+  } catch (err) { console.error('[heartbeat] uncaught:', err); }
 }, HEARTBEAT_INTERVAL_MS);
 wss.on('close', () => clearInterval(heartbeatInterval));
 
@@ -915,17 +929,21 @@ function markConnectionAlive(ws) {
 function getTotalHashRate() { return _totalHashRate; }
 
 setInterval(() => {
-  if (wss.clients.size > 0) broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats(), totalHashRate: _totalHashRate });
+  try {
+    if (wss.clients.size > 0) broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats(), totalHashRate: _totalHashRate });
+  } catch (err) { console.error('[stats-broadcast] uncaught:', err); }
 }, 2000);
 
 // ── Stale Chunk Recycler ─────────────────────────────────────────────────────
 // Run on a fixed 30-second schedule instead of on every request_work message.
 setInterval(() => {
-  const expired = recycleStaleChunks();
-  if (expired > 0) {
-    console.log(`[stale] recycled ${expired} stale chunk(s) back to virtual pool`);
-    invalidateVirtualPending();
-  }
+  try {
+    const expired = recycleStaleChunks();
+    if (expired > 0) {
+      console.log(`[stale] recycled ${expired} stale chunk(s) back to virtual pool`);
+      invalidateVirtualPending();
+    }
+  } catch (err) { console.error('[stale-recycler] uncaught:', err); }
 }, 30_000);
 
 wss.on('connection', (ws) => {
@@ -1070,6 +1088,9 @@ wss.on('connection', (ws) => {
         if (packet && packet.status !== 'cracked') {
           decodeAsync(packet.raw_data, key, (result) => {
             if (result.success) {
+              // Re-check: packet may have been deleted/cracked/retried during async decode
+              const fresh = stmts.getPacketById.get(packetId);
+              if (!fresh || fresh.status === 'cracked') return;
               persistWinningCandidate(packetId, channelName, key, prefix);
               broadcast({ type: 'candidate_found', packetId, channelName, key, prefix });
               markPacketCracked(packetId, channelName, key, result.decoded);
@@ -1099,6 +1120,9 @@ wss.on('connection', (ws) => {
 
         findWinningCandidate(batchPacket, batchMatches, (winner) => {
           if (!winner) return;
+          // Re-check: packet may have been deleted/cracked/retried during async decode
+          const freshBatch = stmts.getPacketById.get(batchPacketId);
+          if (!freshBatch || freshBatch.status === 'cracked') return;
           const { match, result } = winner;
           persistWinningCandidate(batchPacketId, match.channelName, match.keyHex, match.prefixHex);
           broadcast({ type: 'candidate_found', packetId: batchPacketId, channelName: match.channelName, key: match.keyHex, prefix: match.prefixHex });
@@ -1313,19 +1337,22 @@ app.post('/api/packets/:id/retry', (req, res) => {
     minLen: req.body?.crackConfig?.minLen || packet.min_len,
     maxLen: req.body?.crackConfig?.maxLen || packet.max_len,
   });
-  if (channelName) {
-    db.prepare('UPDATE candidate_keys SET ignored = 1 WHERE packet_id = ? AND channel_name = ?')
-      .run(packetId, channelName);
-  }
+  db.transaction(() => {
+    if (channelName) {
+      db.prepare('UPDATE candidate_keys SET ignored = 1 WHERE packet_id = ? AND channel_name = ?')
+        .run(packetId, channelName);
+    }
 
-  db.prepare("UPDATE packets SET status = 'pending', cracked_key = NULL, channel_name = NULL, cracked_at = NULL, decrypted_json = NULL WHERE id = ?")
-    .run(packetId);
-  db.prepare('UPDATE packets SET charset = ?, min_len = ?, max_len = ? WHERE id = ?')
-    .run(cfg.charset, cfg.minLen, cfg.maxLen, packetId);
-  // Only delete unfinished chunks — preserve completed ranges so we don't re-crack them
-  db.prepare("DELETE FROM work_chunks WHERE packet_id = ? AND status != 'completed'")
-    .run(packetId);
-  initWorkForPacket(packetId, packet.prefix, cfg);
+    db.prepare("UPDATE packets SET status = 'pending', cracked_key = NULL, channel_name = NULL, cracked_at = NULL, decrypted_json = NULL WHERE id = ?")
+      .run(packetId);
+    db.prepare('UPDATE packets SET charset = ?, min_len = ?, max_len = ? WHERE id = ?')
+      .run(cfg.charset, cfg.minLen, cfg.maxLen, packetId);
+    // Delete ALL chunks so the keyspace starts fresh on retry/reset
+    db.prepare("DELETE FROM work_chunks WHERE packet_id = ?")
+      .run(packetId);
+    initWorkForPacket(packetId, packet.prefix, cfg);
+  })();
+  invalidateVirtualPending();
 
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
   broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
