@@ -34,10 +34,10 @@ No test suite yet. No build step — frontend is plain JS served statically.
 
 - **Single-page app with no build tooling** — keeps it simple, no bundler needed
 - **SQLite over Postgres/Redis** — single-file database, zero config, good enough for this use case
-- **WebSocket for work distribution** — server pushes work chunks, clients report results in real-time; 30s ping/pong heartbeat detects dead connections
-- **Chunk-based work distribution** — keyspace split into 500K-candidate chunks. Stale chunks (assigned >5 min) get reassigned automatically
+- **WebSocket for work distribution** — server pushes work chunks, clients report results in real-time; 15s ping/pong heartbeat (4 misses = disconnect) detects dead connections
+- **Chunk-based work distribution** — keyspace split into 128M-candidate chunks. Stale chunks (assigned >5 min) get recycled every 30 s via a background interval and reassigned automatically
 - **WebGPU with CPU fallback** — `GPUCracker` class uses WGSL compute shader; `CPUCracker` class provides pure JS SHA-256 for browsers without WebGPU
-- **4M candidates per GPU batch** — each dispatch covers 4M candidates before yielding; result buffer holds 8192 match slots
+- **~16.7M candidates per GPU dispatch** — each kernel launch covers up to `maxComputeWorkgroupsPerDimension × 256` candidates (typically 65535 × 256); result buffer holds 8192 match slots; ping-pong double buffering hides GPU read-back latency
 - **Periodic stats broadcast** — server broadcasts queue stats to all clients every 2 seconds so the UI stays live during long GPU batches
 - **loopRunning guard** — `app.js` uses a `loopRunning` boolean to prevent double-starting the cracking loop after WebSocket reconnect
 
@@ -78,6 +78,35 @@ Four tables:
 **Adding a new tab:** Add `<button class="tab">` and `<section class="tab-content">` in `index.html`. Tab switching is handled automatically by the click handler in `app.js`.
 
 **Changing chunk size:** Modify `CHUNK_SIZE` in `server.js`. The `/api/config` endpoint exposes this to the frontend automatically.
+
+## Key Numeric Settings
+
+| Setting | Value | Location |
+|---------|-------|----------|
+| `CHUNK_SIZE` | 128 000 000 candidates | `server.js:644` |
+| Default work request (desktop) | 4 chunks | `index.html` (HTML value) |
+| Default work request (mobile) | 1 chunk | `app.js:1012` |
+| Work request max (UI) | 64 chunks | `index.html` |
+| Min-ahead floor | 4 chunks | `app.js:203` |
+| Min-ahead ceiling | 16 chunks | `app.js:203` |
+| Stale chunk timeout | 5 minutes | `server.js:333` |
+| Heartbeat interval | 15 s | `server.js:731` |
+| Stats broadcast interval | 2 s | `server.js:910` |
+| Safety-net top-up interval | 30 s | `app.js:106` |
+
+## Architecture Notes
+
+- **`_totalHashRate` running sum** (`server.js`) — total hash rate is maintained as a live variable, updated on `chunk_complete` and worker disconnect. `getTotalHashRate()` returns it directly — no per-broadcast worker iteration.
+
+- **Virtual-pending cache** (`server.js`) — `getVirtualPending()` caches the active-packet scan for 1 second and is shared by both `getQueueStats()` and `getActiveJobStats()`. Call `invalidateVirtualPending()` after any packet state change (crack, delete, retry).
+
+- **Stale chunk recycling** (`server.js`) — runs on a 30-second `setInterval`, not on every `request_work`. `recycleStaleChunks()` is still called directly from `GET /api/stats` for accurate one-off reads.
+
+- **`desiredInFlight` scaling** (`server.js`) — updated on every `chunk_complete` to keep ~10 seconds of work buffered per worker: `Math.max(1, Math.min(16, Math.ceil(hashRate * 10 / CHUNK_SIZE)))`.
+
+- **`markPacketCracked()` atomicity** (`server.js`) — the status update, cursor advance, and assigned-chunk delete are wrapped in a single `db.transaction()` to prevent a concurrent `request_work` from assigning already-cracked work.
+
+- **`sentPacketRaw` pruning** (`server.js`) — pruned for all connected workers when a packet is deleted via `DELETE /api/packets/:id`.
 
 ## Gotchas
 

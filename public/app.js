@@ -99,18 +99,17 @@ function connectWebSocket() {
     setTimeout(connectWebSocket, 2000);
   };
 
-  // Application-level keep-alive: send a lightweight ping every 15s so that
-  // intermediate proxies/load-balancers don't close the idle connection.
-  // Also acts as a safety net for stuck work requests — if the cracking loop
-  // is active but has no work queued and no requests in flight, force a top-up.
+  // Safety net: if the cracking loop is active but stalled (no queued work and
+  // no requests in flight), force a top-up every 30s. The native WebSocket
+  // ping/pong (server-side, 15s) handles proxy keep-alive, so no need to send
+  // a redundant JSON keepalive message here.
   ws._keepAliveTimer = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'keepalive', clientId: getClientId() }));
       if (cracking && loopRunning && queuedWorkMessages.length === 0 && workRequestsInFlight === 0) {
         topUpWorkQueue();
       }
     }
-  }, 15000);
+  }, 30000);
 
   ws.onmessage = (event) => {
     lastWsMessageAt = Date.now();
@@ -1005,11 +1004,10 @@ function updateKeyspaceEstimate() {
 
 // ── Boot ────────────────────────────────────────────────────────────────────
 (async () => {
-  // Set work batch default based on device type
+  // Override work batch default for mobile — desktop default (4) is set in the HTML.
   const batchInput = document.getElementById('work-batch-count');
-  if (batchInput) {
-    const mobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
-    batchInput.value = mobile ? 2 : 8;
+  if (batchInput && (/Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768)) {
+    batchInput.value = 1;
   }
 
   connectWebSocket();
