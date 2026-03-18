@@ -1322,10 +1322,11 @@ app.post('/api/packets/:id/retry', (req, res) => {
     .run(packetId);
   db.prepare('UPDATE packets SET charset = ?, min_len = ?, max_len = ? WHERE id = ?')
     .run(cfg.charset, cfg.minLen, cfg.maxLen, packetId);
-  // Only delete unfinished chunks — preserve completed ranges so we don't re-crack them
-  db.prepare("DELETE FROM work_chunks WHERE packet_id = ? AND status != 'completed'")
+  // Delete ALL chunks so the keyspace starts fresh on retry/reset
+  db.prepare("DELETE FROM work_chunks WHERE packet_id = ?")
     .run(packetId);
   initWorkForPacket(packetId, packet.prefix, cfg);
+  invalidateVirtualPending();
 
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
   broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
