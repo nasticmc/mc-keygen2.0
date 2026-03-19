@@ -37,6 +37,18 @@ let workRequestSentAt = 0;
 let currentCharset = 'abcdefghijklmnopqrstuvwxyz';
 let serverChunkSize = 500000;
 let lastMeasuredHashRate = 0;
+let _smoothedHashRate = 0;
+
+// Exponential moving average for hash rate display — smooths out per-chunk spikes.
+// alpha=0.25 → ~4 samples of memory (~4–8 s at current update frequency).
+function smoothHashRate(newRate) {
+  if (_smoothedHashRate === 0 || newRate === 0) {
+    _smoothedHashRate = newRate; // fast-start / instant-zero on stop
+  } else {
+    _smoothedHashRate = 0.25 * newRate + 0.75 * _smoothedHashRate;
+  }
+  return Math.round(_smoothedHashRate);
+}
 let persistedClientId = localStorage.getItem('mc-worker-client-id') || '';
 const pendingWorkResolvers = [];
 const queuedWorkMessages = [];
@@ -280,12 +292,13 @@ function updateStats(stats) {
 
   const hashRate = stats.totalHashRate ?? 0;
   if (stats.totalHashRate !== undefined) {
-    document.getElementById('stat-hashrate').textContent = formatHashRate(hashRate);
+    const displayRate = smoothHashRate(hashRate);
+    document.getElementById('stat-hashrate').textContent = formatHashRate(displayRate);
   }
 
-  // ETA based on remaining chunks × chunk size ÷ hash rate
+  // ETA based on remaining chunks × chunk size ÷ smoothed hash rate
   const remaining = (active.pending + active.assigned) * serverChunkSize;
-  const eta = hashRate > 0 && remaining > 0 ? remaining / hashRate : Infinity;
+  const eta = _smoothedHashRate > 0 && remaining > 0 ? remaining / _smoothedHashRate : Infinity;
   const etaEl = document.getElementById('stat-eta');
   if (etaEl) etaEl.textContent = formatETA(eta);
 
@@ -795,6 +808,7 @@ document.getElementById('btn-stop-cracking').addEventListener('click', () => {
   document.getElementById('btn-stop-cracking').classList.add('hidden');
   setCrackingStatus('Stopped.');
   resetLocalProgress();
+  _smoothedHashRate = 0;
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'hashrate_update', hashRate: 0, clientId: getClientId() }));
   }
@@ -882,12 +896,13 @@ async function runCrackingLoop() {
       let lastProgressLog = 0;
       await cracker.processChunks(chunks, ws, (hashRate, processed, total) => {
         lastMeasuredHashRate = hashRate;
-        document.getElementById('stat-hashrate').textContent = formatHashRate(hashRate);
+        const displayRate = smoothHashRate(hashRate);
+        document.getElementById('stat-hashrate').textContent = formatHashRate(displayRate);
         const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
         const elapsed = (performance.now() - batchStart) / 1000;
-        const remaining = hashRate > 0 ? (total - processed) / hashRate : 0;
+        const remaining = displayRate > 0 ? (total - processed) / displayRate : 0;
         setCrackingStatus(
-          `Crunching: ${pct}% (${formatNumber(processed)}/${formatNumber(total)}) at ${formatHashRate(hashRate)}` +
+          `Crunching: ${pct}% (${formatNumber(processed)}/${formatNumber(total)}) at ${formatHashRate(displayRate)}` +
           (remaining > 0 ? ` — ${formatETA(remaining)} left` : '') +
           ` [batch ${batchesCompleted + 1}, queued: ${queuedWorkMessages.length}]`
         );
