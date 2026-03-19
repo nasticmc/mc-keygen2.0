@@ -38,6 +38,8 @@ let currentCharset = 'abcdefghijklmnopqrstuvwxyz';
 let serverChunkSize = 500000;
 let lastMeasuredHashRate = 0;
 let _smoothedHashRate = 0;
+let _wsReconnectCount = 0;
+let _wsConnectStartedAt = 0;
 
 // Exponential moving average for hash rate display — smooths out per-chunk spikes.
 // alpha=0.25 → ~4 samples of memory (~4–8 s at current update frequency).
@@ -74,12 +76,26 @@ document.querySelectorAll('.tab').forEach(tab => {
 });
 
 // ── WebSocket Connection ────────────────────────────────────────────────────
+// Close code reference: https://developer.mozilla.org/en-US/docs/Web/API/CloseEvent/code
+const WS_CLOSE_CODES = {
+  1000: 'Normal Closure', 1001: 'Going Away', 1002: 'Protocol Error',
+  1003: 'Unsupported Data', 1005: 'No Status', 1006: 'Abnormal Closure',
+  1007: 'Invalid Frame', 1008: 'Policy Violation', 1009: 'Message Too Big',
+  1010: 'Extension Required', 1011: 'Internal Error', 1012: 'Service Restart',
+  1013: 'Try Again Later', 1015: 'TLS Handshake Failed',
+};
+
 function connectWebSocket() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${protocol}//${location.host}`);
+  const url = `${protocol}//${location.host}`;
+  _wsConnectStartedAt = Date.now();
+  clog(`websocket connecting to ${url} (attempt #${_wsReconnectCount + 1})`);
+  ws = new WebSocket(url);
 
   ws.onopen = () => {
-    clog(`websocket connected (stale resolvers: ${pendingWorkResolvers.length}, queued: ${queuedWorkMessages.length})`);
+    const handshakeMs = Date.now() - _wsConnectStartedAt;
+    _wsReconnectCount++;
+    clog(`websocket connected in ${handshakeMs}ms (reconnect #${_wsReconnectCount}, stale resolvers: ${pendingWorkResolvers.length}, queued: ${queuedWorkMessages.length})`);
     workRequestsInFlight = 0;
     workRequestSentAt = 0;
     lastWsMessageAt = Date.now();
@@ -99,8 +115,25 @@ function connectWebSocket() {
     }
   };
 
-  ws.onclose = () => {
-    clog('websocket disconnected');
+  ws.onerror = (event) => {
+    clog(`websocket error — readyState=${ws.readyState} (0=CONNECTING 1=OPEN 2=CLOSING 3=CLOSED) url=${ws.url}`);
+    // Log network connectivity info if available
+    if (navigator.onLine !== undefined) clog(`  navigator.onLine=${navigator.onLine}`);
+    if (navigator.connection) {
+      const c = navigator.connection;
+      clog(`  network type=${c.effectiveType || c.type || '?'} downlink=${c.downlink ?? '?'}Mbps rtt=${c.rtt ?? '?'}ms`);
+    }
+    // onerror is always followed by onclose, so reconnect logic stays there
+  };
+
+  ws.onclose = (event) => {
+    const codeName = WS_CLOSE_CODES[event.code] || 'Unknown';
+    const reason = event.reason ? ` reason="${event.reason}"` : '';
+    const silentMs = lastWsMessageAt > 0 ? Date.now() - lastWsMessageAt : -1;
+    clog(`websocket closed — code=${event.code} (${codeName})${reason} clean=${event.wasClean} silentFor=${silentMs}ms inFlight=${workRequestsInFlight} queued=${queuedWorkMessages.length}`);
+    if (!event.wasClean) {
+      clog(`  unclean close — possible proxy drop, network change, or server crash`);
+    }
     document.getElementById('connection-status').textContent = 'Disconnected';
     document.getElementById('connection-status').className = 'disconnected';
     document.getElementById('worker-id').textContent = '';
@@ -116,8 +149,11 @@ function connectWebSocket() {
   // ping/pong (server-side, 15s) handles proxy keep-alive, so no need to send
   // a redundant JSON keepalive message here.
   ws._keepAliveTimer = setInterval(() => {
+    const silentMs = lastWsMessageAt > 0 ? Date.now() - lastWsMessageAt : -1;
+    clog(`keepalive tick — readyState=${ws.readyState} cracking=${cracking} loopRunning=${loopRunning} queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight} silentFor=${silentMs}ms`);
     if (ws.readyState === WebSocket.OPEN) {
       if (cracking && loopRunning && queuedWorkMessages.length === 0 && workRequestsInFlight === 0) {
+        clog(`keepalive: stalled pipeline detected — forcing top-up`);
         topUpWorkQueue();
       }
     }
@@ -125,7 +161,13 @@ function connectWebSocket() {
 
   ws.onmessage = (event) => {
     lastWsMessageAt = Date.now();
-    const msg = JSON.parse(event.data);
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch (err) {
+      clog(`ws message parse error: ${err.message} — raw(64): ${String(event.data).slice(0, 64)}`);
+      return;
+    }
     switch (msg.type) {
       case 'worker_count':
         document.getElementById('worker-count').textContent = `Workers: ${msg.count}`;
@@ -194,6 +236,9 @@ function connectWebSocket() {
         clog(`work received: ${chunkCount} chunk(s) [${msg.solicited ? 'solicited' : 'push'}] — queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight} waiting=${pendingWorkResolvers.length}`);
         break;
       }
+      default:
+        clog(`ws unknown message type: "${msg.type}"`);
+        break;
     }
   };
 }
@@ -1052,6 +1097,30 @@ function updateKeyspaceEstimate() {
 
 // ── Boot ────────────────────────────────────────────────────────────────────
 (async () => {
+  // Log environment diagnostics to help debug connection issues on specific machines.
+  clog(`--- MC-Keygen 2.0 boot ---`);
+  clog(`  url: ${location.href}`);
+  clog(`  userAgent: ${navigator.userAgent}`);
+  clog(`  onLine: ${navigator.onLine}`);
+  clog(`  clientId: ${localStorage.getItem('mc-worker-client-id') || '(none yet)'}`);
+  if (navigator.connection) {
+    const c = navigator.connection;
+    clog(`  network: type=${c.effectiveType || c.type || '?'} downlink=${c.downlink ?? '?'}Mbps rtt=${c.rtt ?? '?'}ms saveData=${c.saveData}`);
+  } else {
+    clog(`  network: navigator.connection unavailable`);
+  }
+  if (typeof WebSocket !== 'undefined') {
+    clog(`  WebSocket: supported`);
+  } else {
+    clog(`  WebSocket: NOT SUPPORTED — this will not work`);
+  }
+  if (typeof navigator.gpu !== 'undefined') {
+    clog(`  WebGPU: API present (adapter check deferred to initCracker)`);
+  } else {
+    clog(`  WebGPU: not available (will use CPU fallback)`);
+  }
+  clog(`  viewport: ${window.innerWidth}x${window.innerHeight} devicePixelRatio=${window.devicePixelRatio}`);
+
   // Override work batch default for mobile — desktop default (4) is set in the HTML.
   const batchInput = document.getElementById('work-batch-count');
   if (batchInput && (/Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768)) {
