@@ -56,6 +56,7 @@ const pendingWorkResolvers = [];
 const queuedWorkMessages = [];
 let lastCrackingStatus = 'Idle.';
 let lastWsMessageAt = 0;
+let lastWorkMessageAt = 0;  // last time server responded to a work request (not just stats)
 let consecutiveWorkTimeouts = 0;
 
 const charsetByKey = {
@@ -150,8 +151,13 @@ function connectWebSocket() {
   // a redundant JSON keepalive message here.
   ws._keepAliveTimer = setInterval(() => {
     const silentMs = lastWsMessageAt > 0 ? Date.now() - lastWsMessageAt : -1;
-    clog(`keepalive tick — readyState=${ws.readyState} cracking=${cracking} loopRunning=${loopRunning} queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight} silentFor=${silentMs}ms`);
+    const workSilentMs = lastWorkMessageAt > 0 ? Date.now() - lastWorkMessageAt : -1;
+    const buffered = ws.bufferedAmount ?? -1;
+    clog(`keepalive tick — readyState=${ws.readyState} cracking=${cracking} loopRunning=${loopRunning} queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight} silentFor=${silentMs}ms workSilentFor=${workSilentMs}ms buffered=${buffered}B`);
     if (ws.readyState === WebSocket.OPEN) {
+      if (buffered > 64 * 1024) {
+        clog(`keepalive: send buffer has ${buffered} bytes pending — possible AV/proxy stall`);
+      }
       if (cracking && loopRunning && queuedWorkMessages.length === 0 && workRequestsInFlight === 0) {
         clog(`keepalive: stalled pipeline detected — forcing top-up`);
         topUpWorkQueue();
@@ -209,6 +215,7 @@ function connectWebSocket() {
         refreshWorkerDisplay();
         break;
       case 'work': {
+        lastWorkMessageAt = Date.now();
         // Only decrement inFlight for solicited responses (replies to request_work).
         // Unsolicited pushes from maybePushWork should not affect the counter.
         if (msg.solicited) {
@@ -902,17 +909,28 @@ async function runCrackingLoop() {
         if (!cracking || !ws || ws.readyState !== WebSocket.OPEN) break;
 
         const silentForMs = Date.now() - lastWsMessageAt;
+        const workSilentMs = lastWorkMessageAt > 0 ? Date.now() - lastWorkMessageAt : Infinity;
         if (response._timeout && workRequestsInFlight > 0 && queuedWorkMessages.length === 0 && (Date.now() - workRequestSentAt) > 5000) {
-          clog(`stuck request detected — resetting in-flight counter (silent=${silentForMs}ms)`);
+          clog(`stuck request detected — resetting in-flight counter (silent=${silentForMs}ms workSilent=${workSilentMs}ms buffered=${ws.bufferedAmount ?? '?'}B)`);
           workRequestsInFlight = 0;
           workRequestSentAt = 0;
         }
 
-        // Half-open tunnel recovery: if we repeatedly time out while requests
-        // are in flight and have seen no inbound websocket traffic, force a
-        // reconnect so the loop can resume on a fresh socket.
+        // Half-open tunnel recovery (no AV): total WS silence for 15 s while
+        // requests are in flight → dead socket.
         if (response._timeout && consecutiveWorkTimeouts >= 3 && workRequestsInFlight > 0 && silentForMs > 15000) {
-          clog(`possible tunnel stall detected (silent=${silentForMs}ms, timeouts=${consecutiveWorkTimeouts}) — forcing websocket reconnect`);
+          clog(`tunnel stall detected (silent=${silentForMs}ms, timeouts=${consecutiveWorkTimeouts}) — forcing websocket reconnect`);
+          try { ws.close(); } catch (_) {}
+          break;
+        }
+
+        // AV/DPI stall recovery: stats broadcasts keep lastWsMessageAt fresh
+        // so silentForMs never grows, but work messages are blocked in both
+        // directions.  Reconnect after 6 consecutive timeouts (~30 s) while
+        // requests are still in flight — the fresh connection resets the AV
+        // inspection window.
+        if (response._timeout && consecutiveWorkTimeouts >= 6 && workRequestsInFlight > 0) {
+          clog(`AV/proxy stall suspected (timeouts=${consecutiveWorkTimeouts} workSilent=${workSilentMs}ms buffered=${ws.bufferedAmount ?? '?'}B) — forcing reconnect`);
           try { ws.close(); } catch (_) {}
           break;
         }
@@ -953,6 +971,7 @@ async function runCrackingLoop() {
 
       const batchStart = performance.now();
       let lastProgressLog = 0;
+      let lastHashrateUpdateAt = 0;
       await cracker.processChunks(chunks, ws, (hashRate, processed, total) => {
         lastMeasuredHashRate = hashRate;
         const displayRate = smoothHashRate(hashRate);
@@ -969,9 +988,13 @@ async function runCrackingLoop() {
         // Log progress every ~10 seconds
         if (elapsed - lastProgressLog >= 10) {
           lastProgressLog = elapsed;
-          clog(`progress: ${pct}% (${formatNumber(processed)}/${formatNumber(total)}) at ${formatHashRate(hashRate)} elapsed=${Math.round(elapsed)}s`);
+          clog(`progress: ${pct}% (${formatNumber(processed)}/${formatNumber(total)}) at ${formatHashRate(hashRate)} elapsed=${Math.round(elapsed)}s buffered=${ws?.bufferedAmount ?? '?'}B`);
         }
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        // Rate-limit hashrate_update to once per second — sending on every
+        // progress callback can flood the socket and trigger AV/DPI stalls.
+        const now = performance.now();
+        if (ws && ws.readyState === WebSocket.OPEN && now - lastHashrateUpdateAt >= 1000) {
+          lastHashrateUpdateAt = now;
           ws.send(JSON.stringify({ type: 'hashrate_update', hashRate, clientId: getClientId() }));
         }
       }, currentCharset, packetRawData);
