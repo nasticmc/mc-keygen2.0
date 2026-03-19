@@ -79,6 +79,8 @@ function connectWebSocket() {
     }
     document.getElementById('connection-status').textContent = 'Connected';
     document.getElementById('connection-status').className = 'connected';
+    const srvWsOpen = document.getElementById('srv-ws-status');
+    if (srvWsOpen) { srvWsOpen.textContent = 'Connected'; srvWsOpen.style.color = 'var(--green)'; }
     setCrackingStatus('Connected to server. Registering worker identity...');
     ws.send(JSON.stringify({ type: 'worker_register', clientId: getClientId() }));
     if (cracking && !loopRunning) {
@@ -92,6 +94,8 @@ function connectWebSocket() {
     document.getElementById('connection-status').textContent = 'Disconnected';
     document.getElementById('connection-status').className = 'disconnected';
     document.getElementById('worker-id').textContent = '';
+    const srvWsClose = document.getElementById('srv-ws-status');
+    if (srvWsClose) { srvWsClose.textContent = 'Reconnecting...'; srvWsClose.style.color = 'var(--yellow)'; }
     setCrackingStatus('Socket disconnected. Reconnecting in 2s...');
     workRequestsInFlight = 0;
     workRequestSentAt = 0;
@@ -292,6 +296,20 @@ function updateStats(stats) {
   // Update keyspace display to show remaining candidates (decreases as work completes)
   const ksEl = document.getElementById('stat-keyspace-size');
   if (ksEl && active.total > 0) ksEl.textContent = formatNumber(remaining);
+
+  // Update server activity panel
+  const srvHash = document.getElementById('srv-hash-rate');
+  if (srvHash) srvHash.textContent = formatHashRate(hashRate);
+  const srvAssigned = document.getElementById('srv-assigned');
+  if (srvAssigned) srvAssigned.textContent = formatNumber(active.assigned);
+  const srvCompleted = document.getElementById('srv-completed');
+  if (srvCompleted) srvCompleted.textContent = formatNumber(active.completed);
+  const srvUpdate = document.getElementById('srv-last-update');
+  if (srvUpdate) srvUpdate.textContent = new Date().toLocaleTimeString();
+  if (stats.workerCount !== undefined) {
+    const srvWorkerCount = document.getElementById('srv-worker-count');
+    if (srvWorkerCount) srvWorkerCount.textContent = stats.workerCount;
+  }
 }
 
 function formatNumber(n) {
@@ -354,6 +372,15 @@ function updateWorkerDisplay(workerId, hashRate) {
   refreshWorkerDisplay();
 }
 
+function updateServerWorkerBreakdown(workers) {
+  const el = document.getElementById('srv-worker-breakdown');
+  if (!el) return;
+  if (!workers || workers.length === 0) { el.innerHTML = ''; return; }
+  el.innerHTML = workers.map(w =>
+    `<div class="srv-worker-row"><span class="srv-worker-name">${workerIdToName(w.id)}</span><span class="srv-worker-rate">${formatHashRate(w.hashRate)}</span><span class="srv-worker-chunks">${formatNumber(w.chunksCompleted)} chunks done</span></div>`
+  ).join('');
+}
+
 // ── Packets Table ───────────────────────────────────────────────────────────
 let _lastPacketsJson = '';
 function renderPackets(packets) {
@@ -383,6 +410,25 @@ function renderPackets(packets) {
       </td>
     `;
     tbody.appendChild(tr);
+  }
+
+  // Update active packet summary shown near the crack button
+  const activePacket = packets.find(p => p.status === 'pending' || p.status === 'cracking');
+  const summaryEl = document.getElementById('active-packet-summary');
+  if (summaryEl) {
+    if (activePacket) {
+      const charsetLen = CHARSET_LENS[activePacket.charset] || 26;
+      const minLen = activePacket.min_len || 1;
+      const maxLen = activePacket.max_len || 5;
+      const ksSize = calculateKeyspaceSize(charsetLen, minLen, maxLen);
+      const prefixHex = activePacket.prefix ? activePacket.prefix.toString(16).padStart(2, '0') : '??';
+      const channelHash = activePacket.channel_hash || prefixHex;
+      const badgeClass = activePacket.status === 'cracking' ? 'badge-cracking' : 'badge-pending';
+      summaryEl.innerHTML = `<span class="badge ${badgeClass}">${activePacket.status}</span> Packet #${activePacket.id} &middot; 0x${channelHash} &middot; charset: <strong>${activePacket.charset || 'lower'}</strong> &middot; length: <strong>${minLen}&ndash;${maxLen}</strong> &middot; ~<strong>${formatNumber(ksSize)}</strong> candidates`;
+      summaryEl.classList.remove('hidden');
+    } else {
+      summaryEl.classList.add('hidden');
+    }
   }
 }
 
@@ -973,6 +1019,9 @@ async function loadData() {
     renderCandidates(candidates);
     renderDecodedPackets(decodedPackets);
     document.getElementById('worker-count').textContent = `Workers: ${stats.workerCount}`;
+    const srvWorkerCountEl = document.getElementById('srv-worker-count');
+    if (srvWorkerCountEl) srvWorkerCountEl.textContent = stats.workerCount ?? '—';
+    updateServerWorkerBreakdown(stats.workers || []);
 
     const decoderEl = document.getElementById('decoder-status');
     if (decoderStatus.available) {
