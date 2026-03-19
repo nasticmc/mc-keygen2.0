@@ -42,8 +42,8 @@ let _smoothedHashRate = 0;
 // Exponential moving average for hash rate display — smooths out per-chunk spikes.
 // alpha=0.25 → ~4 samples of memory (~4–8 s at current update frequency).
 function smoothHashRate(newRate) {
-  if (_smoothedHashRate === 0 || newRate === 0) {
-    _smoothedHashRate = newRate; // fast-start / instant-zero on stop
+  if (_smoothedHashRate === 0) {
+    _smoothedHashRate = newRate; // fast-start only; stop resets directly
   } else {
     _smoothedHashRate = 0.25 * newRate + 0.75 * _smoothedHashRate;
   }
@@ -291,7 +291,7 @@ function updateStats(stats) {
   document.getElementById('progress-text').textContent = `${pct}% (${active.completed}/${total})`;
 
   const hashRate = stats.totalHashRate ?? 0;
-  if (stats.totalHashRate !== undefined) {
+  if (stats.totalHashRate !== undefined && (!loopRunning || hashRate > 0)) {
     const displayRate = smoothHashRate(hashRate);
     document.getElementById('stat-hashrate').textContent = formatHashRate(displayRate);
   }
