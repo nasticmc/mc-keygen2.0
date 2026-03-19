@@ -274,7 +274,7 @@ function isMobile() {
 }
 
 function batchCount() {
-  return parseInt(document.getElementById('work-batch-count')?.value, 10) || (isMobile() ? 2 : 8);
+  return parseInt(document.getElementById('work-batch-count')?.value, 10) || (isMobile() ? 1 : 16);
 }
 
 function clampNumber(value, min, max, fallback) {
@@ -304,7 +304,7 @@ function applyPerfDefaults() {
 
   if (batchInput) {
     const saved = localStorage.getItem(PERF_STORAGE_KEYS.workBatchCount);
-    batchInput.value = saved || (isMobile() ? 1 : batchInput.value || 4);
+    batchInput.value = saved || (isMobile() ? 1 : batchInput.value || 16);
   }
   if (dispatchScale) {
     const saved = localStorage.getItem(PERF_STORAGE_KEYS.dispatchScale);
@@ -391,6 +391,13 @@ function updateStats(stats) {
   const ksEl = document.getElementById('stat-keyspace-size');
   if (ksEl && active.total > 0) ksEl.textContent = formatNumber(remaining);
 
+  // Candidate stats bar
+  if (stats.candidatesFound !== undefined) {
+    const foundEl = document.getElementById('stat-candidates-found');
+    const testedEl = document.getElementById('stat-candidates-tested');
+    if (foundEl) foundEl.textContent = stats.candidatesFound;
+    if (testedEl) testedEl.textContent = stats.candidatesTested;
+  }
 }
 
 function formatNumber(n) {
