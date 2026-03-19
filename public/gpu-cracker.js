@@ -391,7 +391,9 @@ class GPUCracker {
     return matches;
   }
 
-  async processChunks(chunks, ws, onProgress, charset, packetRawData = {}) {
+  async processChunks(chunks, callbacks, charset, packetRawData = {}) {
+    // callbacks: { onPrefixMatch, onChunkComplete, onProgress }
+    const { onPrefixMatch, onChunkComplete, onProgress } = callbacks;
     this.running = true;
     this.ensureBuffers();
 
@@ -452,10 +454,8 @@ class GPUCracker {
         }
         batchMatches.push(entry);
       }
-      if (batchMatches.length > 0) {
-        try {
-          ws.send(JSON.stringify({ type: 'prefix_match_batch', packetId: chunk.packet_id, matches: batchMatches }));
-        } catch (_) { /* ws closed mid-batch; loop will detect on next iteration */ }
+      if (batchMatches.length > 0 && onPrefixMatch) {
+        try { onPrefixMatch(chunk.packet_id, batchMatches); } catch (_) { /* fire and forget */ }
       }
     };
 
@@ -535,14 +535,8 @@ class GPUCracker {
       }
     }
 
-    if (completedChunkIds.size > 0) {
-      try {
-        ws.send(JSON.stringify({
-          type: 'chunk_complete',
-          chunkIds: [...completedChunkIds],
-          hashRate: this.hashRate,
-        }));
-      } catch (_) { /* ws closed; server will re-queue via stale-chunk expiry */ }
+    if (completedChunkIds.size > 0 && onChunkComplete) {
+      try { onChunkComplete([...completedChunkIds], this.hashRate); } catch (_) { /* fire and forget */ }
     }
 
     return { found: false };
@@ -619,7 +613,9 @@ class CPUCracker {
     return '#' + name;
   }
 
-  async processChunks(chunks, ws, onProgress, charset, packetRawData = {}) {
+  async processChunks(chunks, callbacks, charset, packetRawData = {}) {
+    // callbacks: { onPrefixMatch, onChunkComplete, onProgress }
+    const { onPrefixMatch, onChunkComplete, onProgress } = callbacks;
     this.running = true;
     let totalHashed = 0;
     let lastTime = performance.now();
@@ -653,13 +649,9 @@ class CPUCracker {
             const decoded = await clientTryDecrypt(rawData, keyHex);
             if (decoded) entry.clientDecoded = decoded;
           }
-          try {
-            ws.send(JSON.stringify({
-              type: 'prefix_match_batch',
-              packetId: chunk.packet_id,
-              matches: [entry],
-            }));
-          } catch (_) { /* ws closed; loop will detect and recover */ }
+          if (onPrefixMatch) {
+            try { onPrefixMatch(chunk.packet_id, [entry]); } catch (_) { /* fire and forget */ }
+          }
         }
 
         totalHashed++;
@@ -686,14 +678,8 @@ class CPUCracker {
       lastTime = performance.now();
     }
 
-    if (completedChunkIds.length > 0) {
-      try {
-        ws.send(JSON.stringify({
-          type: 'chunk_complete',
-          chunkIds: completedChunkIds,
-          hashRate: this.hashRate,
-        }));
-      } catch (_) { /* ws closed; server will re-queue via stale-chunk expiry */ }
+    if (completedChunkIds.length > 0 && onChunkComplete) {
+      try { onChunkComplete(completedChunkIds, this.hashRate); } catch (_) { /* fire and forget */ }
     }
 
     return { found: false };

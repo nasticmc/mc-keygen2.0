@@ -32,8 +32,6 @@ let ws = null;
 let cracker = null;
 let cracking = false;
 let loopRunning = false;
-let workRequestsInFlight = 0;
-let workRequestSentAt = 0;
 let currentCharset = 'abcdefghijklmnopqrstuvwxyz';
 let serverChunkSize = 500000;
 let lastMeasuredHashRate = 0;
@@ -52,12 +50,44 @@ function smoothHashRate(newRate) {
   return Math.round(_smoothedHashRate);
 }
 let persistedClientId = localStorage.getItem('mc-worker-client-id') || '';
-const pendingWorkResolvers = [];
-const queuedWorkMessages = [];
 let lastCrackingStatus = 'Idle.';
 let lastWsMessageAt = 0;
-let lastWorkMessageAt = 0;  // last time server responded to a work request (not just stats)
-let consecutiveWorkTimeouts = 0;
+
+// ── HTTP Transport ──────────────────────────────────────────────────────────
+// All client→server communication uses HTTP POST. WebSocket is receive-only
+// (server pushes: stats, key_found, work pushes, broadcasts).
+async function apiPost(path, body) {
+  const maxRetries = 3;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) return res.json();
+      if (res.status >= 500 && attempt < maxRetries - 1) {
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
+      throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      if (attempt < maxRetries - 1) {
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+async function fetchWork() {
+  const data = await apiPost('/api/worker/request-work', {
+    clientId: getClientId(),
+    count: batchCount(),
+  });
+  return data;
+}
 
 const charsetByKey = {
   alnum: 'abcdefghijklmnopqrstuvwxyz0123456789',
@@ -86,29 +116,37 @@ const WS_CLOSE_CODES = {
   1013: 'Try Again Later', 1015: 'TLS Handshake Failed',
 };
 
-function connectWebSocket() {
+async function connectWebSocket() {
+  // Register worker via HTTP first
+  try {
+    const reg = await apiPost('/api/worker/register', { clientId: getClientId() });
+    setClientId(reg.workerId);
+    document.getElementById('worker-id').textContent = `ID: ${workerIdToName(reg.workerId)}`;
+    document.getElementById('connection-status').textContent = 'Connected';
+    document.getElementById('connection-status').className = 'connected';
+    setCrackingStatus(`Worker registered as ${workerIdToName(reg.workerId)}. Ready.`);
+    clog(`worker registered via HTTP as ${workerIdToName(reg.workerId)}`);
+  } catch (err) {
+    clog(`HTTP registration failed: ${err.message} — retrying in 2s`);
+    document.getElementById('connection-status').textContent = 'Disconnected';
+    document.getElementById('connection-status').className = 'disconnected';
+    setTimeout(connectWebSocket, 2000);
+    return;
+  }
+
+  // WebSocket is receive-only — server pushes stats, key_found, etc.
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const url = `${protocol}//${location.host}`;
   _wsConnectStartedAt = Date.now();
-  clog(`websocket connecting to ${url} (attempt #${_wsReconnectCount + 1})`);
+  clog(`websocket connecting to ${url} (receive-only, attempt #${_wsReconnectCount + 1})`);
   ws = new WebSocket(url);
 
   ws.onopen = () => {
     const handshakeMs = Date.now() - _wsConnectStartedAt;
     _wsReconnectCount++;
-    clog(`websocket connected in ${handshakeMs}ms (reconnect #${_wsReconnectCount}, stale resolvers: ${pendingWorkResolvers.length}, queued: ${queuedWorkMessages.length})`);
-    workRequestsInFlight = 0;
-    workRequestSentAt = 0;
+    clog(`websocket connected in ${handshakeMs}ms (receive-only, reconnect #${_wsReconnectCount})`);
     lastWsMessageAt = Date.now();
-    consecutiveWorkTimeouts = 0;
-    const staleResolvers = pendingWorkResolvers.splice(0);
-    queuedWorkMessages.length = 0;
-    for (const resolve of staleResolvers) {
-      resolve({ chunks: [], _reconnected: true });
-    }
-    document.getElementById('connection-status').textContent = 'Connected';
-    document.getElementById('connection-status').className = 'connected';
-    setCrackingStatus('Connected to server. Registering worker identity...');
+    // Register on WS too so server can associate the WS connection for pushes
     ws.send(JSON.stringify({ type: 'worker_register', clientId: getClientId() }));
     if (cracking && !loopRunning) {
       clog('restarting cracking loop after reconnect');
@@ -118,51 +156,45 @@ function connectWebSocket() {
 
   ws.onerror = (event) => {
     clog(`websocket error — readyState=${ws.readyState} (0=CONNECTING 1=OPEN 2=CLOSING 3=CLOSED) url=${ws.url}`);
-    // Log network connectivity info if available
     if (navigator.onLine !== undefined) clog(`  navigator.onLine=${navigator.onLine}`);
     if (navigator.connection) {
       const c = navigator.connection;
       clog(`  network type=${c.effectiveType || c.type || '?'} downlink=${c.downlink ?? '?'}Mbps rtt=${c.rtt ?? '?'}ms`);
     }
-    // onerror is always followed by onclose, so reconnect logic stays there
   };
 
   ws.onclose = (event) => {
     const codeName = WS_CLOSE_CODES[event.code] || 'Unknown';
     const reason = event.reason ? ` reason="${event.reason}"` : '';
     const silentMs = lastWsMessageAt > 0 ? Date.now() - lastWsMessageAt : -1;
-    clog(`websocket closed — code=${event.code} (${codeName})${reason} clean=${event.wasClean} silentFor=${silentMs}ms inFlight=${workRequestsInFlight} queued=${queuedWorkMessages.length}`);
+    clog(`websocket closed — code=${event.code} (${codeName})${reason} clean=${event.wasClean} silentFor=${silentMs}ms`);
     if (!event.wasClean) {
       clog(`  unclean close — possible proxy drop, network change, or server crash`);
     }
-    document.getElementById('connection-status').textContent = 'Disconnected';
-    document.getElementById('connection-status').className = 'disconnected';
-    document.getElementById('worker-id').textContent = '';
-    setCrackingStatus('Socket disconnected. Reconnecting in 2s...');
-    workRequestsInFlight = 0;
-    workRequestSentAt = 0;
+    // WS is non-critical now — cracking continues via HTTP. Just reconnect for pushes.
     clearInterval(ws._keepAliveTimer);
-    setTimeout(connectWebSocket, 2000);
+    setTimeout(() => {
+      // Reconnect WS only (HTTP registration already done)
+      const protocol2 = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const url2 = `${protocol2}//${location.host}`;
+      _wsConnectStartedAt = Date.now();
+      clog(`websocket reconnecting to ${url2} (receive-only)`);
+      const newWs = new WebSocket(url2);
+      newWs.onopen = ws.onopen;
+      newWs.onerror = ws.onerror;
+      newWs.onclose = ws.onclose;
+      newWs.onmessage = ws.onmessage;
+      newWs._keepAliveTimer = setInterval(() => {
+        const silentMs2 = lastWsMessageAt > 0 ? Date.now() - lastWsMessageAt : -1;
+        clog(`keepalive tick — readyState=${newWs.readyState} cracking=${cracking} loopRunning=${loopRunning} silentFor=${silentMs2}ms`);
+      }, 30000);
+      ws = newWs;
+    }, 2000);
   };
 
-  // Safety net: if the cracking loop is active but stalled (no queued work and
-  // no requests in flight), force a top-up every 30s. The native WebSocket
-  // ping/pong (server-side, 15s) handles proxy keep-alive, so no need to send
-  // a redundant JSON keepalive message here.
   ws._keepAliveTimer = setInterval(() => {
     const silentMs = lastWsMessageAt > 0 ? Date.now() - lastWsMessageAt : -1;
-    const workSilentMs = lastWorkMessageAt > 0 ? Date.now() - lastWorkMessageAt : -1;
-    const buffered = ws.bufferedAmount ?? -1;
-    clog(`keepalive tick — readyState=${ws.readyState} cracking=${cracking} loopRunning=${loopRunning} queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight} silentFor=${silentMs}ms workSilentFor=${workSilentMs}ms buffered=${buffered}B`);
-    if (ws.readyState === WebSocket.OPEN) {
-      if (buffered > 64 * 1024) {
-        clog(`keepalive: send buffer has ${buffered} bytes pending — possible AV/proxy stall`);
-      }
-      if (cracking && loopRunning && queuedWorkMessages.length === 0 && workRequestsInFlight === 0) {
-        clog(`keepalive: stalled pipeline detected — forcing top-up`);
-        topUpWorkQueue();
-      }
-    }
+    clog(`keepalive tick — readyState=${ws.readyState} cracking=${cracking} loopRunning=${loopRunning} silentFor=${silentMs}ms`);
   }, 30000);
 
   ws.onmessage = (event) => {
@@ -203,9 +235,8 @@ function connectWebSocket() {
         updateWorkerDisplay(msg.workerId, msg.hashRate);
         break;
       case 'worker_hello':
-        setClientId(msg.workerId);
-        document.getElementById('worker-id').textContent = `ID: ${workerIdToName(msg.workerId)}`;
-        setCrackingStatus(`Worker registered as ${workerIdToName(msg.workerId)}. Ready.`);
+        // Server confirmed WS association
+        clog(`WS worker_hello received for ${workerIdToName(msg.workerId)}`);
         break;
       case 'server_status':
         updateServerStatus(msg);
@@ -214,35 +245,10 @@ function connectWebSocket() {
         workerData.delete(msg.workerId);
         refreshWorkerDisplay();
         break;
-      case 'work': {
-        lastWorkMessageAt = Date.now();
-        // Only decrement inFlight for solicited responses (replies to request_work).
-        // Unsolicited pushes from maybePushWork should not affect the counter.
-        if (msg.solicited) {
-          workRequestsInFlight = Math.max(0, workRequestsInFlight - 1);
-          if (workRequestsInFlight === 0) workRequestSentAt = 0;
-        }
-
-        const chunkCount = msg.chunks?.length || 0;
-        if (chunkCount > 0) consecutiveWorkTimeouts = 0;
-
-        // Empty replies are useful to satisfy a waiter, but should never be
-        // queued as "available work" or they inflate queued batch/chunk counts.
-        if (chunkCount === 0 && pendingWorkResolvers.length === 0) {
-          clog(`work received: 0 chunk(s) [${msg.solicited ? 'solicited' : 'push'}] — dropped empty payload (queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight} waiting=${pendingWorkResolvers.length})`);
-          if (cracking && loopRunning) topUpWorkQueue();
-          break;
-        }
-
-        if (pendingWorkResolvers.length > 0) {
-          const resolve = pendingWorkResolvers.shift();
-          resolve(msg);
-        } else {
-          queuedWorkMessages.push(msg);
-        }
-        clog(`work received: ${chunkCount} chunk(s) [${msg.solicited ? 'solicited' : 'push'}] — queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight} waiting=${pendingWorkResolvers.length}`);
+      case 'work':
+        // Unsolicited push work is ignored — we use HTTP for work requests now
+        clog(`work push received (${msg.chunks?.length || 0} chunks) — ignored (using HTTP)`);
         break;
-      }
       default:
         clog(`ws unknown message type: "${msg.type}"`);
         break;
@@ -256,56 +262,6 @@ function isMobile() {
 
 function batchCount() {
   return parseInt(document.getElementById('work-batch-count')?.value, 10) || (isMobile() ? 2 : 8);
-}
-
-function getMinAhead() {
-  // Auto-scale to keep ~5 seconds of work buffered in the pipeline.
-  // Floor of 4 ensures we always have enough to survive a slow round-trip.
-  if (lastMeasuredHashRate > 0 && serverChunkSize > 0) {
-    const msPerBatch = (serverChunkSize * batchCount()) / lastMeasuredHashRate * 1000;
-    const auto = Math.max(4, Math.min(16, Math.ceil(5000 / msPerBatch)));
-    const el = document.getElementById('work-min-ahead');
-    if (el) el.value = auto;
-    return auto;
-  }
-  return parseInt(document.getElementById('work-min-ahead')?.value, 10) || (isMobile() ? 2 : 4);
-}
-
-// Fire enough work requests to keep at least getMinAhead() batches queued or
-// in-flight at all times.  Called on loop start and after each batch finishes.
-function topUpWorkQueue() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const minAhead = getMinAhead();
-  const need = minAhead - (queuedWorkMessages.length + workRequestsInFlight);
-  if (need > 0) {
-    clog(`topUp: requesting ${need} batch(es) (minAhead=${minAhead} queued=${queuedWorkMessages.length} inFlight=${workRequestsInFlight})`);
-  }
-  for (let i = 0; i < need; i++) {
-    if (workRequestsInFlight === 0) workRequestSentAt = Date.now();
-    workRequestsInFlight++;
-    ws.send(JSON.stringify({ type: 'request_work', count: batchCount(), clientId: getClientId() }));
-  }
-}
-
-function waitForWork(timeoutMs = 5000) {
-  if (queuedWorkMessages.length > 0) {
-    return Promise.resolve(queuedWorkMessages.shift());
-  }
-
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      const idx = pendingWorkResolvers.indexOf(resolver);
-      if (idx >= 0) pendingWorkResolvers.splice(idx, 1);
-      resolve({ chunks: [], _timeout: true });
-    }, timeoutMs);
-
-    const resolver = (msg) => {
-      clearTimeout(timeout);
-      resolve(msg);
-    };
-
-    pendingWorkResolvers.push(resolver);
-  });
 }
 
 function getClientId() {
@@ -861,9 +817,7 @@ document.getElementById('btn-stop-cracking').addEventListener('click', () => {
   setCrackingStatus('Stopped.');
   resetLocalProgress();
   _smoothedHashRate = 0;
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'hashrate_update', hashRate: 0, clientId: getClientId() }));
-  }
+  apiPost('/api/worker/hashrate', { clientId: getClientId(), hashRate: 0 }).catch(() => {});
 });
 
 async function runCrackingLoop() {
@@ -871,72 +825,37 @@ async function runCrackingLoop() {
   loopRunning = true;
   let batchesCompleted = 0;
 
+  // Pre-fetch next batch via HTTP while GPU processes current one
+  let nextWorkPromise = null;
+
   try {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      clog('loop exiting — socket not open, will restart on reconnect');
-      return;
-    }
+    clog('cracking loop started (HTTP mode)');
 
-    clog('cracking loop started');
-    topUpWorkQueue();
-    clog(`sent initial work requests: inFlight=${workRequestsInFlight} queued=${queuedWorkMessages.length}`);
-    let nextWork = waitForWork(10000);
+    while (cracking) {
+      setCrackingStatus('Requesting work via HTTP...');
 
-    while (cracking && ws && ws.readyState === WebSocket.OPEN) {
-      const qLen = queuedWorkMessages.length;
-      if (qLen > 0) {
-        setCrackingStatus(`${qLen} batch${qLen !== 1 ? 'es' : ''} queued. Loading next...`);
-      } else {
-        setCrackingStatus(`Waiting for work (${workRequestsInFlight} request${workRequestsInFlight !== 1 ? 's' : ''} in-flight)...`);
-      }
-
+      // Use pre-fetched work if available, otherwise fetch now
+      let response;
       const t0 = performance.now();
-      const response = await nextWork;
+      try {
+        response = nextWorkPromise ? await nextWorkPromise : await fetchWork();
+        nextWorkPromise = null;
+      } catch (err) {
+        clog(`HTTP work request failed: ${err.message} — retrying in 2s`);
+        setCrackingStatus(`Work request failed: ${err.message}. Retrying...`);
+        await new Promise(r => setTimeout(r, 2000));
+        continue;
+      }
       const waitMs = Math.round(performance.now() - t0);
-      const chunks = response.chunks;
+
+      const chunks = response.chunks || [];
       const packetRawData = response.packetRawData || {};
       if (response.charset) currentCharset = response.charset;
 
       if (chunks.length === 0) {
-        if (response._reconnected) {
-          consecutiveWorkTimeouts = 0;
-          clog('woke from reconnect — re-requesting work');
-        } else {
-          if (response._timeout) consecutiveWorkTimeouts++;
-          clog(`empty response after ${waitMs}ms (timeout=${response._timeout ? 'yes' : 'no'} #${consecutiveWorkTimeouts} inFlight=${workRequestsInFlight} queued=${queuedWorkMessages.length})`);
-          setCrackingStatus(`No work available — retrying (waited ${waitMs}ms)...`);
-        }
-        if (!cracking || !ws || ws.readyState !== WebSocket.OPEN) break;
-
-        const silentForMs = Date.now() - lastWsMessageAt;
-        const workSilentMs = lastWorkMessageAt > 0 ? Date.now() - lastWorkMessageAt : Infinity;
-        if (response._timeout && workRequestsInFlight > 0 && queuedWorkMessages.length === 0 && (Date.now() - workRequestSentAt) > 5000) {
-          clog(`stuck request detected — resetting in-flight counter (silent=${silentForMs}ms workSilent=${workSilentMs}ms buffered=${ws.bufferedAmount ?? '?'}B)`);
-          workRequestsInFlight = 0;
-          workRequestSentAt = 0;
-        }
-
-        // Half-open tunnel recovery (no AV): total WS silence for 15 s while
-        // requests are in flight → dead socket.
-        if (response._timeout && consecutiveWorkTimeouts >= 3 && workRequestsInFlight > 0 && silentForMs > 15000) {
-          clog(`tunnel stall detected (silent=${silentForMs}ms, timeouts=${consecutiveWorkTimeouts}) — forcing websocket reconnect`);
-          try { ws.close(); } catch (_) {}
-          break;
-        }
-
-        // AV/DPI stall recovery: stats broadcasts keep lastWsMessageAt fresh
-        // so silentForMs never grows, but work messages are blocked in both
-        // directions.  Reconnect after 6 consecutive timeouts (~30 s) while
-        // requests are still in flight — the fresh connection resets the AV
-        // inspection window.
-        if (response._timeout && consecutiveWorkTimeouts >= 6 && workRequestsInFlight > 0) {
-          clog(`AV/proxy stall suspected (timeouts=${consecutiveWorkTimeouts} workSilent=${workSilentMs}ms buffered=${ws.bufferedAmount ?? '?'}B) — forcing reconnect`);
-          try { ws.close(); } catch (_) {}
-          break;
-        }
-
-        topUpWorkQueue();
-        nextWork = waitForWork(5000);
+        clog(`no work available (waited ${waitMs}ms) — retrying in 3s`);
+        setCrackingStatus('No work available — retrying...');
+        await new Promise(r => setTimeout(r, 3000));
         continue;
       }
 
@@ -944,10 +863,11 @@ async function runCrackingLoop() {
       const packetIds = [...new Set(chunks.map(c => c.packet_id))];
       clog(`received ${chunks.length} chunk(s) for packet [${packetIds}] — ${formatNumber(totalCandidates)} candidates (wait=${waitMs}ms)`);
 
-      // Top up before processing so next batch is ready when this one finishes
-      topUpWorkQueue();
-      clog(`pipeline: inFlight=${workRequestsInFlight} queued=${queuedWorkMessages.length}`);
-      nextWork = waitForWork(10000);
+      // Pre-fetch next batch while GPU crunches this one
+      nextWorkPromise = fetchWork().catch(err => {
+        clog(`pre-fetch failed: ${err.message}`);
+        return { chunks: [] };
+      });
 
       setCrackingStatus(`Starting batch: ${chunks.length} chunk(s), ${formatNumber(totalCandidates)} candidates for packet ${packetIds.join(', ')}...`);
 
@@ -972,31 +892,42 @@ async function runCrackingLoop() {
       const batchStart = performance.now();
       let lastProgressLog = 0;
       let lastHashrateUpdateAt = 0;
-      await cracker.processChunks(chunks, ws, (hashRate, processed, total) => {
-        lastMeasuredHashRate = hashRate;
-        const displayRate = smoothHashRate(hashRate);
-        document.getElementById('stat-hashrate').textContent = formatHashRate(displayRate);
-        const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
-        const elapsed = (performance.now() - batchStart) / 1000;
-        const remaining = displayRate > 0 ? (total - processed) / displayRate : 0;
-        setCrackingStatus(
-          `Crunching: ${pct}% (${formatNumber(processed)}/${formatNumber(total)}) at ${formatHashRate(displayRate)}` +
-          (remaining > 0 ? ` — ${formatETA(remaining)} left` : '') +
-          ` [batch ${batchesCompleted + 1}, queued: ${queuedWorkMessages.length}]`
-        );
-        setLocalProgress(processed, total);
-        // Log progress every ~10 seconds
-        if (elapsed - lastProgressLog >= 10) {
-          lastProgressLog = elapsed;
-          clog(`progress: ${pct}% (${formatNumber(processed)}/${formatNumber(total)}) at ${formatHashRate(hashRate)} elapsed=${Math.round(elapsed)}s buffered=${ws?.bufferedAmount ?? '?'}B`);
-        }
-        // Rate-limit hashrate_update to once per second — sending on every
-        // progress callback can flood the socket and trigger AV/DPI stalls.
-        const now = performance.now();
-        if (ws && ws.readyState === WebSocket.OPEN && now - lastHashrateUpdateAt >= 1000) {
-          lastHashrateUpdateAt = now;
-          ws.send(JSON.stringify({ type: 'hashrate_update', hashRate, clientId: getClientId() }));
-        }
+      await cracker.processChunks(chunks, {
+        onPrefixMatch: (packetId, matches) => {
+          apiPost('/api/worker/prefix-match', { clientId: getClientId(), packetId, matches }).catch(err => {
+            clog(`prefix-match POST failed: ${err.message}`);
+          });
+        },
+        onChunkComplete: (chunkIds, hashRate) => {
+          apiPost('/api/worker/chunk-complete', { clientId: getClientId(), chunkIds, hashRate }).catch(err => {
+            clog(`chunk-complete POST failed: ${err.message}`);
+          });
+        },
+        onProgress: (hashRate, processed, total) => {
+          lastMeasuredHashRate = hashRate;
+          const displayRate = smoothHashRate(hashRate);
+          document.getElementById('stat-hashrate').textContent = formatHashRate(displayRate);
+          const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
+          const elapsed = (performance.now() - batchStart) / 1000;
+          const remaining = displayRate > 0 ? (total - processed) / displayRate : 0;
+          setCrackingStatus(
+            `Crunching: ${pct}% (${formatNumber(processed)}/${formatNumber(total)}) at ${formatHashRate(displayRate)}` +
+            (remaining > 0 ? ` — ${formatETA(remaining)} left` : '') +
+            ` [batch ${batchesCompleted + 1}]`
+          );
+          setLocalProgress(processed, total);
+          // Log progress every ~10 seconds
+          if (elapsed - lastProgressLog >= 10) {
+            lastProgressLog = elapsed;
+            clog(`progress: ${pct}% (${formatNumber(processed)}/${formatNumber(total)}) at ${formatHashRate(hashRate)} elapsed=${Math.round(elapsed)}s`);
+          }
+          // Rate-limit hashrate_update to once per second via HTTP
+          const now = performance.now();
+          if (now - lastHashrateUpdateAt >= 1000) {
+            lastHashrateUpdateAt = now;
+            apiPost('/api/worker/hashrate', { clientId: getClientId(), hashRate }).catch(() => {});
+          }
+        },
       }, currentCharset, packetRawData);
 
       const batchMs = Math.round(performance.now() - batchStart);
@@ -1007,15 +938,12 @@ async function runCrackingLoop() {
     }
   } finally {
     loopRunning = false;
-    clog(`cracking loop exited — batches=${batchesCompleted} cracking=${cracking} socket=${ws?.readyState}`);
-    if (cracking && ws && ws.readyState === WebSocket.OPEN) {
+    clog(`cracking loop exited — batches=${batchesCompleted} cracking=${cracking}`);
+    if (cracking) {
+      // Loop exited but still cracking — restart
       setTimeout(runCrackingLoop, 0);
       return;
     }
-  }
-
-  if (cracking && (!ws || ws.readyState !== WebSocket.OPEN)) {
-    setCrackingStatus('Waiting for WebSocket reconnection...');
   }
 }
 
