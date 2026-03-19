@@ -248,16 +248,13 @@ try { db.exec('ALTER TABLE packets ADD COLUMN keyspace_end INTEGER'); } catch {}
 // Also rewind packet cursors so orphaned keyspace ranges get re-assigned.
 {
   const deleted = db.prepare("DELETE FROM work_chunks WHERE status = 'pending'").run().changes;
-  // Rewind cursors for any assigned chunks before deleting them
+  // Refund dispatch credits for any assigned chunks before deleting them
   const orphanedAssigned = db.prepare(
-    "SELECT packet_id, MIN(range_start) as min_start FROM work_chunks WHERE status = 'assigned' GROUP BY packet_id"
+    "SELECT packet_id, COUNT(*) as cnt FROM work_chunks WHERE status = 'assigned' GROUP BY packet_id"
   ).all();
-  for (const { packet_id, min_start } of orphanedAssigned) {
-    const pkt = db.prepare('SELECT chunk_gen_offset FROM packets WHERE id = ?').get(packet_id);
-    if (pkt && pkt.chunk_gen_offset > min_start) {
-      db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(min_start, packet_id);
-      console.log(`[startup] rewound packet ${packet_id} cursor from ${pkt.chunk_gen_offset} to ${min_start}`);
-    }
+  for (const { packet_id, cnt } of orphanedAssigned) {
+    db.prepare('UPDATE packets SET chunk_gen_offset = MAX(0, chunk_gen_offset - ?) WHERE id = ?').run(cnt * CHUNK_SIZE, packet_id);
+    console.log(`[startup] refunded ${cnt} assigned chunk credit(s) for packet ${packet_id}`);
   }
   const reset = db.prepare("DELETE FROM work_chunks WHERE status = 'assigned'").run().changes;
   if (deleted + reset > 0) console.log(`[startup] cleaned up ${deleted} pending + ${reset} assigned chunk rows`);
@@ -461,23 +458,17 @@ function findWinningCandidate(packetId, packet, matches, onDone) {
 // virtual cursor so those ranges will be reassigned to other workers.
 // Release all assigned chunks for a worker back to the virtual pool.
 function releaseWorkerChunks(workerId) {
-  // Find the minimum range_start per packet to rewind cursors
+  // Count assigned chunks per packet to refund dispatch credits
   const rows = db.prepare(
-    "SELECT packet_id, MIN(range_start) as min_start FROM work_chunks WHERE status = 'assigned' AND assigned_to = ? GROUP BY packet_id"
+    "SELECT packet_id, COUNT(*) as cnt FROM work_chunks WHERE status = 'assigned' AND assigned_to = ? GROUP BY packet_id"
   ).all(workerId);
 
   // Delete the assigned rows — virtual system will regenerate the ranges
   stmts.unassignWorkerChunks.run(workerId);
 
-  for (const { packet_id, min_start } of rows) {
-    // Never rewind below the completed work watermark
-    const completedMax = db.prepare(
-      "SELECT MAX(range_end) as max_end FROM work_chunks WHERE packet_id = ? AND status = 'completed'"
-    ).get(packet_id);
-    const safeStart = Math.max(min_start, completedMax?.max_end || 0);
-    // Conditional update: only rewind if offset hasn't been advanced by a concurrent assignment
-    db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ? AND chunk_gen_offset > ?')
-      .run(safeStart, packet_id, safeStart);
+  for (const { packet_id, cnt } of rows) {
+    db.prepare('UPDATE packets SET chunk_gen_offset = MAX(0, chunk_gen_offset - ?) WHERE id = ?')
+      .run(cnt * CHUNK_SIZE, packet_id);
   }
 }
 
@@ -498,30 +489,18 @@ function recycleStaleChunks() {
   const stale = stmts.getStaleChunks.all();
   if (stale.length === 0) return 0;
 
-  // Group by packet and find the minimum range_start per packet
-  const rewindTo = new Map();
+  // Count stale chunks per packet and refund dispatch credits
+  const refundCounts = new Map();
   for (const row of stale) {
-    const current = rewindTo.get(row.packet_id);
-    if (current === undefined || row.range_start < current) {
-      rewindTo.set(row.packet_id, row.range_start);
-    }
+    refundCounts.set(row.packet_id, (refundCounts.get(row.packet_id) || 0) + 1);
     stmts.deleteChunkById.run(row.id);
   }
 
-  // Rewind each affected packet's cursor so the ranges get regenerated
-  for (const [packetId, minStart] of rewindTo) {
-    // Never rewind below the completed work watermark
-    const completedMax = db.prepare(
-      "SELECT MAX(range_end) as max_end FROM work_chunks WHERE packet_id = ? AND status = 'completed'"
-    ).get(packetId);
-    const safeStart = Math.max(minStart, completedMax?.max_end || 0);
-    const packet = stmts.getPacketById.get(packetId);
-    // Conditional update: only rewind if offset hasn't been advanced by a concurrent assignment
-    if (packet && packet.chunk_gen_offset > safeStart) {
-      db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ? AND chunk_gen_offset > ?')
-        .run(safeStart, packetId, safeStart);
-      console.log(`[stale] rewound packet ${packetId} cursor from ${packet.chunk_gen_offset} to ${safeStart}`);
-    }
+  // Refund one CHUNK_SIZE credit per stale chunk so the virtual-pending count stays accurate
+  for (const [packetId, count] of refundCounts) {
+    db.prepare('UPDATE packets SET chunk_gen_offset = MAX(0, chunk_gen_offset - ?) WHERE id = ?')
+      .run(count * CHUNK_SIZE, packetId);
+    console.log(`[stale] refunded ${count} chunk credit(s) for packet ${packetId}`);
   }
 
   return stale.length;
@@ -529,6 +508,9 @@ function recycleStaleChunks() {
 
 // Assign virtual chunks: compute ranges from packet keyspace on-the-fly,
 // insert directly as "assigned" rows. No "pending" rows ever exist.
+// Chunks are assigned at random offsets within the keyspace so lucky workers
+// can find a key near the end of the alphabet without exhausting earlier ranges first.
+// chunk_gen_offset tracks dispatch credits (chunks issued × CHUNK_SIZE), not a sequential position.
 const assignVirtualChunks = db.transaction((workerId, count) => {
   const alreadyAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
   const capacity = Math.max(0, count - alreadyAssigned);
@@ -539,29 +521,32 @@ const assignVirtualChunks = db.transaction((workerId, count) => {
 
   for (const packet of packets) {
     if (assigned.length >= capacity) break;
-    let offset = packet.chunk_gen_offset;
+    let cursor = packet.chunk_gen_offset;
     const end = packet.keyspace_end;
-    if (offset >= end) continue;
+    if (cursor >= end) continue;
 
-    while (assigned.length < capacity && offset < end) {
-      const rangeEnd = Math.min(offset + CHUNK_SIZE, end);
+    const totalChunks = Math.ceil(end / CHUNK_SIZE);
+    while (assigned.length < capacity && cursor < end) {
+      const randomIndex = Math.floor(Math.random() * totalChunks);
+      const rangeStart = randomIndex * CHUNK_SIZE;
+      const rangeEnd = Math.min(rangeStart + CHUNK_SIZE, end);
       const result = stmts.insertAssignedChunk.run(
-        packet.id, packet.prefix, offset, rangeEnd, packet.charset || 'lower', workerId
+        packet.id, packet.prefix, rangeStart, rangeEnd, packet.charset || 'lower', workerId
       );
       assigned.push({
         id: Number(result.lastInsertRowid),
         packet_id: packet.id,
         target_prefix: packet.prefix,
-        range_start: offset,
+        range_start: rangeStart,
         range_end: rangeEnd,
         charset: packet.charset || 'lower',
         status: 'assigned',
         assigned_to: workerId,
       });
-      offset = rangeEnd;
+      cursor += CHUNK_SIZE;
     }
-    // Advance the packet's cursor
-    db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(offset, packet.id);
+    // Advance the dispatch-credit cursor (not a sequential position)
+    db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(cursor, packet.id);
   }
 
   return assigned;
@@ -575,28 +560,31 @@ const assignExactChunks = db.transaction((workerId, count) => {
 
   for (const packet of packets) {
     if (assigned.length >= count) break;
-    let offset = packet.chunk_gen_offset;
+    let cursor = packet.chunk_gen_offset;
     const end = packet.keyspace_end;
-    if (offset >= end) continue;
+    if (cursor >= end) continue;
 
-    while (assigned.length < count && offset < end) {
-      const rangeEnd = Math.min(offset + CHUNK_SIZE, end);
+    const totalChunks = Math.ceil(end / CHUNK_SIZE);
+    while (assigned.length < count && cursor < end) {
+      const randomIndex = Math.floor(Math.random() * totalChunks);
+      const rangeStart = randomIndex * CHUNK_SIZE;
+      const rangeEnd = Math.min(rangeStart + CHUNK_SIZE, end);
       const result = stmts.insertAssignedChunk.run(
-        packet.id, packet.prefix, offset, rangeEnd, packet.charset || 'lower', workerId
+        packet.id, packet.prefix, rangeStart, rangeEnd, packet.charset || 'lower', workerId
       );
       assigned.push({
         id: Number(result.lastInsertRowid),
         packet_id: packet.id,
         target_prefix: packet.prefix,
-        range_start: offset,
+        range_start: rangeStart,
         range_end: rangeEnd,
         charset: packet.charset || 'lower',
         status: 'assigned',
         assigned_to: workerId,
       });
-      offset = rangeEnd;
+      cursor += CHUNK_SIZE;
     }
-    db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(offset, packet.id);
+    db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ?').run(cursor, packet.id);
   }
 
   return assigned;
