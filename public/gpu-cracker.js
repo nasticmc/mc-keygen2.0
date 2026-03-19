@@ -210,6 +210,7 @@ class GPUCracker {
     this.charsetBuffer = null;
     this.bindGroup = null;
     this.cachedCharset = null;
+    this._mapTimeoutMs = 30000;
   }
 
   async init() {
@@ -361,7 +362,7 @@ class GPUCracker {
     // combinations the GPU can hang (TDR or silent device loss) without
     // properly rejecting the mapAsync promise, which would freeze the
     // cracking loop forever while leaving the WebSocket open.
-    const MAP_TIMEOUT_MS = 30_000;
+    const MAP_TIMEOUT_MS = Math.max(1000, Number(this._mapTimeoutMs) || 30_000);
     const mapPromise = readBuffer.mapAsync(GPUMapMode.READ);
     const timedOut = await Promise.race([
       mapPromise.then(() => false),
@@ -391,7 +392,7 @@ class GPUCracker {
     return matches;
   }
 
-  async processChunks(chunks, callbacks, charset, packetRawData = {}) {
+  async processChunks(chunks, callbacks, charset, packetRawData = {}, tuning = {}) {
     // callbacks: { onPrefixMatch, onChunkComplete, onProgress }
     const { onPrefixMatch, onChunkComplete, onProgress } = callbacks;
     this.running = true;
@@ -408,11 +409,22 @@ class GPUCracker {
     // workgroup_size(256), so candidates = dispatchWorkgroups * 256.
     // On mobile, cap dispatch size to 1/4 of the GPU max to keep individual
     // GPU jobs short and avoid starving the UI/WebSocket event loop.
+    const clamp = (value, min, max, fallback) => {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return fallback;
+      return Math.max(min, Math.min(max, n));
+    };
     const maxDispatch = this._maxDispatch || 65535;
-    const _isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
-    const dispatchCap = _isMobile ? Math.max(1, Math.ceil(maxDispatch / 4)) : maxDispatch;
+    const _isMobile = tuning.deviceMode === 'desktop'
+      ? false
+      : (tuning.deviceMode === 'mobile'
+        ? true
+        : /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768);
+    const dispatchScale = clamp(tuning.dispatchScale, 0.10, 1.00, _isMobile ? 0.25 : 1.00);
+    const dispatchCap = Math.max(1, Math.ceil(maxDispatch * dispatchScale));
     const batchSize = Math.max(256, dispatchCap * 256);
-    const _yieldInterval = _isMobile ? 100 : 500;
+    const _yieldInterval = clamp(tuning.yieldIntervalMs, 0, 5000, _isMobile ? 100 : 500);
+    this._mapTimeoutMs = clamp(tuning.mapTimeoutMs, 1000, 120000, 30000);
 
     // Flatten all work into a single batch list so the ping-pong pipeline can
     // span chunk boundaries without extra complexity.
@@ -430,7 +442,7 @@ class GPUCracker {
     }
 
     try {
-      console.debug(`[gpu] processing ${chunks.length} chunk(s) as ${batches.length} GPU batch(es), batchSize=${batchSize}`);
+      console.debug(`[gpu] processing ${chunks.length} chunk(s) as ${batches.length} GPU batch(es), batchSize=${batchSize}, dispatchScale=${dispatchScale.toFixed(2)}, yieldMs=${_yieldInterval}, mapTimeoutMs=${this._mapTimeoutMs}`);
     } catch (_) {}
 
     // Accumulate prefix matches per packet_id in bounded batches.
@@ -622,7 +634,7 @@ class CPUCracker {
     return '#' + name;
   }
 
-  async processChunks(chunks, callbacks, charset, packetRawData = {}) {
+  async processChunks(chunks, callbacks, charset, packetRawData = {}, tuning = {}) {
     // callbacks: { onPrefixMatch, onChunkComplete, onProgress }
     const { onPrefixMatch, onChunkComplete, onProgress } = callbacks;
     this.running = true;
