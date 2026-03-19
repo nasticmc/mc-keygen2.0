@@ -937,6 +937,20 @@ async function runCrackingLoop() {
         `${chunks.length} chunk${chunks.length !== 1 ? 's' : ''}`;
       setLocalProgress(0, 1);
 
+      // If the GPU device was lost during a previous batch (Windows TDR,
+      // driver crash, AV interference), fall back to CPU so the loop keeps
+      // running instead of immediately failing again on a dead device.
+      if (cracker._deviceLost) {
+        clog('GPU device lost — falling back to CPU cracker for remaining work');
+        cracker = new CPUCracker();
+        await cracker.init();
+        const gpuStatus = document.getElementById('gpu-status');
+        if (gpuStatus) {
+          gpuStatus.textContent = 'WebGPU: Lost (CPU fallback)';
+          gpuStatus.className = 'unsupported';
+        }
+      }
+
       const batchStart = performance.now();
       let lastProgressLog = 0;
       await cracker.processChunks(chunks, ws, (hashRate, processed, total) => {
