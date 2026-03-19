@@ -90,7 +90,7 @@ struct MatchEntry {
 
 struct Results {
   match_count: atomic<u32>,
-  matches: array<MatchEntry, 8192>,
+  matches: array<MatchEntry, 65536>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -184,7 +184,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   if (prefix_byte == params.target_prefix) {
     let slot = atomicAdd(&results.match_count, 1u);
-    if (slot < 8192u) {
+    if (slot < 65536u) {
       results.matches[slot].index = candidate_idx;
       results.matches[slot].key0  = hash1[0];
       results.matches[slot].key1  = hash1[1];
@@ -285,8 +285,8 @@ class GPUCracker {
   ensureBuffers() {
     if (this.bufferSets) return;
 
-    // 4-byte atomic count + 8192 entries × 5 u32s × 4 bytes = 163,844 bytes
-    const MATCH_SLOTS = 8192;
+    // 4-byte atomic count + 65536 entries × 5 u32s × 4 bytes = 1,310,724 bytes (~1.25 MB per buffer)
+    const MATCH_SLOTS = 65536;
     const resultSize = 4 + MATCH_SLOTS * 5 * 4;
     this._matchSlots = MATCH_SLOTS;
     this._resultSize = resultSize;
