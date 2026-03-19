@@ -349,6 +349,14 @@ const stmts = {
   getCandidateStats: db.prepare("SELECT COUNT(*) as total, SUM(verified) as tested, SUM(CASE WHEN verified = 1 AND decode_success = 1 THEN 1 ELSE 0 END) as decoded FROM candidate_keys"),
 };
 
+// ── Session Candidate Counters ────────────────────────────────────────────────
+// Track prefix candidates sent and keys tested per-packet for the current run.
+// Reset on retry or delete so counts reflect only the active cracking attempt.
+const _sessionPrefixesFound = new Map(); // packetId -> count
+const _sessionKeysTested    = new Map(); // packetId -> count
+function _sessionIncr(map, packetId, n = 1) { map.set(packetId, (map.get(packetId) || 0) + n); }
+function _sessionReset(packetId) { _sessionPrefixesFound.delete(packetId); _sessionKeysTested.delete(packetId); }
+
 // ── Virtual Stats ────────────────────────────────────────────────────────────
 // Pending chunks are computed from keyspace math, not DB rows.
 // Cache the virtual-pending scan (runs every 2s broadcast + health check).
@@ -367,8 +375,10 @@ function getVirtualPending() {
 function invalidateVirtualPending() { _vpCache.at = 0; }
 
 function getCandidateStats() {
-  const row = stmts.getCandidateStats.get();
-  return { candidatesFound: row.total || 0, candidatesTested: row.tested || 0, candidatesDecoded: row.decoded || 0 };
+  let found = 0, tested = 0;
+  for (const v of _sessionPrefixesFound.values()) found += v;
+  for (const v of _sessionKeysTested.values()) tested += v;
+  return { candidatesFound: found, candidatesTested: tested, candidatesDecoded: 0 };
 }
 
 function getQueueStats() {
@@ -410,7 +420,7 @@ function markPacketCracked(packetId, channelName, key, decoded) {
   return true;
 }
 
-function findWinningCandidate(packet, matches, onDone) {
+function findWinningCandidate(packetId, packet, matches, onDone) {
   const MAX_IN_FLIGHT = Math.max(1, DECODER_POOL_SIZE * 2);
   let index = 0;
   let inFlight = 0;
@@ -428,6 +438,7 @@ function findWinningCandidate(packet, matches, onDone) {
       inFlight++;
       decodeAsync(packet.raw_data, match.keyHex, (result) => {
         inFlight--;
+        _sessionIncr(_sessionKeysTested, packetId);
         if (done) return;
         if (result.success) {
           finish({ match, result });
@@ -1118,6 +1129,8 @@ wss.on('connection', (ws) => {
         const batchPacket = stmts.getPacketById.get(batchPacketId);
         if (!batchPacket || batchPacket.status === 'cracked') break;
 
+        _sessionIncr(_sessionPrefixesFound, batchPacketId, (batchMatches || []).length);
+
         // If a client already decoded a match, validate it then skip the decoder pool
         const preDecoded = batchMatches.find(m => {
           if (!m.clientDecoded) return false;
@@ -1131,7 +1144,7 @@ wss.on('connection', (ws) => {
           break;
         }
 
-        findWinningCandidate(batchPacket, batchMatches, (winner) => {
+        findWinningCandidate(batchPacketId, batchPacket, batchMatches, (winner) => {
           if (!winner) return;
           // Re-check: packet may have been deleted/cracked/retried during async decode
           const freshBatch = stmts.getPacketById.get(batchPacketId);
@@ -1292,6 +1305,8 @@ app.post('/api/worker/prefix-match', (req, res) => {
   const batchPacket = stmts.getPacketById.get(packetId);
   if (!batchPacket || batchPacket.status === 'cracked') return res.json({ ok: true });
 
+  _sessionIncr(_sessionPrefixesFound, packetId, (matches || []).length);
+
   // If a client already decoded a match, validate then skip the decoder pool
   const preDecoded = (matches || []).find(m => {
     if (!m.clientDecoded) return false;
@@ -1305,7 +1320,7 @@ app.post('/api/worker/prefix-match', (req, res) => {
     return res.json({ ok: true });
   }
 
-  findWinningCandidate(batchPacket, matches || [], (winner) => {
+  findWinningCandidate(packetId, batchPacket, matches || [], (winner) => {
     if (!winner) return;
     const freshBatch = stmts.getPacketById.get(packetId);
     if (!freshBatch || freshBatch.status === 'cracked') return;
@@ -1464,6 +1479,7 @@ app.delete('/api/packets/:id', (req, res) => {
   db.prepare('DELETE FROM work_chunks WHERE packet_id = ?').run(id);
   db.prepare('DELETE FROM candidate_keys WHERE packet_id = ?').run(id);
   db.prepare('DELETE FROM packets WHERE id = ?').run(id);
+  _sessionReset(id);
   // Prune the deleted packet from each worker's sentPacketRaw set so
   // raw data will be re-sent if the packet is re-uploaded with the same id.
   for (const w of workers.values()) w.sentPacketRaw?.delete(id);
@@ -1512,6 +1528,7 @@ app.post('/api/packets/:id/retry', (req, res) => {
     minLen: req.body?.crackConfig?.minLen || packet.min_len,
     maxLen: req.body?.crackConfig?.maxLen || packet.max_len,
   });
+  _sessionReset(packetId);
   db.transaction(() => {
     if (channelName) {
       db.prepare('UPDATE candidate_keys SET ignored = 1 WHERE packet_id = ? AND channel_name = ?')
