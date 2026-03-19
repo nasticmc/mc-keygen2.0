@@ -234,6 +234,15 @@ class GPUCracker {
 
       this.device = await adapter.requestDevice();
 
+      // Listen for device loss (Windows TDR, driver crash, etc.) so we can
+      // abort any in-flight mapAsync instead of hanging forever.
+      this._deviceLost = false;
+      this.device.lost.then((info) => {
+        console.warn(`[gpu] device lost — reason="${info.reason}" message="${info.message}"`);
+        this._deviceLost = true;
+        this.running = false;
+      });
+
       const shaderModule = this.device.createShaderModule({ code: SHA256_WGSL });
       this.pipeline = this.device.createComputePipeline({
         layout: 'auto',
@@ -347,7 +356,24 @@ class GPUCracker {
   // that resolves once the GPU has finished writing to that buffer.
   async _readResults(bufSetIdx) {
     const { readBuffer } = this.bufferSets[bufSetIdx];
-    await readBuffer.mapAsync(GPUMapMode.READ);
+
+    // Race mapAsync against a 30-second timeout.  On some Windows/driver
+    // combinations the GPU can hang (TDR or silent device loss) without
+    // properly rejecting the mapAsync promise, which would freeze the
+    // cracking loop forever while leaving the WebSocket open.
+    const MAP_TIMEOUT_MS = 30_000;
+    const mapPromise = readBuffer.mapAsync(GPUMapMode.READ);
+    const timedOut = await Promise.race([
+      mapPromise.then(() => false),
+      new Promise(r => setTimeout(() => r(true), MAP_TIMEOUT_MS)),
+    ]);
+
+    if (timedOut) {
+      this._deviceLost = true;
+      this.running = false;
+      throw new Error(`[gpu] mapAsync timed out after ${MAP_TIMEOUT_MS}ms — GPU may be lost or hung`);
+    }
+
     const resultData = new Uint32Array(readBuffer.getMappedRange());
     const matchCount = resultData[0];
     const matches = [];
