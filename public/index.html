@@ -43,6 +43,9 @@
       <div class="cracking-controls">
         <button id="btn-start-cracking" class="btn-primary">Start Cracking</button>
         <button id="btn-stop-cracking" class="btn-danger hidden">Stop Cracking</button>
+        <label class="inline-label">Work Request Size
+          <input id="work-batch-count" type="number" min="1" max="64" value="16">
+        </label>
         <span id="gpu-status" class="gpu-badge">WebGPU: Checking...</span>
       </div>
       <div id="active-packet-summary" class="active-packet-summary hidden"></div>
@@ -93,6 +96,11 @@
 
       <div id="cracking-feedback" class="cracking-feedback">Idle.</div>
 
+      <div id="candidate-stats-bar" class="candidate-stats-bar">
+        <span>Prefix matches found: <strong id="stat-candidates-found">0</strong></span>
+        <span>Tested with decoder: <strong id="stat-candidates-tested">0</strong></span>
+      </div>
+
       <div class="keyspace-controls">
         <label>Charset
           <select id="keyspace-charset">
@@ -107,9 +115,6 @@
         </label>
         <label>Max Length
           <input id="keyspace-max-len" type="number" min="1" max="10" value="5">
-        </label>
-        <label>Work Request Size
-          <input id="work-batch-count" type="number" min="1" max="64" value="4">
         </label>
         <label>Device Mode
           <select id="device-perf-mode">

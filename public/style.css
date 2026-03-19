@@ -566,6 +566,38 @@ select:focus, input[type="number"]:focus {
   color: var(--accent);
 }
 
+.candidate-stats-bar {
+  display: flex;
+  gap: 24px;
+  align-items: center;
+  margin: 10px 0 6px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: var(--bg);
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+.candidate-stats-bar strong {
+  color: var(--accent);
+}
+
+.inline-label {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.inline-label input {
+  width: 60px;
+}
+
 .btn-warning {
   border-color: var(--yellow);
   color: var(--yellow);

@@ -346,6 +346,7 @@ const stmts = {
   deletePacketAssigned: db.prepare("DELETE FROM work_chunks WHERE packet_id = ? AND status = 'assigned'"),
   countAssignedToWorker: db.prepare("SELECT COUNT(*) AS cnt FROM work_chunks WHERE status = 'assigned' AND assigned_to = ?"),
   getActivePackets: db.prepare("SELECT * FROM packets WHERE status != 'cracked' AND chunk_gen_offset IS NOT NULL AND keyspace_end IS NOT NULL"),
+  getCandidateStats: db.prepare("SELECT COUNT(*) as total, SUM(verified) as tested, SUM(CASE WHEN verified = 1 AND decode_success = 1 THEN 1 ELSE 0 END) as decoded FROM candidate_keys"),
 };
 
 // ── Virtual Stats ────────────────────────────────────────────────────────────
@@ -364,6 +365,11 @@ function getVirtualPending() {
   return total;
 }
 function invalidateVirtualPending() { _vpCache.at = 0; }
+
+function getCandidateStats() {
+  const row = stmts.getCandidateStats.get();
+  return { candidatesFound: row.total || 0, candidatesTested: row.tested || 0, candidatesDecoded: row.decoded || 0 };
+}
 
 function getQueueStats() {
   const assigned = stmts.getAssignedCount.get().assigned;
@@ -398,7 +404,7 @@ function markPacketCracked(packetId, channelName, key, decoded) {
   })();
   invalidateVirtualPending();
   broadcast({ type: 'key_found', packetId, key, channelName, decoded });
-  broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats() });
+  broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats(), ...getCandidateStats() });
   broadcast({ type: 'packets', packets: stmts.getPackets.all() });
   broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
   return true;
@@ -848,7 +854,7 @@ function broadcastStats() {
   const now = Date.now();
   if (now - _lastStatsBroadcastMs < 500) return;
   _lastStatsBroadcastMs = now;
-  broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats(), totalHashRate: getTotalHashRate() });
+  broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats(), totalHashRate: getTotalHashRate(), ...getCandidateStats() });
 }
 
 // Periodic health report — helps diagnose slowdowns over long runs
@@ -930,7 +936,7 @@ function getTotalHashRate() { return _totalHashRate; }
 
 setInterval(() => {
   try {
-    if (wss.clients.size > 0) broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats(), totalHashRate: _totalHashRate });
+    if (wss.clients.size > 0) broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats(), totalHashRate: _totalHashRate, ...getCandidateStats() });
   } catch (err) { console.error('[stats-broadcast] uncaught:', err); }
 }, 2000);
 
@@ -1569,7 +1575,7 @@ app.get('/api/stats', (req, res) => {
   for (const [id, w] of workers) {
     workerList.push({ id: id.substring(0, 8), hashRate: w.hashRate, chunksCompleted: w.chunksCompleted });
   }
-  res.json({ ...stats, activeStats, workers: workerList, workerCount: workers.size, totalHashRate: getTotalHashRate() });
+  res.json({ ...stats, activeStats, workers: workerList, workerCount: workers.size, totalHashRate: getTotalHashRate(), ...getCandidateStats() });
 });
 
 app.post('/api/derive', (req, res) => {
