@@ -1135,7 +1135,9 @@ wss.on('connection', (ws) => {
         if (!workerId) registerWorker(msg.clientId);
         const w = workers.get(workerId);
         if (w) {
-          w.hashRate = msg.hashRate || 0;
+          const newRate = msg.hashRate || 0;
+          _totalHashRate = Math.max(0, _totalHashRate + newRate - w.hashRate);
+          w.hashRate = newRate;
           // Refresh assignment lease while a worker is actively reporting
           // progress so long-running chunks are not recycled mid-processing.
           stmts.touchWorkerAssignedChunks.run(workerId);
