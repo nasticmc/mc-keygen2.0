@@ -433,11 +433,22 @@ class GPUCracker {
       console.debug(`[gpu] processing ${chunks.length} chunk(s) as ${batches.length} GPU batch(es), batchSize=${batchSize}`);
     } catch (_) {}
 
-    // Accumulate prefix matches per packet_id across all GPU batches.
-    // Sending many small HTTP requests (one per GPU dispatch) while the GPU
-    // loop is running floods the browser fetch queue and can delay the
-    // chunk-complete POST.  One batch per packet at the end is much cleaner.
+    // Accumulate prefix matches per packet_id in bounded batches.
+    // A 1-byte prefix can match very frequently (~1/256), so buffering an
+    // entire work packet can produce millions of candidates and blow up
+    // JSON.stringify() ("Invalid string length") when posting results.
+    // Keep each POST bounded to avoid runaway memory and payload sizes.
+    const MATCH_FLUSH_SIZE = 2000;
     const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
+
+    const flushPendingMatches = (packetId, force = false) => {
+      if (!onPrefixMatch) return;
+      const list = pendingMatches.get(packetId);
+      if (!list || list.length === 0) return;
+      if (!force && list.length < MATCH_FLUSH_SIZE) return;
+      try { onPrefixMatch(packetId, list); } catch (_) { /* fire and forget */ }
+      pendingMatches.set(packetId, []);
+    };
 
     const collectMatches = (matches, chunk) => {
       if (matches.length === 0) return;
@@ -450,6 +461,7 @@ class GPUCracker {
         list.push({ channelName, keyHex, prefixHex: chunk.target_prefix.toString(16).padStart(2, '0') });
       }
       pendingMatches.set(chunk.packet_id, list);
+      flushPendingMatches(chunk.packet_id, false);
     };
 
     let _lastProgressTime = 0;
@@ -528,13 +540,9 @@ class GPUCracker {
       }
     }
 
-    // Flush all accumulated prefix matches — one POST per packet, sent before
-    // chunk-complete so the server can start decryption while we report done.
-    if (onPrefixMatch) {
-      for (const [packetId, matches] of pendingMatches) {
-        try { onPrefixMatch(packetId, matches); } catch (_) { /* fire and forget */ }
-      }
-    }
+    // Flush final leftovers before chunk-complete so server can continue
+    // decryption while completion updates are being reported.
+    for (const [packetId] of pendingMatches) flushPendingMatches(packetId, true);
 
     if (completedChunkIds.size > 0 && onChunkComplete) {
       try { onChunkComplete([...completedChunkIds], this.hashRate); } catch (_) { /* fire and forget */ }
@@ -625,7 +633,17 @@ class CPUCracker {
     let processedCandidates = 0;
 
     const completedChunkIds = [];
+    const MATCH_FLUSH_SIZE = 500;
     const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
+
+    const flushPendingMatches = (packetId, force = false) => {
+      if (!onPrefixMatch) return;
+      const list = pendingMatches.get(packetId);
+      if (!list || list.length === 0) return;
+      if (!force && list.length < MATCH_FLUSH_SIZE) return;
+      try { onPrefixMatch(packetId, list); } catch (_) { /* fire and forget */ }
+      pendingMatches.set(packetId, []);
+    };
 
     for (const chunk of chunks) {
       if (!this.running) break;
@@ -648,6 +666,7 @@ class CPUCracker {
           const list = pendingMatches.get(chunk.packet_id) || [];
           list.push({ channelName, keyHex, prefixHex });
           pendingMatches.set(chunk.packet_id, list);
+          flushPendingMatches(chunk.packet_id, false);
         }
 
         totalHashed++;
@@ -674,12 +693,8 @@ class CPUCracker {
       lastTime = performance.now();
     }
 
-    // Flush all accumulated prefix matches — one POST per packet
-    if (onPrefixMatch) {
-      for (const [packetId, matches] of pendingMatches) {
-        try { onPrefixMatch(packetId, matches); } catch (_) { /* fire and forget */ }
-      }
-    }
+    // Flush leftover matches per packet
+    for (const [packetId] of pendingMatches) flushPendingMatches(packetId, true);
 
     if (completedChunkIds.length > 0 && onChunkComplete) {
       try { onChunkComplete(completedChunkIds, this.hashRate); } catch (_) { /* fire and forget */ }
