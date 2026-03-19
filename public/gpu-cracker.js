@@ -433,30 +433,23 @@ class GPUCracker {
       console.debug(`[gpu] processing ${chunks.length} chunk(s) as ${batches.length} GPU batch(es), batchSize=${batchSize}`);
     } catch (_) {}
 
-    const sendMatches = async (matches, chunk) => {
+    // Accumulate prefix matches per packet_id across all GPU batches.
+    // Sending many small HTTP requests (one per GPU dispatch) while the GPU
+    // loop is running floods the browser fetch queue and can delay the
+    // chunk-complete POST.  One batch per packet at the end is much cleaner.
+    const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
+
+    const collectMatches = (matches, chunk) => {
       if (matches.length === 0) return;
-      const batchMatches = [];
+      const list = pendingMatches.get(chunk.packet_id) || [];
       for (const m of matches) {
         const channelName = this.indexToChannelName(m.index, charset);
         if (!channelName) continue;
         const keyHex = [m.key0, m.key1, m.key2, m.key3]
           .map(w => w.toString(16).padStart(8, '0')).join('');
-        const entry = {
-          channelName,
-          keyHex,
-          prefixHex: chunk.target_prefix.toString(16).padStart(2, '0'),
-        };
-        // Attempt client-side decryption to skip a server round-trip
-        const rawData = packetRawData[chunk.packet_id];
-        if (rawData && typeof clientTryDecrypt === 'function') {
-          const decoded = await clientTryDecrypt(rawData, keyHex);
-          if (decoded) entry.clientDecoded = decoded;
-        }
-        batchMatches.push(entry);
+        list.push({ channelName, keyHex, prefixHex: chunk.target_prefix.toString(16).padStart(2, '0') });
       }
-      if (batchMatches.length > 0 && onPrefixMatch) {
-        try { onPrefixMatch(chunk.packet_id, batchMatches); } catch (_) { /* fire and forget */ }
-      }
+      pendingMatches.set(chunk.packet_id, list);
     };
 
     let _lastProgressTime = 0;
@@ -480,8 +473,8 @@ class GPUCracker {
         _lastProgressTime = now;
         onProgress(this.hashRate, processedCandidates, totalCandidates);
       }
-      // Send matches without blocking the pipeline — fire and forget
-      if (matches.length > 0) sendMatches(matches, batch.chunk);
+      // Collect matches — all will be sent in one batch at the end
+      if (matches.length > 0) collectMatches(matches, batch.chunk);
       if (batch.isLastInChunk) completedChunkIds.add(batch.chunk.id);
     };
 
@@ -532,6 +525,14 @@ class GPUCracker {
         if (this.running) await finishBatch(matches, pending.batch);
       } catch (err) {
         console.error('GPU readback error:', err);
+      }
+    }
+
+    // Flush all accumulated prefix matches — one POST per packet, sent before
+    // chunk-complete so the server can start decryption while we report done.
+    if (onPrefixMatch) {
+      for (const [packetId, matches] of pendingMatches) {
+        try { onPrefixMatch(packetId, matches); } catch (_) { /* fire and forget */ }
       }
     }
 
@@ -624,6 +625,7 @@ class CPUCracker {
     let processedCandidates = 0;
 
     const completedChunkIds = [];
+    const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
 
     for (const chunk of chunks) {
       if (!this.running) break;
@@ -643,15 +645,9 @@ class CPUCracker {
         if (prefix === chunk.target_prefix) {
           const keyHex = bufToHex(key);
           const prefixHex = prefix.toString(16).padStart(2, '0');
-          const entry = { channelName, keyHex, prefixHex };
-          const rawData = packetRawData[chunk.packet_id];
-          if (rawData && typeof clientTryDecrypt === 'function') {
-            const decoded = await clientTryDecrypt(rawData, keyHex);
-            if (decoded) entry.clientDecoded = decoded;
-          }
-          if (onPrefixMatch) {
-            try { onPrefixMatch(chunk.packet_id, [entry]); } catch (_) { /* fire and forget */ }
-          }
+          const list = pendingMatches.get(chunk.packet_id) || [];
+          list.push({ channelName, keyHex, prefixHex });
+          pendingMatches.set(chunk.packet_id, list);
         }
 
         totalHashed++;
@@ -676,6 +672,13 @@ class CPUCracker {
 
       totalHashed = 0;
       lastTime = performance.now();
+    }
+
+    // Flush all accumulated prefix matches — one POST per packet
+    if (onPrefixMatch) {
+      for (const [packetId, matches] of pendingMatches) {
+        try { onPrefixMatch(packetId, matches); } catch (_) { /* fire and forget */ }
+      }
     }
 
     if (completedChunkIds.length > 0 && onChunkComplete) {
