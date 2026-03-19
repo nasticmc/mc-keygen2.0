@@ -378,8 +378,13 @@ class GPUCracker {
     let _rateWindowCount = 0;
 
     // workgroup_size(256), so candidates = dispatchWorkgroups * 256.
+    // On mobile, cap dispatch size to 1/4 of the GPU max to keep individual
+    // GPU jobs short and avoid starving the UI/WebSocket event loop.
     const maxDispatch = this._maxDispatch || 65535;
-    const batchSize = Math.max(256, maxDispatch * 256);
+    const _isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
+    const dispatchCap = _isMobile ? Math.max(1, Math.ceil(maxDispatch / 4)) : maxDispatch;
+    const batchSize = Math.max(256, dispatchCap * 256);
+    const _yieldInterval = _isMobile ? 100 : 500;
 
     // Flatten all work into a single batch list so the ping-pong pipeline can
     // span chunk boundaries without extra complexity.
@@ -485,7 +490,7 @@ class GPUCracker {
       // events can fire.  Without this, pushed work messages pile up in
       // the network buffer and the client appears idle to the server.
       const now = performance.now();
-      if (now - _lastYield > 500) {
+      if (now - _lastYield > _yieldInterval) {
         _lastYield = now;
         await new Promise(r => setTimeout(r, 0));
       }
