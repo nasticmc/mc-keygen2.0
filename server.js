@@ -973,7 +973,14 @@ wss.on('connection', (ws) => {
 
     workerId = nextWorkerId;
     ws.workerId = workerId;
-    workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0, desiredInFlight: 1, lastWorkerUpdateAt: 0, sentPacketRaw: new Set() });
+    // Merge with existing HTTP-registered worker if present, otherwise create new
+    const existingWorker = workers.get(workerId);
+    if (existingWorker) {
+      existingWorker.ws = ws;
+      existingWorker.lastSeenAt = Date.now();
+    } else {
+      workers.set(workerId, { ws, chunksCompleted: 0, hashRate: 0, desiredInFlight: 1, lastWorkerUpdateAt: 0, sentPacketRaw: new Set(), lastSeenAt: Date.now() });
+    }
 
     console.log(`[ws] worker registered ${wName(workerId)} total=${workers.size}`);
     setServerStatus('worker_registered', `Worker ${workerIdToName(workerId)} is online (${workers.size} total).`);
@@ -1182,6 +1189,166 @@ wss.on('connection', (ws) => {
     broadcastStats();
   });
 });
+
+// ── Worker HTTP API ─────────────────────────────────────────────────────────
+// HTTP POST endpoints for client→server communication. The WebSocket channel
+// is kept for server→client pushes only (stats, key_found, work pushes).
+
+// Look up or create a worker entry by clientId. Reused by all HTTP endpoints.
+function getOrCreateHttpWorker(clientId) {
+  const workerId = makeWorkerId(clientId);
+  let worker = workers.get(workerId);
+  if (!worker) {
+    worker = { ws: null, chunksCompleted: 0, hashRate: 0, desiredInFlight: 1, lastWorkerUpdateAt: 0, sentPacketRaw: new Set(), lastSeenAt: Date.now() };
+    workers.set(workerId, worker);
+    console.log(`[http] worker registered ${wName(workerId)} total=${workers.size}`);
+    setServerStatus('worker_registered', `Worker ${workerIdToName(workerId)} is online (${workers.size} total).`);
+    broadcast({ type: 'worker_count', count: workers.size });
+  }
+  worker.lastSeenAt = Date.now();
+  return { workerId, worker };
+}
+
+app.post('/api/worker/register', (req, res) => {
+  const { clientId } = req.body;
+  if (!clientId) return res.status(400).json({ error: 'clientId required' });
+
+  const { workerId } = getOrCreateHttpWorker(clientId);
+  res.json({ workerId });
+});
+
+app.post('/api/worker/request-work', (req, res) => {
+  const { clientId, count } = req.body;
+  if (!clientId) return res.status(400).json({ error: 'clientId required' });
+
+  const { workerId, worker } = getOrCreateHttpWorker(clientId);
+  const requestedCount = Math.max(1, Math.min(64, parseInt(count, 10) || 1));
+  const chunks = assignExactChunks(workerId, requestedCount);
+
+  const packetRawData = {};
+  const sentPacketRaw = worker.sentPacketRaw || new Set();
+  worker.sentPacketRaw = sentPacketRaw;
+  for (const chunk of chunks) {
+    if (sentPacketRaw.has(chunk.packet_id) || (chunk.packet_id in packetRawData)) continue;
+    const pkt = stmts.getPacketById.get(chunk.packet_id);
+    if (!pkt) continue;
+    packetRawData[chunk.packet_id] = pkt.raw_data;
+    sentPacketRaw.add(chunk.packet_id);
+  }
+
+  const dbAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
+  const rawPacketCount = Object.keys(packetRawData).length;
+  console.log(`[http-work] ${wName(workerId)} requested=${requestedCount} → sending ${chunks.length} chunk(s) (db_assigned=${dbAssigned}, raw_packets=${rawPacketCount})`);
+  broadcastStats();
+
+  res.json({
+    chunks,
+    charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
+    packetRawData,
+  });
+});
+
+app.post('/api/worker/chunk-complete', (req, res) => {
+  const { clientId, chunkIds: rawIds, hashRate } = req.body;
+  if (!clientId) return res.status(400).json({ error: 'clientId required' });
+
+  const { workerId, worker } = getOrCreateHttpWorker(clientId);
+  const chunkIds = [...new Set((Array.isArray(rawIds) ? rawIds : []).map(id => parseInt(id, 10)).filter(Number.isFinite))];
+  if (chunkIds.length === 0) return res.json({ ok: true });
+
+  const { completedNow, alreadyCompletedOrMissing } = completeChunksForWorker(workerId, chunkIds);
+  const completionNote = alreadyCompletedOrMissing > 0
+    ? ` (${alreadyCompletedOrMissing} already completed/recycled)`
+    : '';
+  if (worker) {
+    worker.chunksCompleted += completedNow;
+    const newRate = hashRate || 0;
+    _totalHashRate = Math.max(0, _totalHashRate + newRate - worker.hashRate);
+    worker.hashRate = newRate;
+    worker.desiredInFlight = newRate > 0
+      ? Math.max(1, Math.min(16, Math.ceil(newRate * 10 / CHUNK_SIZE)))
+      : worker.desiredInFlight;
+  }
+  const remainingAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
+  console.log(`[http-done] ${wName(workerId)} chunks=${chunkIds.length} completed_now=${completedNow} remaining=${remainingAssigned} rate=${formatHashRate(hashRate || 0)}${completionNote}`);
+  broadcastStats();
+  broadcast({ type: 'worker_update', workerId, hashRate: hashRate || 0 });
+
+  res.json({ ok: true });
+});
+
+app.post('/api/worker/prefix-match', (req, res) => {
+  const { clientId, packetId, matches } = req.body;
+  if (!clientId) return res.status(400).json({ error: 'clientId required' });
+
+  getOrCreateHttpWorker(clientId); // touch lastSeenAt
+
+  const batchPacket = stmts.getPacketById.get(packetId);
+  if (!batchPacket || batchPacket.status === 'cracked') return res.json({ ok: true });
+
+  // If a client already decoded a match, validate then skip the decoder pool
+  const preDecoded = (matches || []).find(m => {
+    if (!m.clientDecoded) return false;
+    const v = validateDecryptedContent(m.clientDecoded);
+    return v.valid;
+  });
+  if (preDecoded) {
+    persistWinningCandidate(packetId, preDecoded.channelName, preDecoded.keyHex, preDecoded.prefixHex);
+    broadcast({ type: 'candidate_found', packetId, channelName: preDecoded.channelName, key: preDecoded.keyHex, prefix: preDecoded.prefixHex });
+    markPacketCracked(packetId, preDecoded.channelName, preDecoded.keyHex, preDecoded.clientDecoded);
+    return res.json({ ok: true });
+  }
+
+  findWinningCandidate(batchPacket, matches || [], (winner) => {
+    if (!winner) return;
+    const freshBatch = stmts.getPacketById.get(packetId);
+    if (!freshBatch || freshBatch.status === 'cracked') return;
+    const { match, result } = winner;
+    persistWinningCandidate(packetId, match.channelName, match.keyHex, match.prefixHex);
+    broadcast({ type: 'candidate_found', packetId, channelName: match.channelName, key: match.keyHex, prefix: match.prefixHex });
+    markPacketCracked(packetId, match.channelName, match.keyHex, result.decoded);
+  });
+
+  res.json({ ok: true });
+});
+
+app.post('/api/worker/hashrate', (req, res) => {
+  const { clientId, hashRate } = req.body;
+  if (!clientId) return res.status(400).json({ error: 'clientId required' });
+
+  const { workerId, worker } = getOrCreateHttpWorker(clientId);
+  if (worker) {
+    const newRate = hashRate || 0;
+    _totalHashRate = Math.max(0, _totalHashRate + newRate - worker.hashRate);
+    worker.hashRate = newRate;
+    stmts.touchWorkerAssignedChunks.run(workerId);
+    const now = Date.now();
+    if (now - worker.lastWorkerUpdateAt >= 1000) {
+      worker.lastWorkerUpdateAt = now;
+      broadcast({ type: 'worker_update', workerId, hashRate: worker.hashRate });
+    }
+  }
+
+  res.json({ ok: true });
+});
+
+// Prune HTTP-only workers that haven't contacted us in 60s.
+// WS-connected workers are handled by the existing heartbeat/close logic.
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, w] of workers) {
+    if (w.ws) continue; // WS worker — handled by ping/pong
+    if (w.lastSeenAt && (now - w.lastSeenAt) > 60_000) {
+      _totalHashRate = Math.max(0, _totalHashRate - (w.hashRate || 0));
+      releaseWorkerChunks(id);
+      workers.delete(id);
+      console.log(`[http] pruned inactive worker ${wName(id)} total=${workers.size}`);
+      broadcast({ type: 'worker_removed', workerId: id });
+      broadcast({ type: 'worker_count', count: workers.size });
+      broadcastStats();
+    }
+  }
+}, 15_000);
 
 // ── REST API ────────────────────────────────────────────────────────────────
 
