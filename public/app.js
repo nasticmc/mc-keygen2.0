@@ -38,6 +38,16 @@ let lastMeasuredHashRate = 0;
 let _smoothedHashRate = 0;
 let _wsReconnectCount = 0;
 let _wsConnectStartedAt = 0;
+let _gpuRetryAttemptedAfterLoss = false;
+
+const PERF_STORAGE_KEYS = {
+  workBatchCount: 'mc-worker-work-batch-count',
+  deviceMode: 'mc-worker-device-mode',
+  dispatchScale: 'mc-worker-gpu-dispatch-scale',
+  yieldIntervalMs: 'mc-worker-gpu-yield-interval',
+  mapTimeoutMs: 'mc-worker-gpu-map-timeout',
+  fallbackPolicy: 'mc-worker-gpu-fallback-policy',
+};
 
 // Exponential moving average for hash rate display — smooths out per-chunk spikes.
 // alpha=0.25 → ~4 samples of memory (~4–8 s at current update frequency).
@@ -257,11 +267,78 @@ async function connectWebSocket() {
 }
 
 function isMobile() {
+  const mode = localStorage.getItem(PERF_STORAGE_KEYS.deviceMode) || 'auto';
+  if (mode === 'desktop') return false;
+  if (mode === 'mobile') return true;
   return /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
 }
 
 function batchCount() {
   return parseInt(document.getElementById('work-batch-count')?.value, 10) || (isMobile() ? 2 : 8);
+}
+
+function clampNumber(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function getGpuTuningSettings() {
+  const dispatchScale = clampNumber(document.getElementById('gpu-dispatch-scale')?.value, 0.1, 1.0, isMobile() ? 0.25 : 1.0);
+  const yieldIntervalMs = clampNumber(document.getElementById('gpu-yield-interval')?.value, 0, 5000, isMobile() ? 100 : 500);
+  const mapTimeoutMs = clampNumber(document.getElementById('gpu-map-timeout')?.value, 1000, 120000, 30000);
+  const fallbackPolicy = document.getElementById('gpu-fallback-policy')?.value || 'retry_once';
+  const deviceMode = document.getElementById('device-perf-mode')?.value || 'auto';
+  return { dispatchScale, yieldIntervalMs, mapTimeoutMs, fallbackPolicy, deviceMode };
+}
+
+function applyPerfDefaults() {
+  const batchInput = document.getElementById('work-batch-count');
+  const deviceMode = document.getElementById('device-perf-mode');
+  const dispatchScale = document.getElementById('gpu-dispatch-scale');
+  const yieldInterval = document.getElementById('gpu-yield-interval');
+  const mapTimeout = document.getElementById('gpu-map-timeout');
+  const fallbackPolicy = document.getElementById('gpu-fallback-policy');
+
+  if (deviceMode) deviceMode.value = localStorage.getItem(PERF_STORAGE_KEYS.deviceMode) || 'auto';
+
+  if (batchInput) {
+    const saved = localStorage.getItem(PERF_STORAGE_KEYS.workBatchCount);
+    batchInput.value = saved || (isMobile() ? 1 : batchInput.value || 4);
+  }
+  if (dispatchScale) {
+    const saved = localStorage.getItem(PERF_STORAGE_KEYS.dispatchScale);
+    dispatchScale.value = saved || (isMobile() ? '0.25' : '1.00');
+  }
+  if (yieldInterval) {
+    const saved = localStorage.getItem(PERF_STORAGE_KEYS.yieldIntervalMs);
+    yieldInterval.value = saved || (isMobile() ? '100' : '500');
+  }
+  if (mapTimeout) mapTimeout.value = localStorage.getItem(PERF_STORAGE_KEYS.mapTimeoutMs) || '30000';
+  if (fallbackPolicy) fallbackPolicy.value = localStorage.getItem(PERF_STORAGE_KEYS.fallbackPolicy) || 'retry_once';
+}
+
+function bindPerfControlPersistence() {
+  const bindings = [
+    ['work-batch-count', PERF_STORAGE_KEYS.workBatchCount],
+    ['device-perf-mode', PERF_STORAGE_KEYS.deviceMode],
+    ['gpu-dispatch-scale', PERF_STORAGE_KEYS.dispatchScale],
+    ['gpu-yield-interval', PERF_STORAGE_KEYS.yieldIntervalMs],
+    ['gpu-map-timeout', PERF_STORAGE_KEYS.mapTimeoutMs],
+    ['gpu-fallback-policy', PERF_STORAGE_KEYS.fallbackPolicy],
+  ];
+  for (const [id, key] of bindings) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    const handler = () => {
+      localStorage.setItem(key, String(el.value));
+      if (id === 'device-perf-mode') {
+        applyPerfDefaults();
+      }
+    };
+    el.addEventListener('change', handler);
+    el.addEventListener('input', handler);
+  }
 }
 
 function getClientId() {
@@ -784,6 +861,7 @@ async function initCracker() {
 
   cracker = new GPUCracker();
   const gpuOk = await cracker.init();
+  _gpuRetryAttemptedAfterLoss = false;
 
   if (gpuOk) {
     gpuStatus.textContent = 'WebGPU: Ready';
@@ -879,13 +957,38 @@ async function runCrackingLoop() {
       // driver crash, AV interference), fall back to CPU so the loop keeps
       // running instead of immediately failing again on a dead device.
       if (cracker._deviceLost) {
-        clog('GPU device lost — falling back to CPU cracker for remaining work');
-        cracker = new CPUCracker();
-        await cracker.init();
-        const gpuStatus = document.getElementById('gpu-status');
-        if (gpuStatus) {
-          gpuStatus.textContent = 'WebGPU: Lost (CPU fallback)';
-          gpuStatus.className = 'unsupported';
+        const tuning = getGpuTuningSettings();
+        if (tuning.fallbackPolicy === 'retry_once' && !_gpuRetryAttemptedAfterLoss) {
+          _gpuRetryAttemptedAfterLoss = true;
+          clog('GPU device lost — attempting one GPU reinit before CPU fallback');
+          const retryCracker = new GPUCracker();
+          const retryOk = await retryCracker.init();
+          if (retryOk) {
+            cracker = retryCracker;
+            const gpuStatus = document.getElementById('gpu-status');
+            if (gpuStatus) {
+              gpuStatus.textContent = 'WebGPU: Recovered';
+              gpuStatus.className = 'supported';
+            }
+          } else {
+            clog('GPU reinit failed — falling back to CPU cracker');
+            cracker = new CPUCracker();
+            await cracker.init();
+            const gpuStatus = document.getElementById('gpu-status');
+            if (gpuStatus) {
+              gpuStatus.textContent = 'WebGPU: Lost (CPU fallback)';
+              gpuStatus.className = 'unsupported';
+            }
+          }
+        } else {
+          clog('GPU device lost — falling back to CPU cracker for remaining work');
+          cracker = new CPUCracker();
+          await cracker.init();
+          const gpuStatus = document.getElementById('gpu-status');
+          if (gpuStatus) {
+            gpuStatus.textContent = 'WebGPU: Lost (CPU fallback)';
+            gpuStatus.className = 'unsupported';
+          }
         }
       }
 
@@ -928,7 +1031,7 @@ async function runCrackingLoop() {
             apiPost('/api/worker/hashrate', { clientId: getClientId(), hashRate }).catch(() => {});
           }
         },
-      }, currentCharset, packetRawData);
+      }, currentCharset, packetRawData, getGpuTuningSettings());
 
       const batchMs = Math.round(performance.now() - batchStart);
       batchesCompleted++;
@@ -1086,11 +1189,8 @@ function updateKeyspaceEstimate() {
   }
   clog(`  viewport: ${window.innerWidth}x${window.innerHeight} devicePixelRatio=${window.devicePixelRatio}`);
 
-  // Override work batch default for mobile — desktop default (4) is set in the HTML.
-  const batchInput = document.getElementById('work-batch-count');
-  if (batchInput && (/Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768)) {
-    batchInput.value = 1;
-  }
+  applyPerfDefaults();
+  bindPerfControlPersistence();
 
   connectWebSocket();
   await loadData();

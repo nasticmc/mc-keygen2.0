@@ -111,6 +111,28 @@
         <label>Work Request Size
           <input id="work-batch-count" type="number" min="1" max="64" value="4">
         </label>
+        <label>Device Mode
+          <select id="device-perf-mode">
+            <option value="auto" selected>Auto</option>
+            <option value="desktop">Force Desktop</option>
+            <option value="mobile">Force Mobile</option>
+          </select>
+        </label>
+        <label>GPU Dispatch Scale
+          <input id="gpu-dispatch-scale" type="number" min="0.10" max="1.00" step="0.05" value="1.00">
+        </label>
+        <label>GPU Yield (ms)
+          <input id="gpu-yield-interval" type="number" min="0" max="5000" step="50" value="500">
+        </label>
+        <label>GPU Map Timeout (ms)
+          <input id="gpu-map-timeout" type="number" min="1000" max="120000" step="500" value="30000">
+        </label>
+        <label>GPU Fallback
+          <select id="gpu-fallback-policy">
+            <option value="retry_once" selected>Retry GPU Once</option>
+            <option value="cpu_immediate">CPU Immediate</option>
+          </select>
+        </label>
       </div>
 
       <h3>Packet Queue</h3>
