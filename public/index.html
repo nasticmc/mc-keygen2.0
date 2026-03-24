@@ -23,6 +23,7 @@
     <button class="tab" data-tab="channels">Known Channels</button>
     <button class="tab" data-tab="decoder">Packet Decoder</button>
     <button class="tab" data-tab="decoded">Decoded Packets</button>
+    <button class="tab" data-tab="verification">Verification <span id="verification-badge" class="badge badge-pending hidden">0</span></button>
   </nav>
 
   <!-- ── Upload Tab ──────────────────────────────────────────────────── -->
@@ -232,6 +233,22 @@
       <p class="hint">Packets that have been cracked and decoded using the recovered channel key via meshcoredecoder.</p>
       <div id="decoded-empty" class="decoded-empty hidden">No decoded packets yet. Cracked packets will appear here automatically.</div>
       <div id="decoded-packets-list"></div>
+    </div>
+  </section>
+
+  <!-- ── Verification Tab ─────────────────────────────────────────────── -->
+  <section id="tab-verification" class="tab-content">
+    <div class="panel">
+      <h2>Verification Queue</h2>
+      <p class="hint">Keys that successfully decoded a packet are listed here. Select the correct one to confirm — or enable auto-confirm to skip manual review when only one key matches.</p>
+      <div class="settings-row">
+        <label>
+          <input type="checkbox" id="auto-confirm-single" checked>
+          Auto-confirm when exactly one key decodes a packet
+        </label>
+      </div>
+      <div id="verification-empty" class="decoded-empty">No packets awaiting verification.</div>
+      <div id="verification-list"></div>
     </div>
   </section>
 

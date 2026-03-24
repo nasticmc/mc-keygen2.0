@@ -240,8 +240,21 @@ async function connectWebSocket() {
       case 'key_found':
         showNotification(`Decrypted! Packet #${msg.packetId}: channel ${msg.channelName}`);
         setCrackingStatus(`Packet #${msg.packetId} cracked with ${msg.channelName}.`);
+        verificationQueue.delete(msg.packetId);
+        renderVerificationQueue();
+        updateVerificationBadge();
         loadDecodedPackets();
         break;
+      case 'verification_candidate': {
+        updateVerificationQueue(msg.packetId, msg.candidates, msg.channelHash, msg.prefix);
+        const autoEl = document.getElementById('auto-confirm-single');
+        if (autoEl?.checked && msg.candidates.length === 1) {
+          confirmKey(msg.packetId, msg.candidates[0].id);
+        } else {
+          showNotification(`${msg.candidates.length} key${msg.candidates.length !== 1 ? 's' : ''} decoded packet #${msg.packetId} — check Verification tab`);
+        }
+        break;
+      }
       case 'worker_update':
         updateWorkerDisplay(msg.workerId, msg.hashRate);
         break;
@@ -626,6 +639,86 @@ function renderChannels(channels) {
 
 async function deleteChannel(id) {
   await fetch(`/api/channels/${id}`, { method: 'DELETE' });
+}
+
+// ── Verification Tab ─────────────────────────────────────────────────────────
+const verificationQueue = new Map(); // packetId → { id, channel_hash, prefix, decodedCandidates }
+
+function extractDecodedText(decodedJson) {
+  try {
+    const obj = typeof decodedJson === 'string' ? JSON.parse(decodedJson) : decodedJson;
+    const dec = obj?.payload?.decoded?.decrypted;
+    if (!dec) return '(no text)';
+    const parts = [];
+    if (dec.sender) parts.push(dec.sender);
+    if (dec.message) parts.push(dec.message);
+    return parts.join(': ') || '(empty)';
+  } catch (_) { return '(parse error)'; }
+}
+
+function updateVerificationBadge() {
+  const badge = document.getElementById('verification-badge');
+  if (!badge) return;
+  const count = verificationQueue.size;
+  badge.textContent = count;
+  badge.classList.toggle('hidden', count === 0);
+}
+
+function renderVerificationQueue() {
+  const listEl = document.getElementById('verification-list');
+  const emptyEl = document.getElementById('verification-empty');
+  if (!listEl || !emptyEl) return;
+
+  const items = [...verificationQueue.values()];
+  emptyEl.classList.toggle('hidden', items.length > 0);
+
+  listEl.innerHTML = items.map(p => {
+    const candidates = p.decodedCandidates || [];
+    const channelHash = p.channel_hash || p.prefix?.toString(16) || '??';
+    const rows = candidates.map(c => `
+      <tr>
+        <td>${escapeHtml(c.channel_name)}</td>
+        <td class="mono" style="font-size:0.75em">${escapeHtml(c.key)}</td>
+        <td>${escapeHtml(extractDecodedText(c.decoded_json))}</td>
+        <td><button class="btn-sm" onclick="confirmKey(${p.id}, ${c.id})">Select</button></td>
+      </tr>`).join('');
+    return `
+      <div class="panel" style="margin-bottom:1rem">
+        <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.75rem">
+          <strong>Packet #${p.id}</strong>
+          <span class="mono" style="color:var(--text-muted)">0x${channelHash}</span>
+          <span class="badge badge-pending">${candidates.length} key${candidates.length !== 1 ? 's' : ''} found</span>
+        </div>
+        <table class="table">
+          <thead><tr><th>Channel</th><th>Key</th><th>Decoded Text</th><th></th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  }).join('');
+}
+
+function updateVerificationQueue(packetId, candidates, channelHash, prefix) {
+  if (!candidates || candidates.length === 0) return;
+  const existing = verificationQueue.get(packetId) || { id: packetId };
+  existing.decodedCandidates = candidates;
+  if (channelHash !== undefined) existing.channel_hash = channelHash;
+  if (prefix !== undefined) existing.prefix = prefix;
+  verificationQueue.set(packetId, existing);
+  renderVerificationQueue();
+  updateVerificationBadge();
+}
+
+async function confirmKey(packetId, candidateId) {
+  try {
+    await fetch(`/api/packets/${packetId}/confirm-key`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ candidateId }),
+    });
+    // key_found WS event will handle moving to decoded tab and removing from queue
+  } catch (err) {
+    console.error('confirmKey failed:', err);
+  }
 }
 
 // ── Decoded Packets Tab ─────────────────────────────────────────────────────
@@ -1148,13 +1241,14 @@ function showNotification(message) {
 // ── Initial Load ────────────────────────────────────────────────────────────
 async function loadData() {
   try {
-    const [packetsRes, channelsRes, statsRes, candidatesRes, decoderRes, decodedRes] = await Promise.all([
+    const [packetsRes, channelsRes, statsRes, candidatesRes, decoderRes, decodedRes, verRes] = await Promise.all([
       fetch('/api/packets'),
       fetch('/api/channels'),
       fetch('/api/stats'),
       fetch('/api/candidates'),
       fetch('/api/decoder-status'),
       fetch('/api/packets/decoded'),
+      fetch('/api/packets/awaiting-verification'),
     ]);
     const packets = await packetsRes.json();
     const channels = await channelsRes.json();
@@ -1162,12 +1256,18 @@ async function loadData() {
     const candidates = await candidatesRes.json();
     const decoderStatus = await decoderRes.json();
     const decodedPackets = await decodedRes.json();
+    const verPackets = await verRes.json();
 
     renderPackets(packets);
     renderChannels(channels);
     updateStats(stats);
     renderCandidates(candidates);
     renderDecodedPackets(decodedPackets);
+    for (const p of verPackets) {
+      verificationQueue.set(p.id, p);
+    }
+    renderVerificationQueue();
+    updateVerificationBadge();
     document.getElementById('worker-count').textContent = `Workers: ${stats.workerCount}`;
 
     const decoderEl = document.getElementById('decoder-status');
@@ -1238,6 +1338,15 @@ function updateKeyspaceEstimate() {
 
   applyPerfDefaults();
   bindPerfControlPersistence();
+
+  // Auto-confirm single setting persistence
+  const autoConfirmSingleEl = document.getElementById('auto-confirm-single');
+  if (autoConfirmSingleEl) {
+    autoConfirmSingleEl.checked = localStorage.getItem('mc-auto-confirm-single') !== 'false';
+    autoConfirmSingleEl.addEventListener('change', () => {
+      localStorage.setItem('mc-auto-confirm-single', autoConfirmSingleEl.checked);
+    });
+  }
 
   connectWebSocket();
   await loadData();

@@ -481,7 +481,12 @@ class GPUCracker {
           localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count - 1);
           try { onPrefixMatch(flush.packetId, [winner]); } catch (_) {}
         } else {
+          // No winner — treat like fallback so server gets a chance to verify
+          _fallbackPackets.add(flush.packetId);
           localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count);
+          const existing = pendingMatches.get(flush.packetId) || [];
+          for (const c of flush.candidates) existing.push(c);
+          pendingMatches.set(flush.packetId, existing);
         }
 
         if (_pendingFlushes.size === 0 && _drainResolve) {
@@ -738,7 +743,12 @@ class CPUCracker {
           localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count - 1);
           try { onPrefixMatch(flush.packetId, [winner]); } catch (_) {}
         } else {
+          // No winner — treat like fallback so server gets a chance to verify
+          _fallbackPackets.add(flush.packetId);
           localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count);
+          const existing = pendingMatches.get(flush.packetId) || [];
+          for (const c of flush.candidates) existing.push(c);
+          pendingMatches.set(flush.packetId, existing);
         }
 
         if (_pendingFlushes.size === 0 && _drainResolve) {
