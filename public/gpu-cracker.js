@@ -458,8 +458,30 @@ class GPUCracker {
       const list = pendingMatches.get(packetId);
       if (!list || list.length === 0) return;
       if (!force && list.length < MATCH_FLUSH_SIZE) return;
-      try { onPrefixMatch(packetId, list); } catch (_) { /* fire and forget */ }
+      const snapshot = list.slice();
       pendingMatches.set(packetId, []);
+
+      (async () => {
+        const rawHex = (packetRawData || {})[packetId];
+        if (!tuning.clientDecodeEnabled || !rawHex || typeof clientTryDecrypt === 'undefined') {
+          try { onPrefixMatch(packetId, snapshot); } catch (_) {}
+          return;
+        }
+        const parsed = parseMeshCorePacket(rawHex);
+        if (!parsed || parsed.payloadType !== 5 /* GROUP_TEXT */) {
+          try { onPrefixMatch(packetId, snapshot); } catch (_) {}
+          return;
+        }
+        let winner = null;
+        await Promise.all(snapshot.map(async m => {
+          if (winner) return;
+          const decoded = await clientTryDecrypt(rawHex, m.keyHex);
+          if (decoded && !winner) winner = { ...m, clientDecoded: decoded };
+        }));
+        if (winner) {
+          try { onPrefixMatch(packetId, [winner]); } catch (_) {}
+        }
+      })();
     };
 
     const collectMatches = (matches, chunk) => {
@@ -653,8 +675,30 @@ class CPUCracker {
       const list = pendingMatches.get(packetId);
       if (!list || list.length === 0) return;
       if (!force && list.length < MATCH_FLUSH_SIZE) return;
-      try { onPrefixMatch(packetId, list); } catch (_) { /* fire and forget */ }
+      const snapshot = list.slice();
       pendingMatches.set(packetId, []);
+
+      (async () => {
+        const rawHex = (packetRawData || {})[packetId];
+        if (!tuning.clientDecodeEnabled || !rawHex || typeof clientTryDecrypt === 'undefined') {
+          try { onPrefixMatch(packetId, snapshot); } catch (_) {}
+          return;
+        }
+        const parsed = parseMeshCorePacket(rawHex);
+        if (!parsed || parsed.payloadType !== 5 /* GROUP_TEXT */) {
+          try { onPrefixMatch(packetId, snapshot); } catch (_) {}
+          return;
+        }
+        let winner = null;
+        await Promise.all(snapshot.map(async m => {
+          if (winner) return;
+          const decoded = await clientTryDecrypt(rawHex, m.keyHex);
+          if (decoded && !winner) winner = { ...m, clientDecoded: decoded };
+        }));
+        if (winner) {
+          try { onPrefixMatch(packetId, [winner]); } catch (_) {}
+        }
+      })();
     };
 
     for (const chunk of chunks) {

@@ -47,6 +47,7 @@ const PERF_STORAGE_KEYS = {
   yieldIntervalMs: 'mc-worker-gpu-yield-interval',
   mapTimeoutMs: 'mc-worker-gpu-map-timeout',
   fallbackPolicy: 'mc-worker-gpu-fallback-policy',
+  clientDecodeEnabled: 'mc-worker-client-decode-enabled',
 };
 
 // Exponential moving average for hash rate display — smooths out per-chunk spikes.
@@ -289,7 +290,8 @@ function getGpuTuningSettings() {
   const mapTimeoutMs = clampNumber(document.getElementById('gpu-map-timeout')?.value, 1000, 120000, 30000);
   const fallbackPolicy = document.getElementById('gpu-fallback-policy')?.value || 'retry_once';
   const deviceMode = document.getElementById('device-perf-mode')?.value || 'auto';
-  return { dispatchScale, yieldIntervalMs, mapTimeoutMs, fallbackPolicy, deviceMode };
+  const clientDecodeEnabled = document.getElementById('client-decode-enabled')?.checked ?? true;
+  return { dispatchScale, yieldIntervalMs, mapTimeoutMs, fallbackPolicy, deviceMode, clientDecodeEnabled };
 }
 
 function applyPerfDefaults() {
@@ -316,6 +318,11 @@ function applyPerfDefaults() {
   }
   if (mapTimeout) mapTimeout.value = localStorage.getItem(PERF_STORAGE_KEYS.mapTimeoutMs) || '30000';
   if (fallbackPolicy) fallbackPolicy.value = localStorage.getItem(PERF_STORAGE_KEYS.fallbackPolicy) || 'retry_once';
+  const clientDecode = document.getElementById('client-decode-enabled');
+  if (clientDecode) {
+    const saved = localStorage.getItem(PERF_STORAGE_KEYS.clientDecodeEnabled);
+    clientDecode.checked = saved !== null ? saved === 'true' : !isMobile();
+  }
 }
 
 function bindPerfControlPersistence() {
@@ -338,6 +345,12 @@ function bindPerfControlPersistence() {
     };
     el.addEventListener('change', handler);
     el.addEventListener('input', handler);
+  }
+  const clientDecodeEl = document.getElementById('client-decode-enabled');
+  if (clientDecodeEl) {
+    clientDecodeEl.addEventListener('change', () => {
+      localStorage.setItem(PERF_STORAGE_KEYS.clientDecodeEnabled, String(clientDecodeEl.checked));
+    });
   }
 }
 
