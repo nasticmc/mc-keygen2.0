@@ -75,9 +75,10 @@ fn sha256_block(block: array<u32, 16>) -> array<u32, 8> {
 
 struct Params {
   target_prefix: u32,   // target prefix byte (lowest 8 bits compared against hash2[0]>>24)
-  range_start: u32,
   range_size: u32,
   charset_len: u32,     // length of charset (36 for alnum)
+  tier_len: u32,        // fixed candidate length for this batch
+  start_digits: array<u32, 10>, // base-N digits for batch start offset
 }
 
 struct MatchEntry {
@@ -93,7 +94,7 @@ struct Results {
   matches: array<MatchEntry, 65536>,
 }
 
-@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(0) var<storage, read> params: Params;
 @group(0) @binding(1) var<storage, read_write> results: Results;
 @group(0) @binding(2) var<storage, read> charset: array<u32, 64>;
 
@@ -102,40 +103,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let idx = gid.x;
   if (idx >= params.range_size) { return; }
 
-  let candidate_idx = params.range_start + idx;
-
   // Convert index to channel name string using charset
-  // Index maps to variable-length strings:
-  // 0..35 = 1-char, 36..1331 = 2-char, etc.
+  // For each dispatch, JS pre-splits work so a batch stays inside one
+  // length tier. start_digits describes the first candidate in that tier.
   let base = params.charset_len;
   var name_bytes: array<u32, 32>;  // max channel name length
-  var name_len: u32 = 0u;
+  let tier_len = params.tier_len;
+  var name_len: u32 = 1u;
 
   // First byte is always '#' (0x23)
   name_bytes[0] = 0x23u;
-  name_len = 1u;
+  if (tier_len == 0u || tier_len > 10u) { return; }
 
-  // Determine which length tier this index falls into
-  var remaining = candidate_idx;
-  var tier_start: u32 = 0u;
-  var tier_len: u32 = 1u;
-  var tier_size: u32 = base;
-
-  loop {
-    if (remaining < tier_size) { break; }
-    remaining -= tier_size;
-    tier_start += tier_size;
-    tier_len++;
-    tier_size *= base;
-    if (tier_len > 8u) { return; } // safety limit
+  // Convert local idx to base-N digits of fixed tier_len.
+  var idx_digits: array<u32, 10>;
+  for (var i: u32 = 0u; i < 10u; i++) { idx_digits[i] = 0u; }
+  var temp = idx;
+  for (var i: u32 = 0u; i < tier_len; i++) {
+    let pos = tier_len - 1u - i;
+    idx_digits[pos] = temp % base;
+    temp /= base;
   }
 
-  // Convert remaining to base-N digits for the name
-  var temp = remaining;
+  // Add start_digits + idx_digits in base-N to get final candidate digits.
+  var out_digits: array<u32, 10>;
+  for (var i: u32 = 0u; i < 10u; i++) { out_digits[i] = 0u; }
+  var carry: u32 = 0u;
   for (var i: u32 = 0u; i < tier_len; i++) {
-    let digit = temp % base;
-    name_bytes[name_len + tier_len - 1u - i] = charset[digit];
-    temp /= base;
+    let rev = tier_len - 1u - i;
+    var sum = params.start_digits[rev] + idx_digits[rev] + carry;
+    carry = 0u;
+    if (sum >= base) {
+      sum -= base;
+      carry = 1u;
+    }
+    out_digits[rev] = sum;
+  }
+  if (carry != 0u) { return; } // should never happen if batch splitting is correct
+
+  for (var i: u32 = 0u; i < tier_len; i++) {
+    name_bytes[name_len + i] = charset[out_digits[i]];
   }
   name_len += tier_len;
 
@@ -185,7 +192,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (prefix_byte == params.target_prefix) {
     let slot = atomicAdd(&results.match_count, 1u);
     if (slot < 65536u) {
-      results.matches[slot].index = candidate_idx;
+      results.matches[slot].index = idx;
       results.matches[slot].key0  = hash1[0];
       results.matches[slot].key1  = hash1[1];
       results.matches[slot].key2  = hash1[2];
@@ -261,8 +268,8 @@ class GPUCracker {
 
   // Convert index back to channel name (must match GPU logic exactly)
   indexToChannelName(index, charset) {
-    const base = charset.length;
-    let remaining = index;
+    const base = BigInt(charset.length);
+    let remaining = typeof index === 'bigint' ? index : BigInt(index);
     let tierLen = 1;
     let tierSize = base;
 
@@ -270,14 +277,15 @@ class GPUCracker {
       remaining -= tierSize;
       tierLen++;
       tierSize *= base;
-      if (tierLen > 8) return null;
+      if (tierLen > 10) return null;
     }
 
     let name = '';
     let temp = remaining;
     for (let i = 0; i < tierLen; i++) {
-      name = charset[temp % base] + name;
-      temp = Math.floor(temp / base);
+      const digit = Number(temp % base);
+      name = charset[digit] + name;
+      temp /= base;
     }
 
     return '#' + name;
@@ -296,8 +304,9 @@ class GPUCracker {
     // serialises writeBuffer calls, so params for batch N are always written
     // before batch N's compute pass executes.
     this.paramsBuffer = this.device.createBuffer({
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      // target_prefix/range_size/charset_len/tier_len + 10 start digits
+      size: (4 + 10) * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
     this.charsetBuffer = this.device.createBuffer({
       size: 64 * 4,
@@ -328,7 +337,7 @@ class GPUCracker {
   }
 
   // Submit a compute dispatch to the GPU (non-blocking — does not await completion).
-  _dispatchBatch(bufSetIdx, targetPrefix, rangeStart, rangeSize, charset) {
+  _dispatchBatch(bufSetIdx, targetPrefix, rangeSize, tierLen, startDigits, charset) {
     if (this.cachedCharset !== charset) {
       const charsetData = new Uint32Array(64);
       for (let i = 0; i < charset.length; i++) charsetData[i] = charset.charCodeAt(i);
@@ -340,8 +349,13 @@ class GPUCracker {
 
     // Reset match count then write params for this batch.
     this.device.queue.writeBuffer(resultBuffer, 0, new Uint32Array([0]));
-    this.device.queue.writeBuffer(this.paramsBuffer, 0,
-      new Uint32Array([targetPrefix, rangeStart, rangeSize, charset.length]));
+    const paramsData = new Uint32Array(14);
+    paramsData[0] = targetPrefix >>> 0;
+    paramsData[1] = rangeSize >>> 0;
+    paramsData[2] = charset.length >>> 0;
+    paramsData[3] = tierLen >>> 0;
+    for (let i = 0; i < 10; i++) paramsData[4 + i] = (startDigits?.[i] || 0) >>> 0;
+    this.device.queue.writeBuffer(this.paramsBuffer, 0, paramsData);
 
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginComputePass();
@@ -426,18 +440,56 @@ class GPUCracker {
     const _yieldInterval = clamp(tuning.yieldIntervalMs, 0, 5000, _isMobile ? 100 : 500);
     this._mapTimeoutMs = clamp(tuning.mapTimeoutMs, 1000, 120000, 30000);
 
+    const baseBig = BigInt(charset.length);
+    const toBig = (v) => (typeof v === 'bigint' ? v : BigInt(v));
+    const tierInfoForIndex = (index) => {
+      let remaining = toBig(index);
+      let tierLen = 1;
+      let tierSize = baseBig;
+      while (remaining >= tierSize) {
+        remaining -= tierSize;
+        tierLen++;
+        tierSize *= baseBig;
+        if (tierLen > 10) return null;
+      }
+      return { tierLen, offset: remaining, tierSize };
+    };
+    const digitsForOffset = (offset, tierLen) => {
+      const digits = new Array(10).fill(0);
+      let temp = offset;
+      for (let i = tierLen - 1; i >= 0; i--) {
+        digits[i] = Number(temp % baseBig);
+        temp /= baseBig;
+      }
+      return digits;
+    };
+
     // Flatten all work into a single batch list so the ping-pong pipeline can
-    // span chunk boundaries without extra complexity.
+    // span chunk boundaries without extra complexity. Split at tier boundaries
+    // so each dispatch has a fixed candidate length.
     const batches = [];
     for (const chunk of chunks) {
-      const rangeSize = chunk.range_end - chunk.range_start;
-      for (let offset = 0; offset < rangeSize; offset += batchSize) {
+      const chunkStart = toBig(chunk.range_start);
+      const chunkEnd = toBig(chunk.range_end);
+      let cursor = chunkStart;
+      while (cursor < chunkEnd) {
+        const tier = tierInfoForIndex(cursor);
+        if (!tier) {
+          throw new Error(`[gpu] unsupported tier length for index ${cursor.toString()} (max 10)`);
+        }
+        const tierRemaining = tier.tierSize - tier.offset;
+        const chunkRemaining = chunkEnd - cursor;
+        const sizeBig = [tierRemaining, chunkRemaining, BigInt(batchSize)].reduce((m, v) => (v < m ? v : m));
+        const size = Number(sizeBig);
         batches.push({
           chunk,
-          start: chunk.range_start + offset,
-          size: Math.min(batchSize, rangeSize - offset),
-          isLastInChunk: offset + batchSize >= rangeSize,
+          start: cursor,
+          size,
+          tierLen: tier.tierLen,
+          startDigits: digitsForOffset(tier.offset, tier.tierLen),
+          isLastInChunk: (cursor + sizeBig) >= chunkEnd,
         });
+        cursor += sizeBig;
       }
     }
 
@@ -520,17 +572,18 @@ class GPUCracker {
       }
     };
 
-    const collectMatches = (matches, chunk) => {
+    const collectMatches = (matches, batch) => {
       if (matches.length === 0) return;
-      const list = pendingMatches.get(chunk.packet_id) || [];
+      const list = pendingMatches.get(batch.chunk.packet_id) || [];
       for (const m of matches) {
-        const channelName = this.indexToChannelName(m.index, charset);
+        const globalIndex = batch.start + BigInt(m.index);
+        const channelName = this.indexToChannelName(globalIndex, charset);
         if (!channelName) continue;
         const keyHex = [m.key0, m.key1, m.key2, m.key3]
           .map(w => w.toString(16).padStart(8, '0')).join('');
-        list.push({ channelName, keyHex, prefixHex: chunk.target_prefix.toString(16).padStart(2, '0') });
+        list.push({ channelName, keyHex, prefixHex: batch.chunk.target_prefix.toString(16).padStart(2, '0') });
       }
-      pendingMatches.set(chunk.packet_id, list);
+      pendingMatches.set(batch.chunk.packet_id, list);
     };
 
     let _lastProgressTime = 0;
@@ -555,7 +608,7 @@ class GPUCracker {
         onProgress(this.hashRate, processedCandidates, totalCandidates);
       }
       // Collect matches — flushed once when the chunk completes
-      if (matches.length > 0) collectMatches(matches, batch.chunk);
+      if (matches.length > 0) collectMatches(matches, batch);
       if (batch.isLastInChunk) {
         completedChunkIds.add(batch.chunk.id);
         // Flush one batch of prefix matches per completed chunk
@@ -578,7 +631,14 @@ class GPUCracker {
       pingPong = 1 - pingPong;
 
       // Submit this batch to the GPU (returns immediately).
-      this._dispatchBatch(currentPP, batch.chunk.target_prefix, batch.start, batch.size, charset);
+      this._dispatchBatch(
+        currentPP,
+        batch.chunk.target_prefix,
+        batch.size,
+        batch.tierLen,
+        batch.startDigits,
+        charset
+      );
 
       // Await the previous batch's GPU results while this batch computes.
       if (pending) {
@@ -682,8 +742,8 @@ class CPUCracker {
   async init() { return true; }
 
   indexToChannelName(index, charset) {
-    const base = charset.length;
-    let remaining = index;
+    const base = BigInt(charset.length);
+    let remaining = typeof index === 'bigint' ? index : BigInt(index);
     let tierLen = 1;
     let tierSize = base;
 
@@ -691,14 +751,15 @@ class CPUCracker {
       remaining -= tierSize;
       tierLen++;
       tierSize *= base;
-      if (tierLen > 8) return null;
+      if (tierLen > 10) return null;
     }
 
     let name = '';
     let temp = remaining;
     for (let i = 0; i < tierLen; i++) {
-      name = charset[temp % base] + name;
-      temp = Math.floor(temp / base);
+      const digit = Number(temp % base);
+      name = charset[digit] + name;
+      temp /= base;
     }
 
     return '#' + name;
@@ -785,7 +846,9 @@ class CPUCracker {
       if (!this.running) break;
       let chunkFullyProcessed = true;
 
-      for (let i = chunk.range_start; i < chunk.range_end; i++) {
+      const start = BigInt(chunk.range_start);
+      const end = BigInt(chunk.range_end);
+      for (let i = start; i < end; i++) {
         if (!this.running) {
           chunkFullyProcessed = false;
           break;

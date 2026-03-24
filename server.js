@@ -303,10 +303,7 @@ const CHUNK_SIZE = 128_000_000;
   for (const p of needInit) {
     const charsetKey = p.charset || 'lower';
     const base = (charsetKey === 'alnum' ? 36 : charsetKey === 'lower' ? 26 : charsetKey === 'numeric' ? 10 : charsetKey === 'full' ? 65 : 26);
-    let start = 0;
-    for (let len = 1; len < (p.min_len || 1); len++) start += Math.pow(base, len);
-    let end = start;
-    for (let len = (p.min_len || 1); len <= (p.max_len || 5); len++) end += Math.pow(base, len);
+    const { start, end } = indexRangeForLengths(base, p.min_len || 1, p.max_len || 5);
     const completedMax = db.prepare("SELECT MAX(range_end) as max_end FROM work_chunks WHERE packet_id = ? AND status = 'completed'").get(p.id);
     const offset = (completedMax?.max_end != null) ? Math.max(start, completedMax.max_end) : start;
     const totalChunks = Math.ceil((end - start) / CHUNK_SIZE);
@@ -324,8 +321,7 @@ const CHUNK_SIZE = 128_000_000;
   for (const p of needKsStart) {
     const charsetKey = p.charset || 'lower';
     const base = (charsetKey === 'alnum' ? 36 : charsetKey === 'lower' ? 26 : charsetKey === 'numeric' ? 10 : charsetKey === 'full' ? 65 : 26);
-    let start = 0;
-    for (let len = 1; len < p.min_len; len++) start += Math.pow(base, len);
+    const { start } = indexRangeForLengths(base, p.min_len, p.min_len);
     db.prepare('UPDATE packets SET keyspace_start = ? WHERE id = ?').run(start, p.id);
     console.log(`[migration] fixed keyspace_start for packet ${p.id}: start=${start}`);
   }
@@ -865,12 +861,34 @@ function normalizeCrackConfig(input = {}) {
   };
 }
 
-function indexRangeForLengths(base, minLen, maxLen) {
-  let start = 0;
-  for (let len = 1; len < minLen; len++) start += Math.pow(base, len);
-  let span = 0;
-  for (let len = minLen; len <= maxLen; len++) span += Math.pow(base, len);
+const MAX_SAFE_KEYSPACE = BigInt(Number.MAX_SAFE_INTEGER);
+
+function keyspaceRangeForLengthsBigInt(base, minLen, maxLen) {
+  const b = BigInt(base);
+  let start = 0n;
+  let pow = b; // base^1
+  for (let len = 1; len < minLen; len++) {
+    start += pow;
+    pow *= b;
+  }
+
+  let span = 0n;
+  for (let len = minLen; len <= maxLen; len++) {
+    span += pow;
+    pow *= b;
+  }
   return { start, end: start + span };
+}
+
+function indexRangeForLengths(base, minLen, maxLen) {
+  const { start, end } = keyspaceRangeForLengthsBigInt(base, minLen, maxLen);
+  if (end > MAX_SAFE_KEYSPACE) {
+    throw new Error(
+      `Requested keyspace (${end.toString()} candidates) exceeds JS safe-integer limit (${Number.MAX_SAFE_INTEGER}). ` +
+      'Reduce charset/length range.'
+    );
+  }
+  return { start: Number(start), end: Number(end) };
 }
 
 // ── Virtual Chunk System ────────────────────────────────────────────────────
@@ -938,6 +956,14 @@ function formatHashRate(n) {
   return n + ' H/s';
 }
 
+function encodeChunksForWire(chunks) {
+  return chunks.map(c => ({
+    ...c,
+    range_start: c.range_start != null ? String(c.range_start) : c.range_start,
+    range_end: c.range_end != null ? String(c.range_end) : c.range_end,
+  }));
+}
+
 const serverStatus = {
   phase: 'idle',
   detail: 'Server booted',
@@ -987,7 +1013,7 @@ function maybePushWork(workerId, reason = 'scheduler') {
     }
     safeSend(worker.ws, {
       type: 'work',
-      chunks,
+      chunks: encodeChunksForWire(chunks),
       charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
       packetRawData,
     }, 'work_push');
@@ -1207,7 +1233,7 @@ wss.on('connection', (ws) => {
         const sent = safeSend(ws, {
           type: 'work',
           solicited: true,
-          chunks,
+          chunks: encodeChunksForWire(chunks),
           charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
           packetRawData,
         }, 'work_reply');
@@ -1406,7 +1432,7 @@ app.post('/api/worker/request-work', (req, res) => {
   broadcastStats();
 
   res.json({
-    chunks,
+    chunks: encodeChunksForWire(chunks),
     charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
     packetRawData,
   });
@@ -1627,7 +1653,12 @@ app.post('/api/packets', (req, res) => {
   }
 
   const result = stmts.insertPacket.run(hexData, prefix, channelHash, decoded ? JSON.stringify(decoded) : null, cfg.charset, cfg.minLen, cfg.maxLen);
-  initWorkForPacket(result.lastInsertRowid, prefix, cfg);
+  try {
+    initWorkForPacket(result.lastInsertRowid, prefix, cfg);
+  } catch (err) {
+    db.prepare('DELETE FROM packets WHERE id = ?').run(result.lastInsertRowid);
+    return res.status(400).json({ error: err.message });
+  }
   const packet = stmts.getPacketById.get(result.lastInsertRowid);
 
   broadcast({ type: 'packets', packets: stmts.getPacketsSlim.all() });
@@ -1693,21 +1724,25 @@ app.post('/api/packets/:id/retry', (req, res) => {
     maxLen: req.body?.crackConfig?.maxLen || packet.max_len,
   });
   _sessionReset(packetId);
-  db.transaction(() => {
-    if (channelName) {
-      db.prepare('UPDATE candidate_keys SET ignored = 1 WHERE packet_id = ? AND channel_name = ?')
-        .run(packetId, channelName);
-    }
+  try {
+    db.transaction(() => {
+      if (channelName) {
+        db.prepare('UPDATE candidate_keys SET ignored = 1 WHERE packet_id = ? AND channel_name = ?')
+          .run(packetId, channelName);
+      }
 
-    db.prepare("UPDATE packets SET status = 'pending', cracked_key = NULL, channel_name = NULL, cracked_at = NULL, decrypted_json = NULL WHERE id = ?")
-      .run(packetId);
-    db.prepare('UPDATE packets SET charset = ?, min_len = ?, max_len = ? WHERE id = ?')
-      .run(cfg.charset, cfg.minLen, cfg.maxLen, packetId);
-    // Delete ALL chunks so the keyspace starts fresh on retry/reset
-    db.prepare("DELETE FROM work_chunks WHERE packet_id = ?")
-      .run(packetId);
-    initWorkForPacket(packetId, packet.prefix, cfg);
-  })();
+      db.prepare("UPDATE packets SET status = 'pending', cracked_key = NULL, channel_name = NULL, cracked_at = NULL, decrypted_json = NULL WHERE id = ?")
+        .run(packetId);
+      db.prepare('UPDATE packets SET charset = ?, min_len = ?, max_len = ? WHERE id = ?')
+        .run(cfg.charset, cfg.minLen, cfg.maxLen, packetId);
+      // Delete ALL chunks so the keyspace starts fresh on retry/reset
+      db.prepare("DELETE FROM work_chunks WHERE packet_id = ?")
+        .run(packetId);
+      initWorkForPacket(packetId, packet.prefix, cfg);
+    })();
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
   invalidateVirtualPending();
 
   broadcast({ type: 'packets', packets: stmts.getPacketsSlim.all() });
