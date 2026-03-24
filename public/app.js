@@ -923,6 +923,23 @@ async function runCrackingLoop() {
   loopRunning = true;
   let batchesCompleted = 0;
 
+  // Create a dedicated Web Worker for client-side decode so crypto.subtle
+  // operations don't starve the GPU pipeline on the main thread.
+  let decodeWorker = null;
+  try {
+    const tuningCheck = getGpuTuningSettings();
+    if (tuningCheck.clientDecodeEnabled && typeof Worker !== 'undefined') {
+      decodeWorker = new Worker('decode-worker.js');
+      decodeWorker.onerror = (err) => {
+        console.warn('[decode-worker] error, disabling client decode offload:', err.message);
+        decodeWorker = null;
+      };
+    }
+  } catch (e) {
+    console.warn('[decode-worker] failed to create, falling back to server decode:', e.message);
+    decodeWorker = null;
+  }
+
   // Pre-fetch next batch via HTTP while GPU processes current one
   let nextWorkPromise = null;
 
@@ -1053,7 +1070,7 @@ async function runCrackingLoop() {
             apiPost('/api/worker/hashrate', { clientId: getClientId(), hashRate }).catch(() => {});
           }
         },
-      }, currentCharset, packetRawData, getGpuTuningSettings());
+      }, currentCharset, packetRawData, { ...getGpuTuningSettings(), _decodeWorker: decodeWorker });
 
       const batchMs = Math.round(performance.now() - batchStart);
       batchesCompleted++;
@@ -1062,6 +1079,10 @@ async function runCrackingLoop() {
       setCrackingStatus(`Batch ${batchesCompleted} complete (${formatNumber(totalCandidates)} candidates in ${(batchMs / 1000).toFixed(1)}s). Loading next...`);
     }
   } finally {
+    if (decodeWorker) {
+      try { decodeWorker.terminate(); } catch (_) {}
+      decodeWorker = null;
+    }
     loopRunning = false;
     clog(`cracking loop exited — batches=${batchesCompleted} cracking=${cracking}`);
     if (cracking) {
