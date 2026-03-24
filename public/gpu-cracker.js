@@ -450,7 +450,7 @@ class GPUCracker {
     // entire work packet can produce millions of candidates and blow up
     // JSON.stringify() ("Invalid string length") when posting results.
     // Keep each POST bounded to avoid runaway memory and payload sizes.
-    const MATCH_FLUSH_SIZE = 2000;
+    const MATCH_FLUSH_SIZE = 25000;
     const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
     const localPrefixCounts = new Map(); // packet_id → extra prefix count not yet reported to server
 
@@ -673,7 +673,7 @@ class CPUCracker {
     let processedCandidates = 0;
 
     const completedChunkIds = [];
-    const MATCH_FLUSH_SIZE = 500;
+    const MATCH_FLUSH_SIZE = 25000;
     const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
     const localPrefixCounts = new Map(); // packet_id → extra prefix count not yet reported to server
 
