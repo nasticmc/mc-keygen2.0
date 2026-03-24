@@ -445,14 +445,13 @@ class GPUCracker {
       console.debug(`[gpu] processing ${chunks.length} chunk(s) as ${batches.length} GPU batch(es), batchSize=${batchSize}, dispatchScale=${dispatchScale.toFixed(2)}, yieldMs=${_yieldInterval}, mapTimeoutMs=${this._mapTimeoutMs}`);
     } catch (_) {}
 
-    // Accumulate prefix matches per packet_id in bounded batches.
-    // A 1-byte prefix can match very frequently (~1/256), so buffering an
-    // entire work packet can produce millions of candidates and blow up
-    // JSON.stringify() ("Invalid string length") when posting results.
-    // Keep each POST bounded to avoid runaway memory and payload sizes.
-    const MATCH_FLUSH_SIZE = 25000;
+    // Accumulate prefix matches per packet_id and flush once per completed
+    // work chunk instead of streaming batches mid-chunk.  This prevents the
+    // decode worker from stalling and repeatedly falling back to the server.
+    const MATCH_FLUSH_SIZE = 50000; // safety cap per POST to avoid JSON.stringify blow-up
     const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
     const localPrefixCounts = new Map(); // packet_id → extra prefix count not yet reported to server
+    const _fallbackPackets = new Set(); // packets where decode worker can't decode (skip worker on flush)
 
     // Decode worker state — offloads clientTryDecrypt to a Web Worker so
     // crypto.subtle microtasks never starve the GPU pipeline.
@@ -469,8 +468,15 @@ class GPUCracker {
         _pendingFlushes.delete(id);
 
         if (fallback) {
-          // Worker couldn't decode (wrong packet type) — send all to server
-          try { onPrefixMatch(flush.packetId, flush.candidates); } catch (_) {}
+          // Worker can't decode this packet type — count locally and remember
+          // so future flushes for this packet skip the worker entirely.
+          _fallbackPackets.add(flush.packetId);
+          localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count);
+          // Re-queue candidates so they get sent to the server on the next
+          // chunk-end flush (which will now bypass the decode worker).
+          const existing = pendingMatches.get(flush.packetId) || [];
+          for (const c of flush.candidates) existing.push(c);
+          pendingMatches.set(flush.packetId, existing);
         } else if (winner) {
           localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count - 1);
           try { onPrefixMatch(flush.packetId, [winner]); } catch (_) {}
@@ -489,19 +495,25 @@ class GPUCracker {
       if (!onPrefixMatch) return;
       const list = pendingMatches.get(packetId);
       if (!list || list.length === 0) return;
-      if (!force && list.length < MATCH_FLUSH_SIZE) return;
-      const snapshot = list.slice();
+      if (!force) return; // only flush at chunk boundaries
+
+      // Cap the POST size to avoid JSON.stringify blow-up; count the rest locally.
+      let toSend = list;
+      if (list.length > MATCH_FLUSH_SIZE) {
+        toSend = list.slice(0, MATCH_FLUSH_SIZE);
+        localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + (list.length - MATCH_FLUSH_SIZE));
+      }
       pendingMatches.set(packetId, []);
 
       const rawHex = (packetRawData || {})[packetId];
-      if (_decodeWorker && tuning.clientDecodeEnabled && rawHex) {
+      if (_decodeWorker && tuning.clientDecodeEnabled && rawHex && !_fallbackPackets.has(packetId)) {
         // Offload decoding to the Web Worker — zero main-thread crypto work.
         const flushId = _flushCounter++;
-        _pendingFlushes.set(flushId, { packetId, candidates: snapshot });
-        _decodeWorker.postMessage({ type: 'decode', id: flushId, rawHex, candidates: snapshot });
+        _pendingFlushes.set(flushId, { packetId, candidates: toSend });
+        _decodeWorker.postMessage({ type: 'decode', id: flushId, rawHex, candidates: toSend });
       } else {
-        // No worker or decode disabled — send matches directly to server.
-        try { onPrefixMatch(packetId, snapshot); } catch (_) {}
+        // No worker, decode disabled, or packet type not supported — send to server.
+        try { onPrefixMatch(packetId, toSend); } catch (_) {}
       }
     };
 
@@ -516,7 +528,6 @@ class GPUCracker {
         list.push({ channelName, keyHex, prefixHex: chunk.target_prefix.toString(16).padStart(2, '0') });
       }
       pendingMatches.set(chunk.packet_id, list);
-      flushPendingMatches(chunk.packet_id, false);
     };
 
     let _lastProgressTime = 0;
@@ -540,9 +551,13 @@ class GPUCracker {
         _lastProgressTime = now;
         onProgress(this.hashRate, processedCandidates, totalCandidates);
       }
-      // Collect matches — all will be sent in one batch at the end
+      // Collect matches — flushed once when the chunk completes
       if (matches.length > 0) collectMatches(matches, batch.chunk);
-      if (batch.isLastInChunk) completedChunkIds.add(batch.chunk.id);
+      if (batch.isLastInChunk) {
+        completedChunkIds.add(batch.chunk.id);
+        // Flush one batch of prefix matches per completed chunk
+        flushPendingMatches(batch.chunk.packet_id, true);
+      }
     };
 
     // Ping-pong pipeline: dispatch batch i, then await batch i-1's readback
@@ -604,6 +619,9 @@ class GPUCracker {
     if (_decodeWorker && _pendingFlushes.size > 0) {
       await new Promise(resolve => { _drainResolve = resolve; });
     }
+
+    // Flush any candidates re-queued by fallback responses from the decode worker.
+    for (const [packetId] of pendingMatches) flushPendingMatches(packetId, true);
 
     if (completedChunkIds.size > 0 && onChunkComplete) {
       try { onChunkComplete([...completedChunkIds], this.hashRate, localPrefixCounts); } catch (_) { /* fire and forget */ }
@@ -694,9 +712,10 @@ class CPUCracker {
     let processedCandidates = 0;
 
     const completedChunkIds = [];
-    const MATCH_FLUSH_SIZE = 25000;
+    const MATCH_FLUSH_SIZE = 50000; // safety cap per POST to avoid JSON.stringify blow-up
     const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
     const localPrefixCounts = new Map(); // packet_id → extra prefix count not yet reported to server
+    const _fallbackPackets = new Set(); // packets where decode worker can't decode
 
     // Decode worker state (same pattern as GPUCracker)
     const _decodeWorker = tuning._decodeWorker || null;
@@ -712,7 +731,11 @@ class CPUCracker {
         _pendingFlushes.delete(id);
 
         if (fallback) {
-          try { onPrefixMatch(flush.packetId, flush.candidates); } catch (_) {}
+          _fallbackPackets.add(flush.packetId);
+          localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count);
+          const existing = pendingMatches.get(flush.packetId) || [];
+          for (const c of flush.candidates) existing.push(c);
+          pendingMatches.set(flush.packetId, existing);
         } else if (winner) {
           localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count - 1);
           try { onPrefixMatch(flush.packetId, [winner]); } catch (_) {}
@@ -731,17 +754,22 @@ class CPUCracker {
       if (!onPrefixMatch) return;
       const list = pendingMatches.get(packetId);
       if (!list || list.length === 0) return;
-      if (!force && list.length < MATCH_FLUSH_SIZE) return;
-      const snapshot = list.slice();
+      if (!force) return; // only flush at chunk boundaries
+
+      let toSend = list;
+      if (list.length > MATCH_FLUSH_SIZE) {
+        toSend = list.slice(0, MATCH_FLUSH_SIZE);
+        localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + (list.length - MATCH_FLUSH_SIZE));
+      }
       pendingMatches.set(packetId, []);
 
       const rawHex = (packetRawData || {})[packetId];
-      if (_decodeWorker && tuning.clientDecodeEnabled && rawHex) {
+      if (_decodeWorker && tuning.clientDecodeEnabled && rawHex && !_fallbackPackets.has(packetId)) {
         const flushId = _flushCounter++;
-        _pendingFlushes.set(flushId, { packetId, candidates: snapshot });
-        _decodeWorker.postMessage({ type: 'decode', id: flushId, rawHex, candidates: snapshot });
+        _pendingFlushes.set(flushId, { packetId, candidates: toSend });
+        _decodeWorker.postMessage({ type: 'decode', id: flushId, rawHex, candidates: toSend });
       } else {
-        try { onPrefixMatch(packetId, snapshot); } catch (_) {}
+        try { onPrefixMatch(packetId, toSend); } catch (_) {}
       }
     };
 
@@ -766,7 +794,6 @@ class CPUCracker {
           const list = pendingMatches.get(chunk.packet_id) || [];
           list.push({ channelName, keyHex, prefixHex });
           pendingMatches.set(chunk.packet_id, list);
-          flushPendingMatches(chunk.packet_id, false);
         }
 
         totalHashed++;
@@ -787,7 +814,11 @@ class CPUCracker {
         if (onProgress) onProgress(this.hashRate, processedCandidates, totalCandidates);
       }
 
-      if (chunkFullyProcessed) completedChunkIds.push(chunk.id);
+      if (chunkFullyProcessed) {
+        completedChunkIds.push(chunk.id);
+        // Flush one batch of prefix matches per completed chunk
+        flushPendingMatches(chunk.packet_id, true);
+      }
 
       totalHashed = 0;
       lastTime = performance.now();
@@ -800,6 +831,9 @@ class CPUCracker {
     if (_decodeWorker && _pendingFlushes.size > 0) {
       await new Promise(resolve => { _drainResolve = resolve; });
     }
+
+    // Flush any candidates re-queued by fallback responses from the decode worker.
+    for (const [packetId] of pendingMatches) flushPendingMatches(packetId, true);
 
     if (completedChunkIds.length > 0 && onChunkComplete) {
       try { onChunkComplete(completedChunkIds, this.hashRate, localPrefixCounts); } catch (_) { /* fire and forget */ }
