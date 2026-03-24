@@ -29,8 +29,8 @@
   <section id="tab-upload" class="tab-content active">
     <div class="panel">
       <h2>Upload Raw Packet</h2>
-      <p class="hint">Paste raw packet hex data. It will be decoded with meshcoredecoder to extract the channelHash for cracking.</p>
-      <textarea id="raw-packet" rows="10" placeholder="Paste raw packet hex data here..."></textarea>
+      <p class="hint">Paste raw GroupText packet hex data. Only GroupText (type 5) packets are accepted. The packet will be decoded to extract the channelHash for cracking.</p>
+      <textarea id="raw-packet" rows="10" placeholder="Paste raw GroupText packet hex data here..."></textarea>
       <button id="btn-upload" class="btn-primary">Upload & Queue</button>
       <div id="upload-result" class="result-box hidden"></div>
     </div>
