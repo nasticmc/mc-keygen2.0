@@ -473,10 +473,24 @@ function updateStats(stats) {
 }
 
 function formatNumber(n) {
+  if (typeof n === 'bigint') {
+    const abs = n < 0n ? -n : n;
+    if (abs >= 1_000_000_000n) return `${Number(abs / 100_000_000n) / 10}B`;
+    if (abs >= 1_000_000n) return `${Number(abs / 100_000n) / 10}M`;
+    if (abs >= 1_000n) return `${Number(abs / 100n) / 10}K`;
+    return n.toString();
+  }
   if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(1) + 'B';
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
   if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
   return String(n);
+}
+
+function toBigIntSafe(v) {
+  if (typeof v === 'bigint') return v;
+  if (typeof v === 'string') return BigInt(v);
+  if (typeof v === 'number') return BigInt(Math.trunc(v));
+  return 0n;
 }
 
 function formatETA(seconds) {
@@ -1122,7 +1136,10 @@ async function runCrackingLoop() {
         continue;
       }
 
-      const totalCandidates = chunks.reduce((sum, c) => sum + (c.range_end - c.range_start), 0);
+      const totalCandidates = chunks.reduce(
+        (sum, c) => sum + (toBigIntSafe(c.range_end) - toBigIntSafe(c.range_start)),
+        0n
+      );
       const packetIds = [...new Set(chunks.map(c => c.packet_id))];
       clog(`received ${chunks.length} chunk(s) for packet [${packetIds}] — ${formatNumber(totalCandidates)} candidates (wait=${waitMs}ms)`);
 

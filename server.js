@@ -956,6 +956,14 @@ function formatHashRate(n) {
   return n + ' H/s';
 }
 
+function encodeChunksForWire(chunks) {
+  return chunks.map(c => ({
+    ...c,
+    range_start: c.range_start != null ? String(c.range_start) : c.range_start,
+    range_end: c.range_end != null ? String(c.range_end) : c.range_end,
+  }));
+}
+
 const serverStatus = {
   phase: 'idle',
   detail: 'Server booted',
@@ -1005,7 +1013,7 @@ function maybePushWork(workerId, reason = 'scheduler') {
     }
     safeSend(worker.ws, {
       type: 'work',
-      chunks,
+      chunks: encodeChunksForWire(chunks),
       charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
       packetRawData,
     }, 'work_push');
@@ -1225,7 +1233,7 @@ wss.on('connection', (ws) => {
         const sent = safeSend(ws, {
           type: 'work',
           solicited: true,
-          chunks,
+          chunks: encodeChunksForWire(chunks),
           charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
           packetRawData,
         }, 'work_reply');
@@ -1424,7 +1432,7 @@ app.post('/api/worker/request-work', (req, res) => {
   broadcastStats();
 
   res.json({
-    chunks,
+    chunks: encodeChunksForWire(chunks),
     charset: CHARSETS[chunks[0]?.charset] || CHARSETS.alnum,
     packetRawData,
   });
