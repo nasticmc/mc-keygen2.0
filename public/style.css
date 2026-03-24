@@ -747,3 +747,18 @@ select:focus, input[type="number"]:focus {
   line-height: 1.6;
 }
 
+
+.settings-row {
+  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+}
+
+.settings-row label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+}
