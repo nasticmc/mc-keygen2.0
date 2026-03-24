@@ -68,15 +68,43 @@ let lastWsMessageAt = 0;
 // ── HTTP Transport ──────────────────────────────────────────────────────────
 // All client→server communication uses HTTP POST. WebSocket is receive-only
 // (server pushes: stats, key_found, work pushes, broadcasts).
+
+// Compress a string to a gzip ArrayBuffer via the browser's CompressionStream API.
+// Returns null if unsupported or if compression increases size.
+const _canCompress = typeof CompressionStream !== 'undefined';
+async function _gzipString(str) {
+  if (!_canCompress) return null;
+  try {
+    const stream = new Blob([str]).stream().pipeThrough(new CompressionStream('gzip'));
+    const buf = await new Response(stream).arrayBuffer();
+    // Only use compressed form if it's actually smaller
+    return buf.byteLength < str.length ? buf : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Minimum payload size to bother attempting compression (bytes).
+const _COMPRESS_THRESHOLD = 256;
+
 async function apiPost(path, body) {
   const maxRetries = 3;
+  const jsonStr = JSON.stringify(body);
+
+  // Compress once before the retry loop — reuse the same buffer on retries.
+  let sendBody = jsonStr;
+  const headers = { 'Content-Type': 'application/json' };
+  if (jsonStr.length >= _COMPRESS_THRESHOLD) {
+    const compressed = await _gzipString(jsonStr);
+    if (compressed) {
+      sendBody = compressed;
+      headers['Content-Encoding'] = 'gzip';
+    }
+  }
+
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      const res = await fetch(path, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      const res = await fetch(path, { method: 'POST', headers, body: sendBody });
       if (res.ok) return res.json();
       if (res.status >= 500 && attempt < maxRetries - 1) {
         await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
@@ -1098,11 +1126,9 @@ async function runCrackingLoop() {
       const packetIds = [...new Set(chunks.map(c => c.packet_id))];
       clog(`received ${chunks.length} chunk(s) for packet [${packetIds}] — ${formatNumber(totalCandidates)} candidates (wait=${waitMs}ms)`);
 
-      // Pre-fetch next batch while GPU crunches this one
-      nextWorkPromise = fetchWork().catch(err => {
-        clog(`pre-fetch failed: ${err.message}`);
-        return { chunks: [] };
-      });
+      // Pre-fetch for next batch is deferred until after chunk-complete to avoid
+      // building up a backlog of unawaited POSTs that saturates Chrome's 6-connection
+      // HTTP/1.1 pool and hangs the tab.  See post-processChunks block below.
 
       setCrackingStatus(`Starting batch: ${chunks.length} chunk(s), ${formatNumber(totalCandidates)} candidates for packet ${packetIds.join(', ')}...`);
 
@@ -1196,18 +1222,33 @@ async function runCrackingLoop() {
         },
       }, currentCharset, packetRawData, { ...getGpuTuningSettings(), _decodeWorker: decodeWorker });
 
-      // Send batched chunk-complete POST (all chunks from this batch in one request)
-      if (pendingCompletions.chunkIds.length > 0) {
+      // Send batched chunk-complete POST and pre-fetch next work in parallel.
+      // chunk-complete is awaited so at most one is ever in-flight — prevents
+      // a backlog of unawaited POSTs saturating Chrome's 6-connection HTTP/1.1
+      // pool and hanging the tab.  Pre-fetch runs concurrently so the next
+      // iteration still gets work immediately.
+      {
         const extraPrefixCounts = Object.keys(pendingCompletions.prefixCounts).length > 0
           ? pendingCompletions.prefixCounts : undefined;
-        apiPost('/api/worker/chunk-complete', {
-          clientId: getClientId(),
-          chunkIds: pendingCompletions.chunkIds,
-          hashRate: pendingCompletions.hashRate,
-          prefixCounts: extraPrefixCounts,
-        }).catch(err => {
-          clog(`batch chunk-complete POST failed: ${err.message}`);
+
+        // Start pre-fetch now so it overlaps with the chunk-complete round-trip.
+        nextWorkPromise = fetchWork().catch(err => {
+          clog(`pre-fetch failed: ${err.message}`);
+          return { chunks: [] };
         });
+
+        if (pendingCompletions.chunkIds.length > 0) {
+          try {
+            await apiPost('/api/worker/chunk-complete', {
+              clientId: getClientId(),
+              chunkIds: pendingCompletions.chunkIds,
+              hashRate: pendingCompletions.hashRate,
+              prefixCounts: extraPrefixCounts,
+            });
+          } catch (err) {
+            clog(`batch chunk-complete POST failed: ${err.message}`);
+          }
+        }
       }
 
       const batchMs = Math.round(performance.now() - batchStart);
