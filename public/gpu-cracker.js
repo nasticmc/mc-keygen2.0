@@ -450,16 +450,44 @@ class GPUCracker {
     // entire work packet can produce millions of candidates and blow up
     // JSON.stringify() ("Invalid string length") when posting results.
     // Keep each POST bounded to avoid runaway memory and payload sizes.
-    const MATCH_FLUSH_SIZE = 2000;
+    const MATCH_FLUSH_SIZE = 25000;
     const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
+    const localPrefixCounts = new Map(); // packet_id → extra prefix count not yet reported to server
 
     const flushPendingMatches = (packetId, force = false) => {
       if (!onPrefixMatch) return;
       const list = pendingMatches.get(packetId);
       if (!list || list.length === 0) return;
       if (!force && list.length < MATCH_FLUSH_SIZE) return;
-      try { onPrefixMatch(packetId, list); } catch (_) { /* fire and forget */ }
+      const snapshot = list.slice();
       pendingMatches.set(packetId, []);
+
+      (async () => {
+        const rawHex = (packetRawData || {})[packetId];
+        if (!tuning.clientDecodeEnabled || !rawHex || typeof clientTryDecrypt === 'undefined') {
+          try { onPrefixMatch(packetId, snapshot); } catch (_) {}
+          return;
+        }
+        const parsed = parseMeshCorePacket(rawHex);
+        if (!parsed || parsed.payloadType !== 5 /* GROUP_TEXT */) {
+          try { onPrefixMatch(packetId, snapshot); } catch (_) {}
+          return;
+        }
+        let winner = null;
+        await Promise.all(snapshot.map(async m => {
+          if (winner) return;
+          const decoded = await clientTryDecrypt(rawHex, m.keyHex);
+          if (decoded && !winner) winner = { ...m, clientDecoded: decoded };
+        }));
+        if (winner) {
+          // Server will count 1 (the winner match) via prefix-match POST; report the rest here.
+          localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + snapshot.length - 1);
+          try { onPrefixMatch(packetId, [winner]); } catch (_) {}
+        } else {
+          // Server sees nothing; report the full count.
+          localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + snapshot.length);
+        }
+      })();
     };
 
     const collectMatches = (matches, chunk) => {
@@ -557,7 +585,7 @@ class GPUCracker {
     for (const [packetId] of pendingMatches) flushPendingMatches(packetId, true);
 
     if (completedChunkIds.size > 0 && onChunkComplete) {
-      try { onChunkComplete([...completedChunkIds], this.hashRate); } catch (_) { /* fire and forget */ }
+      try { onChunkComplete([...completedChunkIds], this.hashRate, localPrefixCounts); } catch (_) { /* fire and forget */ }
     }
 
     return { found: false };
@@ -645,16 +673,44 @@ class CPUCracker {
     let processedCandidates = 0;
 
     const completedChunkIds = [];
-    const MATCH_FLUSH_SIZE = 500;
+    const MATCH_FLUSH_SIZE = 25000;
     const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
+    const localPrefixCounts = new Map(); // packet_id → extra prefix count not yet reported to server
 
     const flushPendingMatches = (packetId, force = false) => {
       if (!onPrefixMatch) return;
       const list = pendingMatches.get(packetId);
       if (!list || list.length === 0) return;
       if (!force && list.length < MATCH_FLUSH_SIZE) return;
-      try { onPrefixMatch(packetId, list); } catch (_) { /* fire and forget */ }
+      const snapshot = list.slice();
       pendingMatches.set(packetId, []);
+
+      (async () => {
+        const rawHex = (packetRawData || {})[packetId];
+        if (!tuning.clientDecodeEnabled || !rawHex || typeof clientTryDecrypt === 'undefined') {
+          try { onPrefixMatch(packetId, snapshot); } catch (_) {}
+          return;
+        }
+        const parsed = parseMeshCorePacket(rawHex);
+        if (!parsed || parsed.payloadType !== 5 /* GROUP_TEXT */) {
+          try { onPrefixMatch(packetId, snapshot); } catch (_) {}
+          return;
+        }
+        let winner = null;
+        await Promise.all(snapshot.map(async m => {
+          if (winner) return;
+          const decoded = await clientTryDecrypt(rawHex, m.keyHex);
+          if (decoded && !winner) winner = { ...m, clientDecoded: decoded };
+        }));
+        if (winner) {
+          // Server will count 1 (the winner match) via prefix-match POST; report the rest here.
+          localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + snapshot.length - 1);
+          try { onPrefixMatch(packetId, [winner]); } catch (_) {}
+        } else {
+          // Server sees nothing; report the full count.
+          localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + snapshot.length);
+        }
+      })();
     };
 
     for (const chunk of chunks) {
@@ -709,7 +765,7 @@ class CPUCracker {
     for (const [packetId] of pendingMatches) flushPendingMatches(packetId, true);
 
     if (completedChunkIds.length > 0 && onChunkComplete) {
-      try { onChunkComplete(completedChunkIds, this.hashRate); } catch (_) { /* fire and forget */ }
+      try { onChunkComplete(completedChunkIds, this.hashRate, localPrefixCounts); } catch (_) { /* fire and forget */ }
     }
 
     return { found: false };
