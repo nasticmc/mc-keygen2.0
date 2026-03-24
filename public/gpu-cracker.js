@@ -448,7 +448,7 @@ class GPUCracker {
     // Accumulate prefix matches per packet_id and flush once per completed
     // work chunk instead of streaming batches mid-chunk.  This prevents the
     // decode worker from stalling and repeatedly falling back to the server.
-    const MATCH_FLUSH_SIZE = 50000; // safety cap per POST to avoid JSON.stringify blow-up
+    const MATCH_POST_SIZE = 50000; // max keys per POST to stay under 10 MB JSON limit
     const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
     const localPrefixCounts = new Map(); // packet_id → extra prefix count not yet reported to server
     const _fallbackPackets = new Set(); // packets where decode worker can't decode (skip worker on flush)
@@ -497,23 +497,21 @@ class GPUCracker {
       if (!list || list.length === 0) return;
       if (!force) return; // only flush at chunk boundaries
 
-      // Cap the POST size to avoid JSON.stringify blow-up; count the rest locally.
-      let toSend = list;
-      if (list.length > MATCH_FLUSH_SIZE) {
-        toSend = list.slice(0, MATCH_FLUSH_SIZE);
-        localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + (list.length - MATCH_FLUSH_SIZE));
-      }
       pendingMatches.set(packetId, []);
 
       const rawHex = (packetRawData || {})[packetId];
       if (_decodeWorker && tuning.clientDecodeEnabled && rawHex && !_fallbackPackets.has(packetId)) {
         // Offload decoding to the Web Worker — zero main-thread crypto work.
         const flushId = _flushCounter++;
-        _pendingFlushes.set(flushId, { packetId, candidates: toSend });
-        _decodeWorker.postMessage({ type: 'decode', id: flushId, rawHex, candidates: toSend });
+        _pendingFlushes.set(flushId, { packetId, candidates: list });
+        _decodeWorker.postMessage({ type: 'decode', id: flushId, rawHex, candidates: list });
       } else {
-        // No worker, decode disabled, or packet type not supported — send to server.
-        try { onPrefixMatch(packetId, toSend); } catch (_) {}
+        // No worker, decode disabled, or packet type not supported — send ALL to server
+        // in batches of MATCH_POST_SIZE to stay under the JSON body limit.
+        for (let off = 0; off < list.length; off += MATCH_POST_SIZE) {
+          const batch = list.slice(off, off + MATCH_POST_SIZE);
+          try { onPrefixMatch(packetId, batch); } catch (_) {}
+        }
       }
     };
 
@@ -712,7 +710,7 @@ class CPUCracker {
     let processedCandidates = 0;
 
     const completedChunkIds = [];
-    const MATCH_FLUSH_SIZE = 50000; // safety cap per POST to avoid JSON.stringify blow-up
+    const MATCH_POST_SIZE = 50000; // max keys per POST to stay under 10 MB JSON limit
     const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
     const localPrefixCounts = new Map(); // packet_id → extra prefix count not yet reported to server
     const _fallbackPackets = new Set(); // packets where decode worker can't decode
@@ -756,20 +754,20 @@ class CPUCracker {
       if (!list || list.length === 0) return;
       if (!force) return; // only flush at chunk boundaries
 
-      let toSend = list;
-      if (list.length > MATCH_FLUSH_SIZE) {
-        toSend = list.slice(0, MATCH_FLUSH_SIZE);
-        localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + (list.length - MATCH_FLUSH_SIZE));
-      }
       pendingMatches.set(packetId, []);
 
       const rawHex = (packetRawData || {})[packetId];
       if (_decodeWorker && tuning.clientDecodeEnabled && rawHex && !_fallbackPackets.has(packetId)) {
         const flushId = _flushCounter++;
-        _pendingFlushes.set(flushId, { packetId, candidates: toSend });
-        _decodeWorker.postMessage({ type: 'decode', id: flushId, rawHex, candidates: toSend });
+        _pendingFlushes.set(flushId, { packetId, candidates: list });
+        _decodeWorker.postMessage({ type: 'decode', id: flushId, rawHex, candidates: list });
       } else {
-        try { onPrefixMatch(packetId, toSend); } catch (_) {}
+        // No worker, decode disabled, or packet type not supported — send ALL to server
+        // in batches of MATCH_POST_SIZE to stay under the JSON body limit.
+        for (let off = 0; off < list.length; off += MATCH_POST_SIZE) {
+          const batch = list.slice(off, off + MATCH_POST_SIZE);
+          try { onPrefixMatch(packetId, batch); } catch (_) {}
+        }
       }
     };
 
