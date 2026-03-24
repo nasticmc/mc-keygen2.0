@@ -248,6 +248,9 @@ try { db.exec('ALTER TABLE packets ADD COLUMN keyspace_end INTEGER'); } catch {}
 try { db.exec('ALTER TABLE packets ADD COLUMN keyspace_start INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE packets ADD COLUMN chunk_rand_offset INTEGER DEFAULT 0'); } catch {}
 
+// ── Work Chunk Generation ───────────────────────────────────────────────────
+const CHUNK_SIZE = 128_000_000;
+
 // Migration: delete old "pending" rows (virtual chunk system no longer uses them)
 // and reset assigned rows on startup (workers are not connected yet).
 // Also rewind packet cursors so orphaned keyspace ranges get re-assigned.
@@ -745,9 +748,6 @@ function decodeAsync(hexData, channelKey, cb) {
 }
 
 for (let i = 0; i < DECODER_POOL_SIZE; i++) _decoderPool.push(_spawnDecoderWorker());
-
-// ── Work Chunk Generation ───────────────────────────────────────────────────
-const CHUNK_SIZE = 128_000_000;
 
 const CHARSETS = {
   alnum: 'abcdefghijklmnopqrstuvwxyz0123456789',
