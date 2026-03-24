@@ -454,6 +454,37 @@ class GPUCracker {
     const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
     const localPrefixCounts = new Map(); // packet_id → extra prefix count not yet reported to server
 
+    // Decode worker state — offloads clientTryDecrypt to a Web Worker so
+    // crypto.subtle microtasks never starve the GPU pipeline.
+    const _decodeWorker = tuning._decodeWorker || null;
+    let _flushCounter = 0;
+    const _pendingFlushes = new Map(); // flushId → { packetId, count }
+    let _drainResolve = null;
+
+    if (_decodeWorker) {
+      _decodeWorker.onmessage = (e) => {
+        const { id, winner, count, fallback } = e.data;
+        const flush = _pendingFlushes.get(id);
+        if (!flush) return;
+        _pendingFlushes.delete(id);
+
+        if (fallback) {
+          // Worker couldn't decode (wrong packet type) — send all to server
+          try { onPrefixMatch(flush.packetId, flush.candidates); } catch (_) {}
+        } else if (winner) {
+          localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count - 1);
+          try { onPrefixMatch(flush.packetId, [winner]); } catch (_) {}
+        } else {
+          localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count);
+        }
+
+        if (_pendingFlushes.size === 0 && _drainResolve) {
+          _drainResolve();
+          _drainResolve = null;
+        }
+      };
+    }
+
     const flushPendingMatches = (packetId, force = false) => {
       if (!onPrefixMatch) return;
       const list = pendingMatches.get(packetId);
@@ -462,32 +493,16 @@ class GPUCracker {
       const snapshot = list.slice();
       pendingMatches.set(packetId, []);
 
-      (async () => {
-        const rawHex = (packetRawData || {})[packetId];
-        if (!tuning.clientDecodeEnabled || !rawHex || typeof clientTryDecrypt === 'undefined') {
-          try { onPrefixMatch(packetId, snapshot); } catch (_) {}
-          return;
-        }
-        const parsed = parseMeshCorePacket(rawHex);
-        if (!parsed || parsed.payloadType !== 5 /* GROUP_TEXT */) {
-          try { onPrefixMatch(packetId, snapshot); } catch (_) {}
-          return;
-        }
-        let winner = null;
-        await Promise.all(snapshot.map(async m => {
-          if (winner) return;
-          const decoded = await clientTryDecrypt(rawHex, m.keyHex);
-          if (decoded && !winner) winner = { ...m, clientDecoded: decoded };
-        }));
-        if (winner) {
-          // Server will count 1 (the winner match) via prefix-match POST; report the rest here.
-          localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + snapshot.length - 1);
-          try { onPrefixMatch(packetId, [winner]); } catch (_) {}
-        } else {
-          // Server sees nothing; report the full count.
-          localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + snapshot.length);
-        }
-      })();
+      const rawHex = (packetRawData || {})[packetId];
+      if (_decodeWorker && tuning.clientDecodeEnabled && rawHex) {
+        // Offload decoding to the Web Worker — zero main-thread crypto work.
+        const flushId = _flushCounter++;
+        _pendingFlushes.set(flushId, { packetId, candidates: snapshot });
+        _decodeWorker.postMessage({ type: 'decode', id: flushId, rawHex, candidates: snapshot });
+      } else {
+        // No worker or decode disabled — send matches directly to server.
+        try { onPrefixMatch(packetId, snapshot); } catch (_) {}
+      }
     };
 
     const collectMatches = (matches, chunk) => {
@@ -584,6 +599,12 @@ class GPUCracker {
     // decryption while completion updates are being reported.
     for (const [packetId] of pendingMatches) flushPendingMatches(packetId, true);
 
+    // Wait for all in-flight decode worker responses before reporting
+    // chunk-complete, so localPrefixCounts are accurate.
+    if (_decodeWorker && _pendingFlushes.size > 0) {
+      await new Promise(resolve => { _drainResolve = resolve; });
+    }
+
     if (completedChunkIds.size > 0 && onChunkComplete) {
       try { onChunkComplete([...completedChunkIds], this.hashRate, localPrefixCounts); } catch (_) { /* fire and forget */ }
     }
@@ -677,6 +698,35 @@ class CPUCracker {
     const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
     const localPrefixCounts = new Map(); // packet_id → extra prefix count not yet reported to server
 
+    // Decode worker state (same pattern as GPUCracker)
+    const _decodeWorker = tuning._decodeWorker || null;
+    let _flushCounter = 0;
+    const _pendingFlushes = new Map();
+    let _drainResolve = null;
+
+    if (_decodeWorker) {
+      _decodeWorker.onmessage = (e) => {
+        const { id, winner, count, fallback } = e.data;
+        const flush = _pendingFlushes.get(id);
+        if (!flush) return;
+        _pendingFlushes.delete(id);
+
+        if (fallback) {
+          try { onPrefixMatch(flush.packetId, flush.candidates); } catch (_) {}
+        } else if (winner) {
+          localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count - 1);
+          try { onPrefixMatch(flush.packetId, [winner]); } catch (_) {}
+        } else {
+          localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count);
+        }
+
+        if (_pendingFlushes.size === 0 && _drainResolve) {
+          _drainResolve();
+          _drainResolve = null;
+        }
+      };
+    }
+
     const flushPendingMatches = (packetId, force = false) => {
       if (!onPrefixMatch) return;
       const list = pendingMatches.get(packetId);
@@ -685,32 +735,14 @@ class CPUCracker {
       const snapshot = list.slice();
       pendingMatches.set(packetId, []);
 
-      (async () => {
-        const rawHex = (packetRawData || {})[packetId];
-        if (!tuning.clientDecodeEnabled || !rawHex || typeof clientTryDecrypt === 'undefined') {
-          try { onPrefixMatch(packetId, snapshot); } catch (_) {}
-          return;
-        }
-        const parsed = parseMeshCorePacket(rawHex);
-        if (!parsed || parsed.payloadType !== 5 /* GROUP_TEXT */) {
-          try { onPrefixMatch(packetId, snapshot); } catch (_) {}
-          return;
-        }
-        let winner = null;
-        await Promise.all(snapshot.map(async m => {
-          if (winner) return;
-          const decoded = await clientTryDecrypt(rawHex, m.keyHex);
-          if (decoded && !winner) winner = { ...m, clientDecoded: decoded };
-        }));
-        if (winner) {
-          // Server will count 1 (the winner match) via prefix-match POST; report the rest here.
-          localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + snapshot.length - 1);
-          try { onPrefixMatch(packetId, [winner]); } catch (_) {}
-        } else {
-          // Server sees nothing; report the full count.
-          localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + snapshot.length);
-        }
-      })();
+      const rawHex = (packetRawData || {})[packetId];
+      if (_decodeWorker && tuning.clientDecodeEnabled && rawHex) {
+        const flushId = _flushCounter++;
+        _pendingFlushes.set(flushId, { packetId, candidates: snapshot });
+        _decodeWorker.postMessage({ type: 'decode', id: flushId, rawHex, candidates: snapshot });
+      } else {
+        try { onPrefixMatch(packetId, snapshot); } catch (_) {}
+      }
     };
 
     for (const chunk of chunks) {
@@ -763,6 +795,11 @@ class CPUCracker {
 
     // Flush leftover matches per packet
     for (const [packetId] of pendingMatches) flushPendingMatches(packetId, true);
+
+    // Wait for in-flight decode worker responses before chunk-complete
+    if (_decodeWorker && _pendingFlushes.size > 0) {
+      await new Promise(resolve => { _drainResolve = resolve; });
+    }
 
     if (completedChunkIds.length > 0 && onChunkComplete) {
       try { onChunkComplete(completedChunkIds, this.hashRate, localPrefixCounts); } catch (_) { /* fire and forget */ }
