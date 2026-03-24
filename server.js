@@ -11,7 +11,13 @@ const { MeshCorePacketDecoder } = require('@michaelhart/meshcore-decoder');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({
+  server,
+  perMessageDeflate: {
+    zlibDeflateOptions: { level: 1 },  // Fast compression (level 1)
+    threshold: 256,  // Only compress messages > 256 bytes
+  },
+});
 
 app.use(compression());
 app.use(express.json({ limit: '10mb' }));
