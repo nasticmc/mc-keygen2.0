@@ -6,7 +6,7 @@ Distributed WebGPU hash cracking tool. Node.js/Express backend distributes SHA-2
 
 ## Tech Stack
 
-- **Backend:** Node.js, Express, `ws` (WebSocket), `better-sqlite3`
+- **Backend:** Node.js, Express, `ws` (WebSocket), `better-sqlite3`, `@michaelhart/meshcore-decoder`
 - **Frontend:** Vanilla HTML/CSS/JS (no framework), WebGPU (WGSL compute shaders)
 - **Database:** SQLite file (`keygen.db`, gitignored)
 
@@ -14,11 +14,14 @@ Distributed WebGPU hash cracking tool. Node.js/Express backend distributes SHA-2
 
 ```
 server.js              — Express server, REST API, WebSocket, work distribution
+decoder-worker.js      — MeshCorePacketDecoder worker thread for async decoding
 public/
-  index.html           — Single page with 4-tab layout
+  index.html           — Single page with 5-tab layout
   style.css            — Dark theme styles
   app.js               — Frontend logic, tab navigation, API calls, cracking loop
   gpu-cracker.js       — WebGPU compute shader (SHA-256) + CPU fallback
+  client-decoder.js    — Client-side GroupText decoder (Web Crypto API)
+  decode-worker.js     — Web Worker wrapper for client-decoder.js
 ```
 
 ## Commands
@@ -54,7 +57,7 @@ Four tables:
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/packets` | List all packets |
-| POST | `/api/packets` | Upload a packet (hex data) |
+| POST | `/api/packets` | Upload a GroupText packet (hex data) — rejects non-GroupText |
 | DELETE | `/api/packets/:id` | Delete packet and all associated work |
 | POST | `/api/packets/:id/retry` | Re-queue cracking with new config |
 | POST | `/api/packets/:id/auto-decrypt` | Try all candidate keys for a packet |
@@ -68,6 +71,14 @@ Four tables:
 | POST | `/api/decrypt` | Try to decrypt a packet with a given key |
 | GET | `/api/decoder-status` | Whether the MeshCore packet decoder is loaded |
 | GET | `/api/packets/decoded` | List packets that have been successfully decrypted |
+| POST | `/api/packets/:id/decode` | Re-decode a cracked packet |
+| POST | `/api/derive` | Derive key and prefix from a channel name |
+| GET | `/api/candidates` | List all candidates (limit 100) |
+| POST | `/api/worker/register` | Register a worker |
+| POST | `/api/worker/request-work` | Request work chunks (max 64) |
+| POST | `/api/worker/chunk-complete` | Report completed chunk(s) |
+| POST | `/api/worker/prefix-match` | Report a single prefix match |
+| POST | `/api/worker/hashrate` | Update worker hash rate |
 
 ## Common Modification Patterns
 
@@ -83,16 +94,13 @@ Four tables:
 
 | Setting | Value | Location |
 |---------|-------|----------|
-| `CHUNK_SIZE` | 128 000 000 candidates | `server.js:644` |
-| Default work request (desktop) | 4 chunks | `index.html` (HTML value) |
-| Default work request (mobile) | 1 chunk | `app.js:1012` |
-| Work request max (UI) | 64 chunks | `index.html` |
-| Min-ahead floor | 4 chunks | `app.js:203` |
-| Min-ahead ceiling | 16 chunks | `app.js:203` |
-| Stale chunk timeout | 5 minutes | `server.js:333` |
-| Heartbeat interval | 15 s | `server.js:731` |
-| Stats broadcast interval | 2 s | `server.js:910` |
-| Safety-net top-up interval | 30 s | `app.js:106` |
+| `CHUNK_SIZE` | 128 000 000 candidates | `server.js:255` |
+| Default work request (desktop) | 16 chunks | `index.html:47` |
+| Default work request (mobile) | 1 chunk | `app.js:278` |
+| Work request max (UI) | 64 chunks | `index.html:47` |
+| Stale chunk timeout | 5 minutes | `server.js:371` |
+| Heartbeat interval | 15 s | `server.js:837` |
+| Stats broadcast interval | 2 s | `server.js:1024` |
 
 ## Architecture Notes
 

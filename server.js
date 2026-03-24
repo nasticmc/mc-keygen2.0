@@ -248,6 +248,9 @@ try { db.exec('ALTER TABLE packets ADD COLUMN keyspace_end INTEGER'); } catch {}
 try { db.exec('ALTER TABLE packets ADD COLUMN keyspace_start INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE packets ADD COLUMN chunk_rand_offset INTEGER DEFAULT 0'); } catch {}
 
+// ── Constants ────────────────────────────────────────────────────────────────
+const PAYLOAD_TYPE_GROUP_TEXT = 5;
+
 // ── Work Chunk Generation ───────────────────────────────────────────────────
 const CHUNK_SIZE = 128_000_000;
 
@@ -1077,7 +1080,7 @@ wss.on('connection', (ws) => {
 
   ws.on('message', (raw) => {
     let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
+    try { msg = JSON.parse(raw); } catch { console.warn('[ws] malformed JSON from', wName(workerId)); return; }
 
     // Any successfully parsed message proves the client is still responsive,
     // even if it skipped websocket pong frames while busy processing work.
@@ -1480,6 +1483,7 @@ app.post('/api/packets/:id/decode', async (req, res) => {
 });
 
 // Upload a packet — decode it with meshcoredecoder to extract channelHash
+// Only GroupText packets (payloadType 5) are accepted for cracking.
 app.post('/api/packets', (req, res) => {
   const { rawData, crackConfig } = req.body;
   if (!rawData) return res.status(400).json({ error: 'rawData required' });
@@ -1487,28 +1491,29 @@ app.post('/api/packets', (req, res) => {
 
   const hexData = rawData.trim().replace(/\s+/g, '');
 
-  // Decode the packet to extract channelHash
-  let decoded = null;
-  let channelHash = null;
-  let prefix = null;
+  // Validate hex input
+  if (!/^[0-9a-fA-F]+$/.test(hexData)) return res.status(400).json({ error: 'Invalid hex data' });
+  if (hexData.length % 2 !== 0) return res.status(400).json({ error: 'Hex data must have even length' });
+  if (hexData.length < 4) return res.status(400).json({ error: 'Packet too short' });
 
-  try {
-    decoded = extractChannelHash(hexData);
-    channelHash = decoded.channelHash;
-    if (channelHash !== null && channelHash !== undefined) {
-      // Decoder may return channelHash as a number (decimal) or a hex string
-      prefix = typeof channelHash === 'number' ? channelHash : parseInt(channelHash, 16);
-    }
-  } catch (err) {
-    console.error('Decoder error:', err.message);
+  // Decode the packet to extract channelHash and verify it's GroupText
+  const decoded = extractChannelHash(hexData);
+
+  if (decoded.error) {
+    console.error('Decoder error:', decoded.error);
+    return res.status(400).json({ error: 'Failed to decode packet: ' + decoded.error });
   }
 
-  // If decoder couldn't extract channelHash, fall back to raw first byte
-  if (prefix === null) {
-    const hexMatch = hexData.match(/^([0-9a-fA-F]{2})/);
-    if (hexMatch) {
-      prefix = parseInt(hexMatch[1], 16);
-    }
+  if (decoded.payloadType !== PAYLOAD_TYPE_GROUP_TEXT) {
+    return res.status(400).json({ error: `Only GroupText packets (type ${PAYLOAD_TYPE_GROUP_TEXT}) are supported for cracking. Got type ${decoded.payloadType}.` });
+  }
+
+  let channelHash = decoded.channelHash;
+  let prefix = null;
+
+  if (channelHash !== null && channelHash !== undefined) {
+    // Decoder may return channelHash as a number (decimal) or a hex string
+    prefix = typeof channelHash === 'number' ? channelHash : parseInt(channelHash, 16);
   }
 
   if (prefix === null) {

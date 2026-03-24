@@ -1,12 +1,14 @@
 # MC-Keygen 2.0
 
-Distributed hash cracking tool that uses WebGPU to accelerate MD5 brute-force across multiple browser clients. A central server breaks work into chunks and distributes them to connected workers via WebSocket.
+Distributed WebGPU hash cracking tool for MeshCore GroupText packets. A Node.js/Express backend distributes SHA-256 brute-force work chunks to browser clients that crack using WebGPU compute shaders.
 
 ## Features
 
-- **WebGPU Acceleration** — WGSL compute shaders run MD5 brute-force on the GPU with automatic CPU fallback
-- **Distributed Cracking** — Server splits the keyspace into 1M-key chunks, assigns them to connected browser workers, and reassigns stale chunks after 5 minutes
+- **WebGPU Acceleration** — WGSL compute shaders run SHA-256 key derivation on the GPU with automatic CPU fallback
+- **Distributed Cracking** — Server splits the keyspace into 128M-candidate chunks, assigns them to connected browser workers, and recycles stale chunks after 5 minutes
+- **MeshCore Packet Decoding** — Packets are decoded via `@michaelhart/meshcore-decoder` to extract the channel hash; only GroupText (type 5) packets are accepted
 - **Known Key Matching** — Uploaded packets are checked against a database of known channel keys before queuing for cracking
+- **Client-side Decoding** — Optional in-browser GroupText decryption using Web Crypto API for faster validation
 - **Real-time Dashboard** — Live stats, progress tracking, hash rates, and worker status via WebSocket
 
 ## Quick Start
@@ -21,42 +23,54 @@ Open `http://localhost:3000` in a browser. For distributed cracking, open the UR
 ## Architecture
 
 ```
-┌─────────────┐     WebSocket      ┌─────────────────┐
-│  Browser 1  │◄──────────────────►│                 │
-│  (WebGPU)   │                    │   Express       │
-├─────────────┤     WebSocket      │   Server        │
-│  Browser 2  │◄──────────────────►│                 │
-│  (WebGPU)   │                    │  ┌───────────┐  │
-├─────────────┤     WebSocket      │  │  SQLite   │  │
-│  Browser N  │◄──────────────────►│  │  Database │  │
-│  (CPU)      │                    │  └───────────┘  │
-└─────────────┘                    └─────────────────┘
+┌─────────────┐     HTTP + WS        ┌─────────────────┐
+│  Browser 1  │◄────────────────────►│                 │
+│  (WebGPU)   │                      │   Express       │
+├─────────────┤     HTTP + WS        │   Server        │
+│  Browser 2  │◄────────────────────►│                 │
+│  (WebGPU)   │                      │  ┌───────────┐  │
+├─────────────┤     HTTP + WS        │  │  SQLite   │  │
+│  Browser N  │◄────────────────────►│  │  Database │  │
+│  (CPU)      │                      │  └───────────┘  │
+└─────────────┘                      └─────────────────┘
 ```
+
+Work distribution uses HTTP (POST `/api/worker/request-work`). WebSocket is used for real-time stats, notifications, and worker registration.
 
 ### Server (`server.js`)
 
 - **Express** serves the static frontend and REST API
-- **WebSocket** handles real-time work distribution and result reporting
-- **SQLite** (via `better-sqlite3`) stores packets, known channels, and work chunks
-- Work chunks cover a 256M keyspace split into 1M-key segments
+- **WebSocket** handles real-time worker registration, stats broadcast, and key-found notifications
+- **SQLite** (via `better-sqlite3`) stores packets, known channels, work chunks, and candidate keys
+- **MeshCore Decoder** (`@michaelhart/meshcore-decoder`) parses and decrypts packets via a worker-thread pool
+- **Virtual chunk system** — work chunks are computed on-the-fly from packet keyspace math, not pre-generated as rows
 
-### Frontend (3 Tabs)
+### Frontend (5 Tabs)
 
 | Tab | Purpose |
 |-----|---------|
-| **Upload** | Paste raw packet hex data. Auto-checks against known keys before queuing. |
-| **Cracking** | View queue stats, progress bar, connected workers, and hash rates. Start/stop cracking. |
-| **Known Channels** | Manage known channel names with their hashes, keys, and prefixes. Adding a channel name auto-generates key and prefix. |
+| **Upload Packets** | Paste raw GroupText packet hex data. Auto-checks against known keys before queuing. |
+| **Cracking Queue** | View queue stats, progress, connected workers, hash rates. Start/stop cracking. |
+| **Known Channels** | Manage known channel names with their hashes, keys, and prefixes. |
+| **Packet Decoder** | Decode/decrypt packets manually with a given key. |
+| **Decoded Packets** | View packets that have been successfully decrypted. |
 
 ### WebGPU Cracker (`public/gpu-cracker.js`)
 
 - WGSL compute shader with 256-thread workgroups
-- Processes sub-batches of 64K candidates for UI responsiveness
-- Falls back to a pure JavaScript MD5 implementation when WebGPU is unavailable
+- ~16.7M candidates per GPU dispatch (65535 workgroups × 256 threads)
+- Ping-pong double buffering hides GPU read-back latency
+- Falls back to a pure JavaScript SHA-256 implementation when WebGPU is unavailable
+
+### Client Decoder (`public/client-decoder.js`)
+
+- Decodes GroupText packets using Web Crypto API only (no extra dependencies)
+- AES-128 ECB decryption + HMAC-SHA256 verification
+- Runs in a dedicated Web Worker (`public/decode-worker.js`)
 
 ## Performance & Scaling
 
-See `BACKEND_SCALING_PLAN.md` for an investigation and phased plan to reduce websocket assignment latency, improve fairness across workers, and evaluate migration paths beyond Node.js.
+See `BACKEND_SCALING_PLAN.md` for an investigation and phased plan to reduce assignment latency, improve fairness across workers, and evaluate migration paths beyond Node.js.
 
 ## API
 
@@ -65,8 +79,21 @@ See `BACKEND_SCALING_PLAN.md` for an investigation and phased plan to reduce web
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/api/packets` | List all packets |
-| `POST` | `/api/packets` | Upload a packet (`{ rawData: string }`) |
-| `DELETE` | `/api/packets/:id` | Delete a packet and its work chunks |
+| `POST` | `/api/packets` | Upload a GroupText packet (`{ rawData, crackConfig? }`) |
+| `DELETE` | `/api/packets/:id` | Delete a packet and all associated work |
+| `POST` | `/api/packets/:id/retry` | Re-queue cracking with new config |
+| `POST` | `/api/packets/:id/auto-decrypt` | Try all candidate keys for a packet |
+| `POST` | `/api/packets/:id/decode` | Re-decode a cracked packet |
+| `GET` | `/api/packets/decoded` | List successfully decrypted packets |
+
+### Decoding & Decryption
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/decode` | Decode a packet without saving |
+| `POST` | `/api/decrypt` | Try to decrypt a packet with a given key |
+| `POST` | `/api/derive` | Derive key and prefix from a channel name |
+| `GET` | `/api/decoder-status` | MeshCore decoder availability and version |
 
 ### Known Channels
 
@@ -76,33 +103,60 @@ See `BACKEND_SCALING_PLAN.md` for an investigation and phased plan to reduce web
 | `POST` | `/api/channels` | Add a channel (`{ channelName, hash?, key?, prefix? }`) |
 | `DELETE` | `/api/channels/:id` | Delete a known channel |
 
-### Stats
+### Candidates
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/api/stats` | Queue stats and connected worker info |
+| `GET` | `/api/candidates/:packetId` | List candidate keys for a packet |
+| `GET` | `/api/candidates` | List all candidates (limit 100) |
+
+### Stats & Config
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/stats` | Queue stats, worker info, hash rates |
+| `GET` | `/api/config` | Cracker config (chunk size, charsets) |
+
+### Worker (HTTP-based work distribution)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/worker/register` | Register a worker |
+| `POST` | `/api/worker/request-work` | Request work chunks (max 64) |
+| `POST` | `/api/worker/chunk-complete` | Report completed chunk(s) |
+| `POST` | `/api/worker/prefix-match` | Report a single prefix match |
+| `POST` | `/api/worker/hashrate` | Update worker hash rate |
 
 ### WebSocket Messages
 
 **Client → Server:**
 
-| Type | Fields | Description |
-|------|--------|-------------|
-| `request_work` | `count` | Request N work chunks |
-| `chunk_complete` | `chunkId`, `hashRate` | Report a finished chunk |
-| `key_found` | `packetId`, `key`, `channelName?` | Report a cracked key |
-| `hashrate_update` | `hashRate` | Update worker hash rate |
+| Type | Description |
+|------|-------------|
+| `worker_register` | Register worker with clientId |
+| `request_work` | Request N work chunks |
+| `chunk_complete` | Report finished chunk(s) with hash rate |
+| `prefix_match` | Report a single prefix match candidate |
+| `prefix_match_batch` | Report a batch of prefix matches |
+| `hashrate_update` | Update worker hash rate |
+| `keepalive` | Application-level ping |
 
 **Server → Client:**
 
-| Type | Fields | Description |
-|------|--------|-------------|
-| `work` | `chunks[]` | Assigned work chunks |
-| `stats` | `pending`, `assigned`, `completed`, `total` | Queue statistics |
-| `worker_count` | `count` | Number of connected workers |
-| `key_found` | `packetId`, `key` | Broadcast when a key is cracked |
-| `packets` | `packets[]` | Updated packet list |
-| `channels` | `channels[]` | Updated channel list |
+| Type | Description |
+|------|-------------|
+| `worker_hello` | Acknowledge registration with workerId |
+| `server_status` | Server status message |
+| `work` | Assigned work chunks with packet raw data |
+| `stats` | Queue statistics, active job stats, hash rates |
+| `worker_count` | Number of connected workers |
+| `worker_update` | Individual worker hash rate update |
+| `worker_removed` | Worker disconnected |
+| `key_found` | Broadcast when a key is cracked |
+| `candidate_found` | Broadcast when a candidate key is found |
+| `packets` | Updated packet list |
+| `candidates` | Updated candidate list |
+| `channels` | Updated channel list |
 
 ## Configuration
 
@@ -114,14 +168,18 @@ Internal tuning constants in `server.js`:
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `CHUNK_SIZE` | `1,000,000` | Keys per work chunk |
-| `TOTAL_KEYSPACE` | `256,000,000` | Total keyspace to search |
+| `CHUNK_SIZE` | `128,000,000` | Candidates per work chunk |
+| `PAYLOAD_TYPE_GROUP_TEXT` | `5` | Only this packet type is accepted |
+| `HEARTBEAT_INTERVAL_MS` | `15,000` | WebSocket ping interval (ms) |
+| `HEARTBEAT_MISS_LIMIT` | `4` | Missed pings before disconnect |
+| `WS_MAX_BUFFERED_BYTES` | `8 MB` | WebSocket backpressure threshold |
 
 ## Requirements
 
 - Node.js 18+
 - A browser with WebGPU support (Chrome 113+, Edge 113+) for GPU acceleration
 - Falls back to CPU cracking in unsupported browsers
+- WebGPU requires HTTPS in production (localhost is exempt)
 
 ## License
 
