@@ -68,15 +68,43 @@ let lastWsMessageAt = 0;
 // ── HTTP Transport ──────────────────────────────────────────────────────────
 // All client→server communication uses HTTP POST. WebSocket is receive-only
 // (server pushes: stats, key_found, work pushes, broadcasts).
+
+// Compress a string to a gzip ArrayBuffer via the browser's CompressionStream API.
+// Returns null if unsupported or if compression increases size.
+const _canCompress = typeof CompressionStream !== 'undefined';
+async function _gzipString(str) {
+  if (!_canCompress) return null;
+  try {
+    const stream = new Blob([str]).stream().pipeThrough(new CompressionStream('gzip'));
+    const buf = await new Response(stream).arrayBuffer();
+    // Only use compressed form if it's actually smaller
+    return buf.byteLength < str.length ? buf : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Minimum payload size to bother attempting compression (bytes).
+const _COMPRESS_THRESHOLD = 256;
+
 async function apiPost(path, body) {
   const maxRetries = 3;
+  const jsonStr = JSON.stringify(body);
+
+  // Compress once before the retry loop — reuse the same buffer on retries.
+  let sendBody = jsonStr;
+  const headers = { 'Content-Type': 'application/json' };
+  if (jsonStr.length >= _COMPRESS_THRESHOLD) {
+    const compressed = await _gzipString(jsonStr);
+    if (compressed) {
+      sendBody = compressed;
+      headers['Content-Encoding'] = 'gzip';
+    }
+  }
+
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      const res = await fetch(path, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      const res = await fetch(path, { method: 'POST', headers, body: sendBody });
       if (res.ok) return res.json();
       if (res.status >= 500 && attempt < maxRetries - 1) {
         await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));

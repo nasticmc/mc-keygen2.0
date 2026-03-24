@@ -3,6 +3,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const { Worker } = require('worker_threads');
 const os = require('os');
+const zlib = require('zlib');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
 const path = require('path');
@@ -20,6 +21,28 @@ const wss = new WebSocketServer({
 });
 
 app.use(compression());
+
+// Decompress gzip-encoded request bodies sent by clients before express.json() parses them.
+// Clients send Content-Encoding: gzip to reduce upload size on chunk-complete / prefix-match POSTs.
+app.use((req, res, next) => {
+  if (req.headers['content-encoding'] !== 'gzip') return next();
+  const chunks = [];
+  req.on('data', chunk => chunks.push(chunk));
+  req.on('end', () => {
+    zlib.gunzip(Buffer.concat(chunks), (err, decompressed) => {
+      if (err) return res.status(400).json({ error: 'Failed to decompress request body' });
+      try {
+        req.body = JSON.parse(decompressed.toString('utf8'));
+        req._body = true; // tell body-parser it's already parsed
+        next();
+      } catch (parseErr) {
+        res.status(400).json({ error: 'Invalid JSON in decompressed body' });
+      }
+    });
+  });
+  req.on('error', next);
+});
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
