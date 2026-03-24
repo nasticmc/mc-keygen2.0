@@ -942,6 +942,8 @@ async function runCrackingLoop() {
 
   // Pre-fetch next batch via HTTP while GPU processes current one
   let nextWorkPromise = null;
+  // Cache raw packet data across batches — server only sends it once per session.
+  const cachedPacketRawData = {};
 
   try {
     clog('cracking loop started (HTTP mode)');
@@ -964,7 +966,9 @@ async function runCrackingLoop() {
       const waitMs = Math.round(performance.now() - t0);
 
       const chunks = response.chunks || [];
-      const packetRawData = response.packetRawData || {};
+      // Merge newly received raw data into the cache, then use the full cache.
+      Object.assign(cachedPacketRawData, response.packetRawData || {});
+      const packetRawData = cachedPacketRawData;
       if (response.charset) currentCharset = response.charset;
 
       if (chunks.length === 0) {
