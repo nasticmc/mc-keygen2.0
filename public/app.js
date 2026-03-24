@@ -1021,8 +1021,10 @@ async function runCrackingLoop() {
             clog(`prefix-match POST failed: ${err.message}`);
           });
         },
-        onChunkComplete: (chunkIds, hashRate) => {
-          apiPost('/api/worker/chunk-complete', { clientId: getClientId(), chunkIds, hashRate }).catch(err => {
+        onChunkComplete: (chunkIds, hashRate, prefixCounts) => {
+          const extraPrefixCounts = prefixCounts && prefixCounts.size > 0
+            ? Object.fromEntries(prefixCounts) : undefined;
+          apiPost('/api/worker/chunk-complete', { clientId: getClientId(), chunkIds, hashRate, prefixCounts: extraPrefixCounts }).catch(err => {
             clog(`chunk-complete POST failed: ${err.message}`);
           });
         },

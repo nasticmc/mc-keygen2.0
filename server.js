@@ -1357,6 +1357,13 @@ app.post('/api/worker/chunk-complete', (req, res) => {
       ? Math.max(1, Math.min(16, Math.ceil(newRate * 10 / CHUNK_SIZE)))
       : worker.desiredInFlight;
   }
+  const { prefixCounts } = req.body;
+  if (prefixCounts && typeof prefixCounts === 'object') {
+    for (const [packetId, count] of Object.entries(prefixCounts)) {
+      const id = parseInt(packetId, 10);
+      if (Number.isFinite(id) && count > 0) _sessionIncr(_sessionPrefixesFound, id, count);
+    }
+  }
   const remainingAssigned = stmts.countAssignedToWorker.get(workerId)?.cnt || 0;
   console.log(`[http-done] ${wName(workerId)} chunks=${chunkIds.length} completed_now=${completedNow} remaining=${remainingAssigned} rate=${formatHashRate(hashRate || 0)}${completionNote}`);
   broadcastStats();

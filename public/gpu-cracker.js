@@ -452,6 +452,7 @@ class GPUCracker {
     // Keep each POST bounded to avoid runaway memory and payload sizes.
     const MATCH_FLUSH_SIZE = 2000;
     const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
+    const localPrefixCounts = new Map(); // packet_id → extra prefix count not yet reported to server
 
     const flushPendingMatches = (packetId, force = false) => {
       if (!onPrefixMatch) return;
@@ -479,7 +480,12 @@ class GPUCracker {
           if (decoded && !winner) winner = { ...m, clientDecoded: decoded };
         }));
         if (winner) {
+          // Server will count 1 (the winner match) via prefix-match POST; report the rest here.
+          localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + snapshot.length - 1);
           try { onPrefixMatch(packetId, [winner]); } catch (_) {}
+        } else {
+          // Server sees nothing; report the full count.
+          localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + snapshot.length);
         }
       })();
     };
@@ -579,7 +585,7 @@ class GPUCracker {
     for (const [packetId] of pendingMatches) flushPendingMatches(packetId, true);
 
     if (completedChunkIds.size > 0 && onChunkComplete) {
-      try { onChunkComplete([...completedChunkIds], this.hashRate); } catch (_) { /* fire and forget */ }
+      try { onChunkComplete([...completedChunkIds], this.hashRate, localPrefixCounts); } catch (_) { /* fire and forget */ }
     }
 
     return { found: false };
@@ -669,6 +675,7 @@ class CPUCracker {
     const completedChunkIds = [];
     const MATCH_FLUSH_SIZE = 500;
     const pendingMatches = new Map(); // packet_id → [{channelName, keyHex, prefixHex}]
+    const localPrefixCounts = new Map(); // packet_id → extra prefix count not yet reported to server
 
     const flushPendingMatches = (packetId, force = false) => {
       if (!onPrefixMatch) return;
@@ -696,7 +703,12 @@ class CPUCracker {
           if (decoded && !winner) winner = { ...m, clientDecoded: decoded };
         }));
         if (winner) {
+          // Server will count 1 (the winner match) via prefix-match POST; report the rest here.
+          localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + snapshot.length - 1);
           try { onPrefixMatch(packetId, [winner]); } catch (_) {}
+        } else {
+          // Server sees nothing; report the full count.
+          localPrefixCounts.set(packetId, (localPrefixCounts.get(packetId) || 0) + snapshot.length);
         }
       })();
     };
@@ -753,7 +765,7 @@ class CPUCracker {
     for (const [packetId] of pendingMatches) flushPendingMatches(packetId, true);
 
     if (completedChunkIds.length > 0 && onChunkComplete) {
-      try { onChunkComplete(completedChunkIds, this.hashRate); } catch (_) { /* fire and forget */ }
+      try { onChunkComplete(completedChunkIds, this.hashRate, localPrefixCounts); } catch (_) { /* fire and forget */ }
     }
 
     return { found: false };
