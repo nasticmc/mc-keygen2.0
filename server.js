@@ -6,12 +6,20 @@ const os = require('os');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
 const path = require('path');
+const compression = require('compression');
 const { MeshCorePacketDecoder } = require('@michaelhart/meshcore-decoder');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({
+  server,
+  perMessageDeflate: {
+    zlibDeflateOptions: { level: 1 },  // Fast compression (level 1)
+    threshold: 256,  // Only compress messages > 256 bytes
+  },
+});
 
+app.use(compression());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -349,6 +357,8 @@ try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_ck_packet_key ON candidate_
 const stmts = {
   insertPacket: db.prepare('INSERT INTO packets (raw_data, prefix, channel_hash, decoded_json, charset, min_len, max_len) VALUES (?, ?, ?, ?, ?, ?, ?)'),
   getPackets: db.prepare('SELECT * FROM packets ORDER BY created_at DESC'),
+  getPacketsSlim: db.prepare('SELECT id, prefix, channel_hash, decoded_json, charset, min_len, max_len, status, cracked_key, channel_name, created_at, cracked_at, keyspace_start, keyspace_end, chunk_gen_offset, chunk_rand_offset, decrypted_json FROM packets ORDER BY created_at DESC'),
+  getPacketByIdSlim: db.prepare('SELECT id, prefix, channel_hash, decoded_json, charset, min_len, max_len, status, cracked_key, channel_name, created_at, cracked_at, keyspace_start, keyspace_end, chunk_gen_offset, chunk_rand_offset, decrypted_json FROM packets WHERE id = ?'),
   getPacketById: db.prepare('SELECT * FROM packets WHERE id = ?'),
   updatePacketStatus: db.prepare('UPDATE packets SET status = ?, cracked_key = ?, channel_name = ?, cracked_at = CURRENT_TIMESTAMP WHERE id = ?'),
   getKnownChannels: db.prepare('SELECT * FROM known_channels ORDER BY channel_name'),
@@ -479,7 +489,7 @@ function markPacketCracked(packetId, channelName, key, decoded) {
   invalidateVirtualPending();
   broadcast({ type: 'key_found', packetId, key, channelName, decoded });
   broadcast({ type: 'stats', ...getQueueStats(), activeStats: getActiveJobStats(), ...getCandidateStats() });
-  broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+  broadcast({ type: 'packet_update', packet: stmts.getPacketByIdSlim.get(packetId) });
   broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
   return true;
 }
@@ -596,34 +606,45 @@ function recycleStaleChunks() {
   const stale = stmts.getStaleChunks.all();
   if (stale.length === 0) return 0;
 
+  // Pre-load all referenced packets in one pass to avoid N+1 queries
+  const packetIds = [...new Set(stale.map(r => r.packet_id))];
+  const packetCache = new Map();
+  for (const pid of packetIds) {
+    const p = stmts.getPacketById.get(pid);
+    if (p) packetCache.set(pid, p);
+  }
+
   // For each stale chunk, find the cursor position that originally generated it
   // (inverse of the wrap formula) and rewind to the minimum such position.
   // This ensures the exact stale ranges get re-issued rather than some arbitrary replacement.
   const rewindTo = new Map();
-  for (const row of stale) {
-    const packet = stmts.getPacketById.get(row.packet_id);
-    if (!packet) { stmts.deleteChunkById.run(row.id); continue; }
 
-    const start = packet.keyspace_start || 0;
-    const totalChunks = Math.ceil((packet.keyspace_end - start) / CHUNK_SIZE);
-    const randOffset = packet.chunk_rand_offset || 0;
-    const chunkIndex = Math.floor((row.range_start - start) / CHUNK_SIZE);
-    const cursorIndex = ((chunkIndex - randOffset) % totalChunks + totalChunks) % totalChunks;
-    const cursorForChunk = start + cursorIndex * CHUNK_SIZE;
+  db.transaction(() => {
+    for (const row of stale) {
+      const packet = packetCache.get(row.packet_id);
+      if (!packet) { stmts.deleteChunkById.run(row.id); continue; }
 
-    const current = rewindTo.get(row.packet_id);
-    if (current === undefined || cursorForChunk < current) rewindTo.set(row.packet_id, cursorForChunk);
-    stmts.deleteChunkById.run(row.id);
-  }
+      const start = packet.keyspace_start || 0;
+      const totalChunks = Math.ceil((packet.keyspace_end - start) / CHUNK_SIZE);
+      const randOffset = packet.chunk_rand_offset || 0;
+      const chunkIndex = Math.floor((row.range_start - start) / CHUNK_SIZE);
+      const cursorIndex = ((chunkIndex - randOffset) % totalChunks + totalChunks) % totalChunks;
+      const cursorForChunk = start + cursorIndex * CHUNK_SIZE;
 
-  for (const [packetId, minCursor] of rewindTo) {
-    const packet = stmts.getPacketById.get(packetId);
-    if (packet && packet.chunk_gen_offset > minCursor) {
-      db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ? AND chunk_gen_offset > ?')
-        .run(minCursor, packetId, minCursor);
-      console.log(`[stale] rewound packet ${packetId} cursor to ${minCursor}`);
+      const current = rewindTo.get(row.packet_id);
+      if (current === undefined || cursorForChunk < current) rewindTo.set(row.packet_id, cursorForChunk);
+      stmts.deleteChunkById.run(row.id);
     }
-  }
+
+    for (const [packetId, minCursor] of rewindTo) {
+      const packet = packetCache.get(packetId);
+      if (packet && packet.chunk_gen_offset > minCursor) {
+        db.prepare('UPDATE packets SET chunk_gen_offset = ? WHERE id = ? AND chunk_gen_offset > ?')
+          .run(minCursor, packetId, minCursor);
+        console.log(`[stale] rewound packet ${packetId} cursor to ${minCursor}`);
+      }
+    }
+  })();
 
   return stale.length;
 }
@@ -848,6 +869,8 @@ function initWorkForPacket(packetId, targetPrefix, crackConfig = {}) {
     .run(totalStart, totalStart, totalEnd, randOffset, packetId);
 
   console.log(`[chunks] packet ${packetId}: keyspace ready — ${totalChunks} virtual chunks (${totalStart}→${totalEnd}), rand offset ${randOffset}`);
+  // Notify idle workers that new work is available
+  broadcast({ type: 'work_available' });
   return cfg;
 }
 
@@ -990,13 +1013,10 @@ setInterval(() => {
   try {
     const m = process.memoryUsage();
     const s = getQueueStats();
-    const assignedCounts = new Map(
-      db.prepare("SELECT assigned_to, COUNT(*) as cnt FROM work_chunks WHERE status = 'assigned' GROUP BY assigned_to")
-        .all().map(r => [r.assigned_to, r.cnt])
-    );
+    // Use per-worker DB lookups only for active workers (avoids full GROUP BY scan)
     const workerDetails = [];
     for (const [id, w] of workers) {
-      const assigned = assignedCounts.get(id) || 0;
+      const assigned = stmts.countAssignedToWorker.get(id)?.cnt || 0;
       workerDetails.push(`${workerIdToName(id)}:${formatHashRate(w.hashRate)}/a=${assigned}/d=${w.chunksCompleted}`);
     }
     console.log(`[health] workers=${workers.size} pending=${s.pending} assigned=${s.assigned} completed=${s.completed} rate=${formatHashRate(getTotalHashRate())} rss=${Math.round(m.rss / 1024 / 1024)}MB`);
@@ -1574,7 +1594,7 @@ app.post('/api/packets', (req, res) => {
           stmts.updatePacketStatus.run('cracked', match.key, match.channel_name, result.lastInsertRowid);
           if (decryptResult.decoded) stmts.updatePacketDecrypted.run(JSON.stringify(decryptResult.decoded), result.lastInsertRowid);
           const packet = stmts.getPacketById.get(result.lastInsertRowid);
-          broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+          broadcast({ type: 'packets', packets: stmts.getPacketsSlim.all() });
           return res.json({ packet, alreadyKnown: true, knownChannel: match, decoded: decryptResult.decoded });
         }
       } catch (err) {
@@ -1587,7 +1607,7 @@ app.post('/api/packets', (req, res) => {
   initWorkForPacket(result.lastInsertRowid, prefix, cfg);
   const packet = stmts.getPacketById.get(result.lastInsertRowid);
 
-  broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+  broadcast({ type: 'packets', packets: stmts.getPacketsSlim.all() });
   broadcastStats();
 
   res.json({ packet, alreadyKnown: false, prefixByte: prefixHex, decoded });
@@ -1605,7 +1625,7 @@ app.delete('/api/packets/:id', (req, res) => {
   // raw data will be re-sent if the packet is re-uploaded with the same id.
   for (const w of workers.values()) w.sentPacketRaw?.delete(id);
   invalidateVirtualPending();
-  broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+  broadcast({ type: 'packet_deleted', packetId: id });
   broadcastStats();
   res.json({ ok: true });
 });
@@ -1667,7 +1687,7 @@ app.post('/api/packets/:id/retry', (req, res) => {
   })();
   invalidateVirtualPending();
 
-  broadcast({ type: 'packets', packets: stmts.getPackets.all() });
+  broadcast({ type: 'packets', packets: stmts.getPacketsSlim.all() });
   broadcast({ type: 'candidates', candidates: stmts.getAllCandidates.all() });
   broadcastStats();
 
@@ -1710,7 +1730,7 @@ app.get('/api/candidates', (req, res) => {
 });
 
 app.get('/api/stats', (req, res) => {
-  recycleStaleChunks();
+  // Stale chunk recycling handled by 30s interval — no longer called per-request
   const stats = getQueueStats();
   const activeStats = getActiveJobStats();
   const workerList = [];

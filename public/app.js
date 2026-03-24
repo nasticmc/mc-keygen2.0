@@ -32,6 +32,7 @@ let ws = null;
 let cracker = null;
 let cracking = false;
 let loopRunning = false;
+let _workAvailableResolve = null;
 let currentCharset = 'abcdefghijklmnopqrstuvwxyz';
 let serverChunkSize = 500000;
 let lastMeasuredHashRate = 0;
@@ -227,6 +228,16 @@ async function connectWebSocket() {
       case 'packets':
         renderPackets(msg.packets);
         break;
+      case 'packet_update': {
+        const idx = _cachedPackets.findIndex(p => p.id === msg.packet.id);
+        if (idx >= 0) _cachedPackets[idx] = msg.packet;
+        else _cachedPackets.unshift(msg.packet);
+        renderPackets([..._cachedPackets]);
+        break;
+      }
+      case 'packet_deleted':
+        renderPackets(_cachedPackets.filter(p => p.id !== msg.packetId));
+        break;
       case 'channels':
         renderChannels(msg.channels);
         break;
@@ -268,6 +279,13 @@ async function connectWebSocket() {
       case 'worker_removed':
         workerData.delete(msg.workerId);
         refreshWorkerDisplay();
+        break;
+      case 'work_available':
+        // Server signals new work is available — wake up idle cracking loop
+        if (_workAvailableResolve) {
+          _workAvailableResolve();
+          _workAvailableResolve = null;
+        }
         break;
       case 'work':
         // Unsolicited push work is ignored — we use HTTP for work requests now
@@ -489,7 +507,9 @@ function updateWorkerDisplay(workerId, hashRate) {
 
 // ── Packets Table ───────────────────────────────────────────────────────────
 let _lastPacketsJson = '';
+let _cachedPackets = [];
 function renderPackets(packets) {
+  _cachedPackets = packets;
   const json = JSON.stringify(packets);
   if (json === _lastPacketsJson) return;
   _lastPacketsJson = json;
@@ -1065,9 +1085,12 @@ async function runCrackingLoop() {
       if (response.charset) currentCharset = response.charset;
 
       if (chunks.length === 0) {
-        clog(`no work available (waited ${waitMs}ms) — retrying in 3s`);
-        setCrackingStatus('No work available — retrying...');
-        await new Promise(r => setTimeout(r, 3000));
+        clog(`no work available (waited ${waitMs}ms) — waiting for work_available push (10s timeout)`);
+        setCrackingStatus('No work available — waiting for new work...');
+        await new Promise(r => {
+          const timeout = setTimeout(() => { _workAvailableResolve = null; r(); }, 10000);
+          _workAvailableResolve = () => { clearTimeout(timeout); r(); };
+        });
         continue;
       }
 
@@ -1129,6 +1152,8 @@ async function runCrackingLoop() {
       const batchStart = performance.now();
       let lastProgressLog = 0;
       let lastHashrateUpdateAt = 0;
+      // Accumulate chunk completions and send one batched POST after processChunks
+      const pendingCompletions = { chunkIds: [], prefixCounts: {}, hashRate: 0 };
       await cracker.processChunks(chunks, {
         onPrefixMatch: (packetId, matches) => {
           apiPost('/api/worker/prefix-match', { clientId: getClientId(), packetId, matches }).catch(err => {
@@ -1136,11 +1161,13 @@ async function runCrackingLoop() {
           });
         },
         onChunkComplete: (chunkIds, hashRate, prefixCounts) => {
-          const extraPrefixCounts = prefixCounts && prefixCounts.size > 0
-            ? Object.fromEntries(prefixCounts) : undefined;
-          apiPost('/api/worker/chunk-complete', { clientId: getClientId(), chunkIds, hashRate, prefixCounts: extraPrefixCounts }).catch(err => {
-            clog(`chunk-complete POST failed: ${err.message}`);
-          });
+          pendingCompletions.chunkIds.push(...chunkIds);
+          pendingCompletions.hashRate = hashRate;
+          if (prefixCounts && prefixCounts.size > 0) {
+            for (const [k, v] of prefixCounts) {
+              pendingCompletions.prefixCounts[k] = (pendingCompletions.prefixCounts[k] || 0) + v;
+            }
+          }
         },
         onProgress: (hashRate, processed, total) => {
           lastMeasuredHashRate = hashRate;
@@ -1168,6 +1195,20 @@ async function runCrackingLoop() {
           }
         },
       }, currentCharset, packetRawData, { ...getGpuTuningSettings(), _decodeWorker: decodeWorker });
+
+      // Send batched chunk-complete POST (all chunks from this batch in one request)
+      if (pendingCompletions.chunkIds.length > 0) {
+        const extraPrefixCounts = Object.keys(pendingCompletions.prefixCounts).length > 0
+          ? pendingCompletions.prefixCounts : undefined;
+        apiPost('/api/worker/chunk-complete', {
+          clientId: getClientId(),
+          chunkIds: pendingCompletions.chunkIds,
+          hashRate: pendingCompletions.hashRate,
+          prefixCounts: extraPrefixCounts,
+        }).catch(err => {
+          clog(`batch chunk-complete POST failed: ${err.message}`);
+        });
+      }
 
       const batchMs = Math.round(performance.now() - batchStart);
       batchesCompleted++;
