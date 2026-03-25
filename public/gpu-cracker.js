@@ -532,6 +532,16 @@ class GPUCracker {
         } else if (winner) {
           localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count - 1);
           try { onPrefixMatch(flush.packetId, [winner]); } catch (_) {}
+          // Safety net: re-queue remaining candidates for server-side
+          // verification.  If the winner is a false positive (passed client
+          // HMAC but fails server decode) we must not lose the real key.
+          const remaining = flush.candidates.filter(c => c.keyHex !== winner.keyHex);
+          if (remaining.length > 0) {
+            _fallbackPackets.add(flush.packetId);
+            const existing = pendingMatches.get(flush.packetId) || [];
+            for (const c of remaining) existing.push(c);
+            pendingMatches.set(flush.packetId, existing);
+          }
         } else {
           // No winner — treat like fallback so server gets a chance to verify
           _fallbackPackets.add(flush.packetId);
@@ -803,6 +813,16 @@ class CPUCracker {
         } else if (winner) {
           localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count - 1);
           try { onPrefixMatch(flush.packetId, [winner]); } catch (_) {}
+          // Safety net: re-queue remaining candidates for server-side
+          // verification.  If the winner is a false positive (passed client
+          // HMAC but fails server decode) we must not lose the real key.
+          const remaining = flush.candidates.filter(c => c.keyHex !== winner.keyHex);
+          if (remaining.length > 0) {
+            _fallbackPackets.add(flush.packetId);
+            const existing = pendingMatches.get(flush.packetId) || [];
+            for (const c of remaining) existing.push(c);
+            pendingMatches.set(flush.packetId, existing);
+          }
         } else {
           // No winner — treat like fallback so server gets a chance to verify
           _fallbackPackets.add(flush.packetId);

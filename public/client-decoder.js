@@ -138,6 +138,16 @@ async function clientTryDecrypt(hexData, channelKeyHex) {
       message = text;
     }
 
+    // Reject garbled false-positive decryptions.  A wrong key that passes
+    // the 2-byte HMAC check (~1/65536) produces random AES output.  Without
+    // this filter the decode worker picks the first HMAC false-positive as
+    // the "winner" and discards all remaining candidates — including the
+    // real key.  Mirrors server-side isReadableMessage().
+    const finalText = (message || text || '').trim();
+    if (finalText.length < 2) return null;
+    if (!/^[\x09\x0A\x0D\x20-\x7E\p{Extended_Pictographic}\uFE0F\u200D]+$/u.test(finalText)) return null;
+    if (!/[A-Za-z0-9]/.test(finalText) && !/\p{Extended_Pictographic}/u.test(finalText)) return null;
+
     // Shape matches MeshCorePacketDecoder output so server can store it as-is
     return {
       isValid: true,
