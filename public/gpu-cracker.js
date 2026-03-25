@@ -514,41 +514,26 @@ class GPUCracker {
 
     if (_decodeWorker) {
       _decodeWorker.onmessage = (e) => {
-        const { id, winner, count, fallback } = e.data;
+        const { id, winners, count, fallback } = e.data;
         const flush = _pendingFlushes.get(id);
         if (!flush) return;
         _pendingFlushes.delete(id);
 
         if (fallback) {
-          // Worker can't decode this packet type — count locally and remember
-          // so future flushes for this packet skip the worker entirely.
+          // Worker can't decode this packet type — re-queue all for server.
           _fallbackPackets.add(flush.packetId);
           localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count);
-          // Re-queue candidates so they get sent to the server on the next
-          // chunk-end flush (which will now bypass the decode worker).
           const existing = pendingMatches.get(flush.packetId) || [];
           for (const c of flush.candidates) existing.push(c);
           pendingMatches.set(flush.packetId, existing);
-        } else if (winner) {
-          localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count - 1);
-          try { onPrefixMatch(flush.packetId, [winner]); } catch (_) {}
-          // Safety net: re-queue remaining candidates for server-side
-          // verification.  If the winner is a false positive (passed client
-          // HMAC but fails server decode) we must not lose the real key.
-          const remaining = flush.candidates.filter(c => c.keyHex !== winner.keyHex);
-          if (remaining.length > 0) {
-            _fallbackPackets.add(flush.packetId);
-            const existing = pendingMatches.get(flush.packetId) || [];
-            for (const c of remaining) existing.push(c);
-            pendingMatches.set(flush.packetId, existing);
-          }
         } else {
-          // No winner — treat like fallback so server gets a chance to verify
-          _fallbackPackets.add(flush.packetId);
-          localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count);
-          const existing = pendingMatches.get(flush.packetId) || [];
-          for (const c of flush.candidates) existing.push(c);
-          pendingMatches.set(flush.packetId, existing);
+          // Send all client-verified winners to server as next-stage candidates.
+          // Count the rest (non-winners) locally — they failed client decode.
+          const winnerCount = (winners || []).length;
+          localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count - winnerCount);
+          if (winnerCount > 0) {
+            try { onPrefixMatch(flush.packetId, winners); } catch (_) {}
+          }
         }
 
         if (_pendingFlushes.size === 0 && _drainResolve) {
@@ -799,37 +784,26 @@ class CPUCracker {
 
     if (_decodeWorker) {
       _decodeWorker.onmessage = (e) => {
-        const { id, winner, count, fallback } = e.data;
+        const { id, winners, count, fallback } = e.data;
         const flush = _pendingFlushes.get(id);
         if (!flush) return;
         _pendingFlushes.delete(id);
 
         if (fallback) {
+          // Worker can't decode this packet type — re-queue all for server.
           _fallbackPackets.add(flush.packetId);
           localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count);
           const existing = pendingMatches.get(flush.packetId) || [];
           for (const c of flush.candidates) existing.push(c);
           pendingMatches.set(flush.packetId, existing);
-        } else if (winner) {
-          localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count - 1);
-          try { onPrefixMatch(flush.packetId, [winner]); } catch (_) {}
-          // Safety net: re-queue remaining candidates for server-side
-          // verification.  If the winner is a false positive (passed client
-          // HMAC but fails server decode) we must not lose the real key.
-          const remaining = flush.candidates.filter(c => c.keyHex !== winner.keyHex);
-          if (remaining.length > 0) {
-            _fallbackPackets.add(flush.packetId);
-            const existing = pendingMatches.get(flush.packetId) || [];
-            for (const c of remaining) existing.push(c);
-            pendingMatches.set(flush.packetId, existing);
-          }
         } else {
-          // No winner — treat like fallback so server gets a chance to verify
-          _fallbackPackets.add(flush.packetId);
-          localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count);
-          const existing = pendingMatches.get(flush.packetId) || [];
-          for (const c of flush.candidates) existing.push(c);
-          pendingMatches.set(flush.packetId, existing);
+          // Send all client-verified winners to server as next-stage candidates.
+          // Count the rest (non-winners) locally — they failed client decode.
+          const winnerCount = (winners || []).length;
+          localPrefixCounts.set(flush.packetId, (localPrefixCounts.get(flush.packetId) || 0) + count - winnerCount);
+          if (winnerCount > 0) {
+            try { onPrefixMatch(flush.packetId, winners); } catch (_) {}
+          }
         }
 
         if (_pendingFlushes.size === 0 && _drainResolve) {
