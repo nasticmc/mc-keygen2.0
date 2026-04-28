@@ -87,6 +87,22 @@ async function _gzipString(str) {
 // Minimum payload size to bother attempting compression (bytes).
 const _COMPRESS_THRESHOLD = 256;
 
+// Serialise prefix-match POSTs — at most 1 in-flight at a time so they
+// cannot saturate Chrome's 6-connection HTTP/1.1 pool and block fetchWork
+// or chunk-complete.  In the worst case (non-GroupText packets / client
+// decode disabled) a 128M chunk yields ~500 K prefix matches → 10 batched
+// POSTs per chunk; 16 chunks = 160 concurrent calls without this queue.
+const _pmQueue = [];
+let _pmBusy = false;
+function _drainPmQueue() {
+  if (_pmBusy || _pmQueue.length === 0) return;
+  _pmBusy = true;
+  const { packetId, matches } = _pmQueue.shift();
+  apiPost('/api/worker/prefix-match', { clientId: getClientId(), packetId, matches })
+    .catch(err => clog(`prefix-match POST failed: ${err.message}`))
+    .finally(() => { _pmBusy = false; _drainPmQueue(); });
+}
+
 async function apiPost(path, body) {
   const maxRetries = 3;
   const jsonStr = JSON.stringify(body);
@@ -1199,9 +1215,8 @@ async function runCrackingLoop() {
       const pendingCompletions = { chunkIds: [], prefixCounts: {}, hashRate: 0 };
       await cracker.processChunks(chunks, {
         onPrefixMatch: (packetId, matches) => {
-          apiPost('/api/worker/prefix-match', { clientId: getClientId(), packetId, matches }).catch(err => {
-            clog(`prefix-match POST failed: ${err.message}`);
-          });
+          _pmQueue.push({ packetId, matches });
+          _drainPmQueue();
         },
         onChunkComplete: (chunkIds, hashRate, prefixCounts) => {
           pendingCompletions.chunkIds.push(...chunkIds);
